@@ -228,6 +228,51 @@ class MetricLoggerTest(absltest.TestCase):
           settings=mock_wandb.Settings.return_value,
       )
 
+  def test_wandb_backend_instantiated_before_tensorboard_in_defaults(self):
+    """Tests that WandbBackend is instantiated before TensorboardBackend.
+
+    wandb.init(sync_tensorboard=True) patches the TensorBoard SummaryWriter at
+    init time, so WandbBackend must be constructed first.
+    """
+    if env_utils.is_internal_env():
+      return  # wandb/tensorboard not used in internal env
+
+    call_order = []
+    mock_tb = self.mock_backends[0]
+    mock_wb = self.mock_backends[1]
+    mock_tb.side_effect = lambda *a, **kw: call_order.append("tensorboard")
+    mock_wb.side_effect = lambda *a, **kw: call_order.append("wandb")
+
+    options = metrics_logger.MetricsLoggerOptions(log_dir=self.log_dir)
+    options.create_backends()
+
+    self.assertEqual(call_order, ["wandb", "tensorboard"])
+
+  def test_custom_backend_wandb_factory_sorted_before_tensorboard(self):
+    """Tests that WandbBackend class factories are sorted before others."""
+    call_order = []
+
+    class FakeWandbBackend(metrax_logging.WandbBackend):
+      def __init__(self):  # pylint: disable=super-init-not-called
+        call_order.append("wandb")
+        self._is_active = False
+        self.wandb = None
+
+    class FakeTensorboardBackend:
+      def __init__(self):
+        call_order.append("tensorboard")
+
+    # Pass tensorboard factory first to confirm the sort reorders them.
+    options = metrics_logger.MetricsLoggerOptions(
+        log_dir=self.log_dir,
+        backend_kwargs={
+            "custom_backend": [FakeTensorboardBackend, FakeWandbBackend]
+        },
+    )
+    options.create_backends()
+
+    self.assertEqual(call_order, ["wandb", "tensorboard"])
+
 
 if __name__ == "__main__":
   absltest.main()

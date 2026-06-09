@@ -3,7 +3,7 @@
 import collections
 import dataclasses
 import enum
-from typing import Any, Callable
+from typing import Any, Callable, TypedDict
 
 from absl import logging
 import jax
@@ -18,6 +18,16 @@ CluBackend = getattr(metrax_logging, "CluBackend", None)
 
 # User backends MUST be factories (callables) to keep Options pure and copyable.
 BackendFactory = Callable[[], LoggingBackend]
+
+
+class CustomBackendFactories(TypedDict):
+  custom_backend: list[BackendFactory]
+
+
+class LoggingBackendKwargs(TypedDict, total=False):
+  clu: dict[str, Any]
+  wandb: dict[str, Any]
+  tensorboard: dict[str, Any]
 
 
 @dataclasses.dataclass
@@ -45,8 +55,8 @@ class MetricsLoggerOptions:
   #      'flush_every_n_steps': 100,
   #   }
   # }
-  backend_kwargs: dict[str, dict[str, Any] | list[BackendFactory]] = (
-      dataclasses.field(default_factory=dict)
+  backend_kwargs: CustomBackendFactories | LoggingBackendKwargs = (
+      dataclasses.field(default_factory=LoggingBackendKwargs)
   )
 
   def create_backends(self) -> list[LoggingBackend]:
@@ -60,30 +70,36 @@ class MetricsLoggerOptions:
         "custom_backend" in self.backend_kwargs
         and self.backend_kwargs["custom_backend"]
     ):
-      return [factory() for factory in self.backend_kwargs["custom_backend"]]
+      # Sort factories so WandbBackend (and subclasses) are instantiated before
+      # TensorboardBackend. wandb.init() patches the TB SummaryWriter class at
+      # init time, so wandb.init() must run before any TB writers are created.
+      def _is_wandb_factory(factory: BackendFactory) -> bool:
+        return isinstance(factory, type) and issubclass(
+            factory, metrax_logging.WandbBackend
+        )
+
+      sorted_factories = sorted(
+          self.backend_kwargs["custom_backend"],
+          key=lambda f: not _is_wandb_factory(f),
+      )
+      return [factory() for factory in sorted_factories]
 
     # Case 2: Defaults.
-    active_backends = []
-    kwargs_dict = self.backend_kwargs or {}
+    active_backends: list[LoggingBackend] = []
 
     if env_utils.is_internal_env():
       if CluBackend is None:
         raise ImportError(
             "Internal environment detected, but CluBackend not available."
         )
-      clu_kwargs = kwargs_dict.get("clu", {})
+      clu_kwargs = self.backend_kwargs.get("clu", {})
       active_backends.append(CluBackend(log_dir=self.log_dir, **clu_kwargs))
     else:
-      tb_kwargs = kwargs_dict.get("tensorboard", {})
-      active_backends.append(
-          TensorboardBackend(
-              log_dir=self.log_dir,
-              flush_every_n_steps=self.flush_every_n_steps,
-              **tb_kwargs,
-          )
-      )
       try:
-        wandb_kwargs = kwargs_dict.get("wandb", {})
+        wandb_kwargs = self.backend_kwargs.get("wandb", {})
+        # WandbBackend must be created before TensorboardBackend so that
+        # wandb.init() (and the sync_tensorboard TB patcher) runs before any
+        # TB writers are created.
         active_backends.append(
             WandbBackend(
                 project=self.project_name,
@@ -93,6 +109,15 @@ class MetricsLoggerOptions:
         )
       except ImportError:
         logging.info("WandbBackend skipped: 'wandb' library not installed.")
+
+      tb_kwargs = self.backend_kwargs.get("tensorboard", {})
+      active_backends.append(
+          TensorboardBackend(
+              log_dir=self.log_dir,
+              flush_every_n_steps=self.flush_every_n_steps,
+              **tb_kwargs,
+          )
+      )
     return active_backends
 
 
@@ -146,7 +171,7 @@ class MetricsLogger:
     mode_metrics[metric_name].append(scalar_value)
 
     jax.monitoring.record_scalar(
-        f"{metrics_prefix}/{mode}/{metric_name}", scalar_value, step=step
+        f"{metrics_prefix}/{mode}/{metric_name}", float(scalar_value), step=step
     )
 
   def metric_exists(
