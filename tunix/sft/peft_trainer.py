@@ -14,12 +14,14 @@
 
 """PEFT trainer."""
 
+from __future__ import annotations
+
 from collections.abc import Iterable
 import contextlib
 import dataclasses
 import functools
 import time
-from typing import Any, Callable, Concatenate, Dict, List, ParamSpec, Tuple
+from typing import Any, Callable, Concatenate, ParamSpec, TypeAlias, override, overload, TYPE_CHECKING
 
 from absl import logging
 import flax
@@ -45,7 +47,14 @@ from tunix.sft import progress_bar
 from tunix.sft import sharding_utils
 from tunix.sft import utils
 
-_ModelInputT = Dict[str, ArrayLike]
+if TYPE_CHECKING:
+  from numpy._typing import _ArrayLikeFloat_co, _FloatLike_co
+
+  _ReductionFunction: TypeAlias = Callable[
+      [_ArrayLikeFloat_co], np.floating[Any]
+  ]
+
+_ModelInput: TypeAlias = dict[str, ArrayLike]
 P = ParamSpec("P")
 MetricsLogger = sft_metrics_logger.MetricsLogger
 MetricsLoggerOptions = sft_metrics_logger.MetricsLoggerOptions
@@ -74,7 +83,7 @@ class TrainingConfig:
   # Configs for performance metrics.
   perf_metrics_options: perf_metrics.PerfMetricsOptions | None = None
 
-  data_sharding_axis: Tuple[str, ...] = ("fsdp",)
+  data_sharding_axis: tuple[str, ...] = ("fsdp",)
 
   # Controls how many train_steps can be scheduled ahead of time.
   max_inflight_computations: int = 2
@@ -122,9 +131,9 @@ class MetricsBuffer:
   """
 
   step: int
-  losses: List[ArrayLike]
-  additional_metrics: Dict[
-      str, Tuple[List[ArrayLike], Callable[[ArrayLike], ArrayLike]]
+  losses: list[ArrayLike]
+  additional_metrics: dict[
+      str, tuple[list[ArrayLike], _ReductionFunction]
   ] = dataclasses.field(default_factory=dict)
 
   @property
@@ -146,7 +155,10 @@ def _calculate_global_batch_size(train_example: Any) -> int:
   Raises:
     TypeError: If the batch size cannot be determined from the training example.
   """
-  if dataclasses.is_dataclass(train_example):
+  if (
+      dataclasses.is_dataclass(train_example)
+      and not isinstance(train_example, type)
+  ):
     attributes = dataclasses.asdict(train_example)
   elif isinstance(train_example, dict):
     attributes = train_example
@@ -162,6 +174,211 @@ def _calculate_global_batch_size(train_example: Any) -> int:
       "Could not automatically determine batch size. No JAX or NumPy "
       "array found in the training example."
   )
+
+
+class SFTLoggingHook(hooks.TrainingHooks):
+  """Hook that handles metric buffering, logging, and progress bar updates."""
+
+  def __init__(self) -> None:
+    self._buffered_train_metrics: MetricsBuffer | None = None
+    self._prev_buffered_train_metrics: MetricsBuffer | None = None
+    self._buffered_eval_metrics: MetricsBuffer | None = None
+    self._pbar: progress_bar.ProgressBar | None = None
+    self._mode: sft_metrics_logger.Mode = sft_metrics_logger.Mode.TRAIN
+
+  @property
+  def _tqdm_train_metrics(self) -> list[str]:
+    return ["loss", "perplexity", "learning_rate"]
+
+  @override
+  def on_train_start(self, train_ctx: PeftTrainer) -> None:
+    if (
+        self._pbar is None
+        and train_ctx.config.max_steps is not None
+        and train_ctx.metrics_logger is not None
+    ):
+      self._pbar = progress_bar.ProgressBar(
+          metrics_prefix=train_ctx.metrics_prefix,
+          metrics_logger=train_ctx.metrics_logger,
+          initial_steps=train_ctx._train_steps,
+          max_steps=train_ctx.config.max_steps,
+          description=train_ctx.config.pbar_description,
+      )
+
+  @override
+  def on_train_end(self, train_ctx: PeftTrainer) -> None:
+    if self._pbar is not None:
+      self._pbar.close()
+      self._pbar = None
+
+  def _buffer_metrics(
+      self,
+      metrics_buffer: MetricsBuffer | None,
+      loss: ArrayLike,
+      step: int,
+      additional_metrics: (
+          dict[str, tuple[ArrayLike, Callable[[_ArrayLikeFloat_co], np.floating[Any]]]] | None
+      ) = None,
+  ) -> MetricsBuffer:
+    if metrics_buffer is None:
+      metrics_buffer = MetricsBuffer(step=step, losses=[loss])
+    else:
+      assert metrics_buffer.step == step
+      metrics_buffer.losses.append(loss)
+
+    if additional_metrics is not None:
+      for k, (v, op) in additional_metrics.items():
+        if k not in metrics_buffer.additional_metrics:
+          metrics_buffer.additional_metrics[k] = ([v], op)
+        else:
+          metrics_buffer.additional_metrics[k][0].append(v)
+
+    return metrics_buffer
+
+  def _log_metrics(
+      self,
+      train_ctx: PeftTrainer,
+      loss: _FloatLike_co,
+      step: int,
+      additional_metrics: dict[str, _FloatLike_co] | None = None,
+  ) -> None:
+    if (metrics_logger := train_ctx.metrics_logger) is None:
+      return
+  
+    def log(metric_name: str, value: _FloatLike_co) -> None:
+      return metrics_logger.log(
+          train_ctx.metrics_prefix, metric_name, value, self._mode, step
+      )
+
+    log("loss", loss)
+
+    perplexity = np.exp(jax.device_get(loss))
+    log("perplexity", perplexity)
+    if self._mode == sft_metrics_logger.Mode.TRAIN:
+      logging.info(
+          "Train step %d training loss: %f - training perplexity: %f",
+          step,
+          loss,
+          perplexity,
+      )
+
+    learning_rate = train_ctx._try_get_learning_rate()
+    if learning_rate is not None:
+      learning_rate = jax.device_get(learning_rate)
+      log("learning_rate", learning_rate)
+
+    for metric_name, value in (additional_metrics or {}).items():
+      log(metric_name, value)
+
+  def _write_metrics(
+      self,
+      train_ctx: PeftTrainer,
+      metrics_buffer: MetricsBuffer,
+  ) -> None:
+    @overload
+    def _to_np_array(v: ArrayLike) -> np.ndarray: ...
+    @overload
+    def _to_np_array(v: list[ArrayLike]) -> list[np.ndarray]: ...
+    def _to_np_array(v):
+      if isinstance(v, jax.Array):
+        return np.asarray(v, dtype=np.float32)
+      elif isinstance(v, list):
+        return [_to_np_array(x) for x in v]
+      return v
+
+    self._log_metrics(
+        train_ctx=train_ctx,
+        loss=metrics_buffer.loss,
+        step=metrics_buffer.step,
+        additional_metrics={
+            k: op(_to_np_array(v))
+            for k, (v, op) in metrics_buffer.additional_metrics.items()
+        },
+    )
+
+  def _may_update_pbar(
+      self,
+      train_ctx: PeftTrainer,
+      metrics: list[str],
+      step: int | None = None,
+      loss: ArrayLike | None = None,
+  ) -> None:
+    if self._pbar is not None:
+      self._pbar.update_metrics(metrics, self._mode, ndigits=3)
+      self._pbar.update()
+
+  def _write_train_metrics(self, train_ctx: PeftTrainer) -> None:
+    """Writes previous buffered train metrics."""
+    if self._prev_buffered_train_metrics is None:
+      # skip the first step so we can overlap I/O with next step.
+      self._prev_buffered_train_metrics = self._buffered_train_metrics
+      self._buffered_train_metrics = None
+      return
+
+    # increment the step by one for logging purpose, because train_step is not
+    # incremented until the next model update.
+    self._prev_buffered_train_metrics.step += 1
+    self._write_metrics(train_ctx, self._prev_buffered_train_metrics)
+    self._may_update_pbar(
+        train_ctx,
+        self._tqdm_train_metrics,
+        step=self._prev_buffered_train_metrics.step,
+        loss=self._prev_buffered_train_metrics.loss,
+    )
+    self._prev_buffered_train_metrics = self._buffered_train_metrics
+    self._buffered_train_metrics = None
+
+  @override
+  def on_train_micro_step_end(
+      self,
+      train_ctx: PeftTrainer,
+      train_loss: ArrayLike,
+      grad_norm: ArrayLike | None = None,
+  ) -> None:
+    self._mode = sft_metrics_logger.Mode.TRAIN
+    additional_metrics = (
+        {"grad_norm": (grad_norm, np.mean)}
+        if grad_norm is not None
+        else None
+    )
+    self._buffered_train_metrics = self._buffer_metrics(
+        self._buffered_train_metrics,
+        loss=train_loss,
+        step=train_ctx._train_steps,
+        additional_metrics=additional_metrics,
+    )
+
+  @override
+  def on_train_step_end(
+      self,
+      train_ctx: PeftTrainer,
+      train_step: int,
+      train_loss: ArrayLike,
+  ) -> None:
+    self._mode = sft_metrics_logger.Mode.TRAIN
+    self._write_train_metrics(train_ctx)
+
+  @override
+  def on_eval_micro_step_end(
+      self, train_ctx: PeftTrainer, eval_loss: ArrayLike
+  ) -> None:
+    self._mode = sft_metrics_logger.Mode.EVAL
+    self._buffered_eval_metrics = self._buffer_metrics(
+        self._buffered_eval_metrics,
+        loss=eval_loss,
+        step=train_ctx._train_steps,
+    )
+
+  @override
+  def on_eval_end(
+      self,
+      train_ctx: PeftTrainer,
+      eval_loss: ArrayLike,
+  ) -> None:
+    self._mode = sft_metrics_logger.Mode.EVAL
+    if self._buffered_eval_metrics is not None:
+      self._write_metrics(train_ctx, self._buffered_eval_metrics)
+      self._buffered_eval_metrics = None
 
 
 class PeftTrainer:
@@ -196,7 +413,7 @@ class PeftTrainer:
       metrics_logger: MetricsLogger | None = None,
       perf_tracer: perf_trace.Tracer | None = None,
       perf_tracer_v2: perf_tracer_lib.Tracer | None = None,
-  ):
+  ) -> None:
     # TODO(noghabi): Implement sequence packing for SFT and remove this check.
     if (
         training_config.max_seq_token_per_tpu is not None
@@ -273,10 +490,7 @@ class PeftTrainer:
         max_step=max_step,
         profiler_options=self.config.profiler_options,
     )
-    self._buffered_train_metrics: MetricsBuffer | None = None
-    self._prev_buffered_train_metrics: MetricsBuffer | None = None
-    self._buffered_eval_metrics: MetricsBuffer | None = None
-    self.training_hooks = None
+    self.training_hooks = SFTLoggingHook()
     self.data_hooks = None
     self._jit_cache = set()
     self._mini_batch_size = None
@@ -299,7 +513,7 @@ class PeftTrainer:
   def with_loss_fn(
       self,
       loss_fn: Callable[
-          Concatenate[nnx.Module, P], ArrayLike | Tuple[ArrayLike, Any]
+          Concatenate[nnx.Module, P], ArrayLike | tuple[ArrayLike, Any]
       ],
       has_aux: bool = False,
   ):
@@ -310,7 +524,7 @@ class PeftTrainer:
     return self
 
   def with_gen_model_input_fn(
-      self, gen_model_input_fn: Callable[[Any], _ModelInputT]
+      self, gen_model_input_fn: Callable[[Any], _ModelInput]
   ):
     """Generates model input from training input.
 
@@ -330,7 +544,7 @@ class PeftTrainer:
 
   def _train_step(
       self, model: nnx.Module, optimizer: nnx.Optimizer, inputs: Any
-  ) -> Tuple[ArrayLike, Any | None, ArrayLike]:
+  ) -> tuple[ArrayLike, Any | None, ArrayLike]:
     """Main body for one train step.
 
     Args:
@@ -360,7 +574,7 @@ class PeftTrainer:
 
   def _eval_step(
       self, model: nnx.Module, inputs: Any
-  ) -> ArrayLike | Tuple[ArrayLike, Any]:
+  ) -> ArrayLike | tuple[ArrayLike, Any]:
     inputs = self.gen_model_input_fn(inputs)
     out = self.eval_loss_fn(model, **inputs)
     if self._has_aux:
@@ -371,7 +585,7 @@ class PeftTrainer:
 
   def create_train_step_fn(
       self,
-  ) -> Callable[..., Tuple[ArrayLike, Any | None, ArrayLike]]:
+  ) -> Callable[..., tuple[ArrayLike, Any | None, ArrayLike]]:
     """Creates the train step function."""
     return self._train_step
 
@@ -462,103 +676,6 @@ class PeftTrainer:
           return chainpart.hyperparams["learning_rate"].value
       return None
 
-  def _log_metrics(
-      self,
-      loss: ArrayLike,
-      step: int | None = None,
-      additional_metrics: dict[str, ArrayLike] | None = None,
-  ):
-    """Logs the metrics to the metrics logger and console."""
-    perplexity = np.exp(jax.device_get(loss))
-    self.metrics_logger.log(self.metrics_prefix, "loss", loss, self._mode, step)
-    self.metrics_logger.log(
-        self.metrics_prefix, "perplexity", perplexity, self._mode, step
-    )
-    learning_rate = self._try_get_learning_rate()
-    if learning_rate is not None:
-      self.metrics_logger.log(
-          self.metrics_prefix,
-          "learning_rate",
-          jax.device_get(learning_rate),
-          self._mode,
-          step,
-      )
-
-    if self._mode == sft_metrics_logger.Mode.TRAIN:
-      logging.info(
-          "Train step %d training loss: %f  - training perplexity: %f",
-          step,
-          loss,
-          perplexity,
-      )
-    for k, v in (additional_metrics or {}).items():
-      self.metrics_logger.log(self.metrics_prefix, k, v, self._mode, step)
-
-  def _buffer_metrics(
-      self,
-      metrics_buffer: MetricsBuffer | None,
-      loss: ArrayLike,
-      step: int,
-      additional_metrics: (
-          dict[str, Tuple[ArrayLike, Callable[[ArrayLike], ArrayLike]]] | None
-      ) = None,
-  ) -> MetricsBuffer:
-    """Buffers metrics for the current step."""
-    if metrics_buffer is None:
-      metrics_buffer = MetricsBuffer(
-          step=step,
-          losses=[loss],
-      )
-    else:
-      assert metrics_buffer.step == step
-      metrics_buffer.losses.append(loss)
-    if additional_metrics is not None:
-      for k, (v, op) in additional_metrics.items():
-        if k not in metrics_buffer.additional_metrics:
-          metrics_buffer.additional_metrics[k] = ([v], op)
-        else:
-          metrics_buffer.additional_metrics[k][0].append(v)
-    return metrics_buffer
-
-  def _write_train_metrics(self):
-    """Writes previous buffered train metrics."""
-    if self._prev_buffered_train_metrics is None:
-      # skip the first step so we can overlap I/O with next step.
-      self._prev_buffered_train_metrics = self._buffered_train_metrics
-      self._buffered_train_metrics = None
-      return
-    # increment the step by one for logging purpose, because train_step is not
-    # incremented until the next model update.
-    self._prev_buffered_train_metrics.step += 1
-    self._write_metrics(self._prev_buffered_train_metrics)
-    self._may_update_pbar(
-        self._tqdm_train_metrics,
-        step=self._prev_buffered_train_metrics.step,
-        loss=self._prev_buffered_train_metrics.loss,
-    )
-    self._prev_buffered_train_metrics = self._buffered_train_metrics
-    self._buffered_train_metrics = None
-
-  def _write_metrics(self, metrics_buffer: MetricsBuffer):
-    def _to_np_array(v):
-      if isinstance(v, jax.Array):
-        return np.asarray(v, dtype=np.float32)
-      elif isinstance(v, list):
-        return [_to_np_array(x) for x in v]
-      return v
-
-    self._log_metrics(
-        loss=metrics_buffer.loss,
-        step=metrics_buffer.step,
-        additional_metrics={
-            k: op(_to_np_array(v))
-            for k, (
-                v,
-                op,
-            ) in metrics_buffer.additional_metrics.items()
-        },
-    )
-
   @contextlib.contextmanager
   def _switch_mode(self, mode: sft_metrics_logger.Mode):
     original_mode = self._mode
@@ -567,24 +684,6 @@ class PeftTrainer:
       yield
     finally:
       self._mode = original_mode
-
-  @property
-  def _tqdm_train_metrics(self) -> list[str]:
-    return ["loss", "perplexity", "learning_rate"]
-
-  def _may_update_pbar(
-      self,
-      metrics: list[str],
-      step: int | None = None,
-      loss: ArrayLike | None = None,
-  ):
-    """Updates the progress bar with the given metrics if available."""
-    if self._pbar is not None:
-      self._pbar.update_metrics(metrics, self._mode, ndigits=3)
-      self._pbar.update()
-
-    if self.training_hooks and self._mode == sft_metrics_logger.Mode.TRAIN:
-      self.training_hooks.on_train_step_end(self, step, loss)
 
   def train(
       self,
@@ -614,15 +713,6 @@ class PeftTrainer:
 
     if eval_ds:
       self._run_eval(eval_ds, eval_step)
-
-    if self.config.max_steps is not None and self._pbar is None:
-      self._pbar = progress_bar.ProgressBar(
-          metrics_prefix=self.metrics_prefix,
-          metrics_logger=self.metrics_logger,
-          initial_steps=self._train_steps,
-          max_steps=self.config.max_steps,
-          description=self.config.pbar_description,
-      )
 
     if self.training_hooks:
       self.training_hooks.on_train_start(self)
@@ -709,13 +799,9 @@ class PeftTrainer:
           span_v2.async_end([train_loss])
 
         self._throttler.add_computation(train_loss)
-        self._buffered_train_metrics = self._buffer_metrics(
-            self._buffered_train_metrics,
-            loss=train_loss,
-            step=self._train_steps,
-            additional_metrics={"grad_norm": (grad_norm, np.mean)},
-        )
-        # NB: put this after self._buffer_metrics is important
+        if self.training_hooks:
+          self.training_hooks.on_train_micro_step_end(self, train_loss, grad_norm)
+        # NB: put this after _buffer_metrics is important
         self._post_process_train_step(aux)
         self._iter_steps += 1
 
@@ -725,7 +811,8 @@ class PeftTrainer:
             == 0
         ):
           self._train_steps += 1
-          self._write_train_metrics()
+          if self.training_hooks:
+            self.training_hooks.on_train_step_end(self, self._train_steps, train_loss)
 
           # Checkpoint frequency is configured by checkpointing_options.
           self.checkpoint_manager.save(
@@ -782,16 +869,16 @@ class PeftTrainer:
   def close(self):
     """Closes the trainer and its associated resources.
 
-    This includes writing any buffered metrics, saving the last checkpoint,
+    This includes saving the last checkpoint,
     and closing the checkpoint manager and metrics logger.
     """
-    self._write_train_metrics()
+    if self.training_hooks:
+      # Flush the last step
+      self.training_hooks.on_train_step_end(self, self._train_steps, 0.0)
     self._save_last_checkpoint()
     self.checkpoint_manager.close()
-    self.metrics_logger.close()
-    if self._pbar is not None:
-      self._pbar.close()
-      self._pbar = None
+    if self.metrics_logger is not None:
+      self.metrics_logger.close()
 
   def _run_eval(
       self,
@@ -803,6 +890,8 @@ class PeftTrainer:
     eval_iterator = iter(eval_ds)
     with self._switch_mode(sft_metrics_logger.Mode.EVAL):
       eval_loss, eval_steps = 0, 0
+      if self.training_hooks:
+        self.training_hooks.on_eval_start(self)
       while True:
         if self.data_hooks:
           eval_example = self.data_hooks.load_next_eval_batch(self)
@@ -821,14 +910,13 @@ class PeftTrainer:
           self.training_hooks.on_eval_step_start(self)
         loss, aux = eval_step_fn(eval_example)
         loss = jax.lax.stop_gradient(loss)
-        self._buffered_eval_metrics = self._buffer_metrics(
-            self._buffered_eval_metrics,
-            loss=loss,
-            step=self._train_steps,
-        )
+        if self.training_hooks:
+          self.training_hooks.on_eval_micro_step_end(self, loss)
         self._post_process_eval_step(aux)
         eval_loss += loss
         eval_steps += 1
+        if self.training_hooks:
+          self.training_hooks.on_eval_step_end(self, loss)
 
       if eval_steps == 0:
         logging.warning(
@@ -836,18 +924,12 @@ class PeftTrainer:
         )
         return
 
-      self._write_metrics(self._buffered_eval_metrics)
       logging.info(
-          "Train step %d eval loss: %f - eval perplexity: %f",
+          "Train step %d eval completed.",
           self._train_steps,
-          self.metrics_logger.get_metric(self.metrics_prefix, "loss", "eval"),
-          self.metrics_logger.get_metric(
-              self.metrics_prefix, "perplexity", "eval"
-          ),
       )
-      self._buffered_eval_metrics = None
       if self.training_hooks:
-        self.training_hooks.on_eval_step_end(self, eval_loss)
+        self.training_hooks.on_eval_end(self, eval_loss)
 
 
 def _default_loss_fn(

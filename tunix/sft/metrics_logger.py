@@ -1,15 +1,20 @@
 """Metric logger with a unified, protocol-based backend system."""
 
+from __future__ import annotations
+
 import collections
 import dataclasses
 import enum
-from typing import Any, Callable, TypedDict
+from typing import Any, Callable, TypedDict, TYPE_CHECKING
 
 from absl import logging
 import jax
 from metrax import logging as metrax_logging
 import numpy as np
 from tunix.utils import env_utils
+
+if TYPE_CHECKING:
+  from numpy._typing import _FloatLike_co
 
 LoggingBackend = metrax_logging.LoggingBackend
 TensorboardBackend = metrax_logging.TensorboardBackend
@@ -159,7 +164,7 @@ class MetricsLogger:
       self,
       metrics_prefix: str,
       metric_name: str,
-      scalar_value: float | np.ndarray,
+      scalar_value: _FloatLike_co,
       mode: Mode | str,
       step: int,
   ):

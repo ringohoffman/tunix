@@ -14,64 +14,73 @@
 
 """Hooks for training and data loading."""
 
-import abc
-from typing import Any
+from __future__ import annotations
 
-ABC = abc.ABC
-abstractmethod = abc.abstractmethod
-PeftTrainer = Any
+from typing import Any, TYPE_CHECKING, Protocol
+
+if TYPE_CHECKING:
+  from jax.typing import ArrayLike
+
+  from tunix.sft import peft_trainer
 
 
-class TrainingHooks(ABC):
+class TrainingHooks(Protocol):
   """Hooks to be used for training."""
 
-  @abstractmethod
-  def on_train_start(self, train_ctx: "PeftTrainer.PeftTrainer"):
+  def on_train_start(self, train_ctx: peft_trainer.PeftTrainer) -> None:
     """Called at the beginning of training."""
-    pass
 
-  @abstractmethod
-  def on_train_end(self, train_ctx: "PeftTrainer.PeftTrainer"):
+  def on_train_end(self, train_ctx: peft_trainer.PeftTrainer) -> None:
     """Called at the end of training."""
-    pass
 
-  @abstractmethod
-  def on_train_step_start(self, train_ctx: "PeftTrainer.PeftTrainer"):
+  def on_train_step_start(self, train_ctx: peft_trainer.PeftTrainer) -> None:
     """Called at the beginning of a training step."""
-    pass
 
-  @abstractmethod
   def on_train_step_end(
       self,
-      train_ctx: "PeftTrainer.PeftTrainer",
+      train_ctx: peft_trainer.PeftTrainer,
       train_step: int,
-      train_loss: float,
-  ):
+      train_loss: ArrayLike,
+  ) -> None:
     """Called at the end of a training step."""
-    pass
 
-  @abstractmethod
-  def on_eval_step_start(self, train_ctx: "PeftTrainer.PeftTrainer"):
-    """Called at the beginning of an evaluation step."""
-    pass
+  def on_train_micro_step_end(
+      self,
+      train_ctx: peft_trainer.PeftTrainer,
+      train_loss: ArrayLike,
+      grad_norm: ArrayLike | None = None,
+  ) -> None:
+    """Called at the end of a micro-step during gradient accumulation."""
 
-  @abstractmethod
+  def on_eval_start(self, train_ctx: peft_trainer.PeftTrainer) -> None:
+    """Called at the beginning of an evaluation phase."""
+
+  def on_eval_end(
+      self,
+      train_ctx: peft_trainer.PeftTrainer,
+      eval_loss: ArrayLike,
+  ) -> None:
+    """Called at the end of an evaluation phase."""
+
+  def on_eval_step_start(self, train_ctx: peft_trainer.PeftTrainer) -> None:
+    """Called at the beginning of an evaluation step (batch)."""
+
   def on_eval_step_end(
-      self, train_ctx: "PeftTrainer.PeftTrainer", eval_loss: float
-  ):
-    """Called at the end of an evaluation step."""
-    pass
+      self, train_ctx: peft_trainer.PeftTrainer, eval_loss: ArrayLike
+  ) -> None:
+    """Called at the end of an evaluation step (batch)."""
+
+  def on_eval_micro_step_end(
+      self, train_ctx: peft_trainer.PeftTrainer, eval_loss: ArrayLike
+  ) -> None:
+    """Called at the end of a micro-step during evaluation."""
 
 
-class DataHooks(ABC):
+class DataHooks(Protocol):
   """Hooks to wire in external data loader and processing logic."""
 
-  @abstractmethod
-  def load_next_train_batch(self, train_ctx: "PeftTrainer.PeftTrainer") -> Any:
+  def load_next_train_batch(self, train_ctx: peft_trainer.PeftTrainer) -> Any:
     """Loads the next batch of data for training."""
-    raise NotImplementedError()
 
-  @abstractmethod
-  def load_next_eval_batch(self, train_ctx: "PeftTrainer.PeftTrainer") -> Any:
+  def load_next_eval_batch(self, train_ctx: peft_trainer.PeftTrainer) -> Any:
     """Loads the next batch of data for evaluation."""
-    raise NotImplementedError()
