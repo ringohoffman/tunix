@@ -21,7 +21,7 @@ import contextlib
 import dataclasses
 import functools
 import time
-from typing import Any, Callable, Concatenate, ParamSpec, TypeAlias, override, overload, TYPE_CHECKING
+from typing import Any, Callable, Concatenate, ParamSpec, Self, TypeAlias, override, overload, TYPE_CHECKING
 
 from absl import logging
 import flax
@@ -490,13 +490,19 @@ class PeftTrainer:
         max_step=max_step,
         profiler_options=self.config.profiler_options,
     )
-    self.training_hooks = SFTLoggingHook()
+    self.training_hooks: list[hooks.TrainingHooks] = [SFTLoggingHook()]
     self.data_hooks = None
     self._jit_cache = set()
     self._mini_batch_size = None
 
-  def with_training_hooks(self, training_hooks: hooks.TrainingHooks):
-    self.training_hooks = training_hooks
+  def with_training_hooks(
+      self, training_hooks: hooks.TrainingHooks | list[hooks.TrainingHooks]
+  ) -> Self:
+    if isinstance(training_hooks, list):
+      self.training_hooks.extend(training_hooks)
+    else:
+      self.training_hooks.append(training_hooks)
+    return self
 
   def with_data_hooks(self, data_hooks: hooks.DataHooks):
     self.data_hooks = data_hooks
@@ -714,8 +720,8 @@ class PeftTrainer:
     if eval_ds:
       self._run_eval(eval_ds, eval_step)
 
-    if self.training_hooks:
-      self.training_hooks.on_train_start(self)
+    for hook in self.training_hooks:
+      hook.on_train_start(self)
 
     train_iterator = iter(train_ds)
     index = 0
@@ -757,8 +763,8 @@ class PeftTrainer:
         )
 
         self._throttler.wait_for_next()
-        if self.training_hooks:
-          self.training_hooks.on_train_step_start(self)
+        for hook in self.training_hooks:
+          hook.on_train_step_start(self)
 
         # Collect tags for the span
         metadata = self.custom_checkpoint_metadata()
@@ -799,8 +805,8 @@ class PeftTrainer:
           span_v2.async_end([train_loss])
 
         self._throttler.add_computation(train_loss)
-        if self.training_hooks:
-          self.training_hooks.on_train_micro_step_end(self, train_loss, grad_norm)
+        for hook in self.training_hooks:
+          hook.on_train_micro_step_end(self, train_loss, grad_norm)
         # NB: put this after _buffer_metrics is important
         self._post_process_train_step(aux)
         self._iter_steps += 1
@@ -811,8 +817,8 @@ class PeftTrainer:
             == 0
         ):
           self._train_steps += 1
-          if self.training_hooks:
-            self.training_hooks.on_train_step_end(self, self._train_steps, train_loss)
+          for hook in self.training_hooks:
+            hook.on_train_step_end(self, self._train_steps, train_loss)
 
           # Checkpoint frequency is configured by checkpointing_options.
           self.checkpoint_manager.save(
@@ -836,8 +842,8 @@ class PeftTrainer:
         "Train loop finished in: %.4f seconds",
         time.perf_counter() - last_step_completion_time,
     )
-    if self.training_hooks:
-      self.training_hooks.on_train_end(self)
+    for hook in self.training_hooks:
+      hook.on_train_end(self)
     if not self.is_managed_externally:
       self.close()
 
@@ -872,9 +878,8 @@ class PeftTrainer:
     This includes saving the last checkpoint,
     and closing the checkpoint manager and metrics logger.
     """
-    if self.training_hooks:
-      # Flush the last step
-      self.training_hooks.on_train_step_end(self, self._train_steps, 0.0)
+    for hook in self.training_hooks:
+      hook.on_train_step_end(self, self._train_steps, 0.0)
     self._save_last_checkpoint()
     self.checkpoint_manager.close()
     if self.metrics_logger is not None:
@@ -890,8 +895,8 @@ class PeftTrainer:
     eval_iterator = iter(eval_ds)
     with self._switch_mode(sft_metrics_logger.Mode.EVAL):
       eval_loss, eval_steps = 0, 0
-      if self.training_hooks:
-        self.training_hooks.on_eval_start(self)
+      for hook in self.training_hooks:
+        hook.on_eval_start(self)
       while True:
         if self.data_hooks:
           eval_example = self.data_hooks.load_next_eval_batch(self)
@@ -906,17 +911,17 @@ class PeftTrainer:
         eval_example = sharding_utils.shard_input(
             eval_example, self.config.data_sharding_axis
         )
-        if self.training_hooks:
-          self.training_hooks.on_eval_step_start(self)
+        for hook in self.training_hooks:
+          hook.on_eval_step_start(self)
         loss, aux = eval_step_fn(eval_example)
         loss = jax.lax.stop_gradient(loss)
-        if self.training_hooks:
-          self.training_hooks.on_eval_micro_step_end(self, loss)
+        for hook in self.training_hooks:
+          hook.on_eval_micro_step_end(self, loss)
         self._post_process_eval_step(aux)
         eval_loss += loss
         eval_steps += 1
-        if self.training_hooks:
-          self.training_hooks.on_eval_step_end(self, loss)
+        for hook in self.training_hooks:
+          hook.on_eval_step_end(self, loss)
 
       if eval_steps == 0:
         logging.warning(
@@ -928,8 +933,8 @@ class PeftTrainer:
           "Train step %d eval completed.",
           self._train_steps,
       )
-      if self.training_hooks:
-        self.training_hooks.on_eval_end(self, eval_loss)
+      for hook in self.training_hooks:
+        hook.on_eval_end(self, eval_loss)
 
 
 def _default_loss_fn(
