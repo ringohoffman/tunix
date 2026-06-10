@@ -49,6 +49,7 @@ class TrainingHooks(Protocol):
       train_ctx: peft_trainer.PeftTrainer,
       train_loss: ArrayLike,
       grad_norm: ArrayLike | None = None,
+      aux: dict[str, ArrayLike] | None = None,
   ) -> None:
     """Called at the end of a micro-step during gradient accumulation."""
 
@@ -71,7 +72,10 @@ class TrainingHooks(Protocol):
     """Called at the end of an evaluation step (batch)."""
 
   def on_eval_micro_step_end(
-      self, train_ctx: peft_trainer.PeftTrainer, eval_loss: ArrayLike
+      self,
+      train_ctx: peft_trainer.PeftTrainer,
+      eval_loss: ArrayLike,
+      aux: dict[str, ArrayLike] | None = None,
   ) -> None:
     """Called at the end of a micro-step during evaluation."""
 

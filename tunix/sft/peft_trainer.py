@@ -21,7 +21,7 @@ import contextlib
 import dataclasses
 import functools
 import time
-from typing import Any, Callable, Concatenate, ParamSpec, Self, TypeAlias, override, overload, TYPE_CHECKING
+from typing import Any, Callable, Concatenate, ParamSpec, Self, TypeAlias, TYPE_CHECKING
 
 from absl import logging
 import flax
@@ -43,16 +43,11 @@ from tunix.sft import hooks
 from tunix.sft import inflight_throttler
 from tunix.sft import metrics_logger as sft_metrics_logger
 from tunix.sft import profiler
-from tunix.sft import progress_bar
 from tunix.sft import sharding_utils
 from tunix.sft import utils
 
 if TYPE_CHECKING:
-  from numpy._typing import _ArrayLikeFloat_co, _FloatLike_co
-
-  _ReductionFunction: TypeAlias = Callable[
-      [_ArrayLikeFloat_co], np.floating[Any]
-  ]
+  from numpy._typing import _FloatLike_co
 
 _ModelInput: TypeAlias = dict[str, ArrayLike]
 P = ParamSpec("P")
@@ -117,268 +112,26 @@ class TrainingInput:
   images: jax.Array | np.ndarray | None = None
 
 
-@dataclasses.dataclass(slots=True, kw_only=True)
-class MetricsBuffer:
-  """Metrics collected for a specific step.
+def _sft_step_metrics_fn(
+    train_ctx: PeftTrainer,
+    step: int,
+    mode: sft_metrics_logger.Mode,
+    metrics: dict[str, _FloatLike_co],
+) -> None:
+  """Computes legacy SFT metrics including perplexity and learning rate."""
+  metrics["perplexity"] = np.exp(metrics["loss"])
 
-  Attributes:
-    step: The training step number.
-    losses: A list of loss values recorded within this step (e.g., across
-      gradient accumulation steps).
-    additional_metrics: Dictionary for storing additional metrics. The key is
-      the metric name, and the value is a tuple containing a list of metric
-      values and a callable to aggregate them.
-  """
-
-  step: int
-  losses: list[ArrayLike]
-  additional_metrics: dict[
-      str, tuple[list[ArrayLike], _ReductionFunction]
-  ] = dataclasses.field(default_factory=dict)
-
-  @property
-  def loss(self):
-    """Returns the mean of the recorded losses for the step."""
-    return np.mean(np.array([np.array(x) for x in self.losses]))
-
-
-def _calculate_global_batch_size(train_example: Any) -> int:
-  """Calculates the global batch size from a training example.
-
-  Args:
-    train_example: A training example, which can be a dataclass, a dict, or an
-      object with attributes.
-
-  Returns:
-    The global batch size.
-
-  Raises:
-    TypeError: If the batch size cannot be determined from the training example.
-  """
-  if (
-      dataclasses.is_dataclass(train_example)
-      and not isinstance(train_example, type)
-  ):
-    attributes = dataclasses.asdict(train_example)
-  elif isinstance(train_example, dict):
-    attributes = train_example
-  else:
-    attributes = vars(train_example)
-
-  for field_value in attributes.values():
-    if isinstance(field_value, (jax.Array, np.ndarray)):
-      # Assume the first array we find has the batch dimension.
-      return field_value.shape[0]
-
-  raise TypeError(
-      "Could not automatically determine batch size. No JAX or NumPy "
-      "array found in the training example."
-  )
-
-
-class SFTLoggingHook(hooks.TrainingHooks):
-  """Hook that handles metric buffering, logging, and progress bar updates."""
-
-  def __init__(self) -> None:
-    self._buffered_train_metrics: MetricsBuffer | None = None
-    self._prev_buffered_train_metrics: MetricsBuffer | None = None
-    self._buffered_eval_metrics: MetricsBuffer | None = None
-    self._pbar: progress_bar.ProgressBar | None = None
-    self._mode: sft_metrics_logger.Mode = sft_metrics_logger.Mode.TRAIN
-
-  @property
-  def _tqdm_train_metrics(self) -> list[str]:
-    return ["loss", "perplexity", "learning_rate"]
-
-  @override
-  def on_train_start(self, train_ctx: PeftTrainer) -> None:
-    if (
-        self._pbar is None
-        and train_ctx.config.max_steps is not None
-        and train_ctx.metrics_logger is not None
-    ):
-      self._pbar = progress_bar.ProgressBar(
-          metrics_prefix=train_ctx.metrics_prefix,
-          metrics_logger=train_ctx.metrics_logger,
-          initial_steps=train_ctx._train_steps,
-          max_steps=train_ctx.config.max_steps,
-          description=train_ctx.config.pbar_description,
-      )
-
-  @override
-  def on_train_end(self, train_ctx: PeftTrainer) -> None:
-    if self._pbar is not None:
-      self._pbar.close()
-      self._pbar = None
-
-  def _buffer_metrics(
-      self,
-      metrics_buffer: MetricsBuffer | None,
-      loss: ArrayLike,
-      step: int,
-      additional_metrics: (
-          dict[str, tuple[ArrayLike, Callable[[_ArrayLikeFloat_co], np.floating[Any]]]] | None
-      ) = None,
-  ) -> MetricsBuffer:
-    if metrics_buffer is None:
-      metrics_buffer = MetricsBuffer(step=step, losses=[loss])
-    else:
-      assert metrics_buffer.step == step
-      metrics_buffer.losses.append(loss)
-
-    if additional_metrics is not None:
-      for k, (v, op) in additional_metrics.items():
-        if k not in metrics_buffer.additional_metrics:
-          metrics_buffer.additional_metrics[k] = ([v], op)
-        else:
-          metrics_buffer.additional_metrics[k][0].append(v)
-
-    return metrics_buffer
-
-  def _log_metrics(
-      self,
-      train_ctx: PeftTrainer,
-      loss: _FloatLike_co,
-      step: int,
-      additional_metrics: dict[str, _FloatLike_co] | None = None,
-  ) -> None:
-    if (metrics_logger := train_ctx.metrics_logger) is None:
-      return
-  
-    def log(metric_name: str, value: _FloatLike_co) -> None:
-      return metrics_logger.log(
-          train_ctx.metrics_prefix, metric_name, value, self._mode, step
-      )
-
-    log("loss", loss)
-
-    perplexity = np.exp(jax.device_get(loss))
-    log("perplexity", perplexity)
-    if self._mode == sft_metrics_logger.Mode.TRAIN:
-      logging.info(
-          "Train step %d training loss: %f - training perplexity: %f",
-          step,
-          loss,
-          perplexity,
-      )
-
-    learning_rate = train_ctx._try_get_learning_rate()
-    if learning_rate is not None:
-      learning_rate = jax.device_get(learning_rate)
-      log("learning_rate", learning_rate)
-
-    for metric_name, value in (additional_metrics or {}).items():
-      log(metric_name, value)
-
-  def _write_metrics(
-      self,
-      train_ctx: PeftTrainer,
-      metrics_buffer: MetricsBuffer,
-  ) -> None:
-    @overload
-    def _to_np_array(v: ArrayLike) -> np.ndarray: ...
-    @overload
-    def _to_np_array(v: list[ArrayLike]) -> list[np.ndarray]: ...
-    def _to_np_array(v):
-      if isinstance(v, jax.Array):
-        return np.asarray(v, dtype=np.float32)
-      elif isinstance(v, list):
-        return [_to_np_array(x) for x in v]
-      return v
-
-    self._log_metrics(
-        train_ctx=train_ctx,
-        loss=metrics_buffer.loss,
-        step=metrics_buffer.step,
-        additional_metrics={
-            k: op(_to_np_array(v))
-            for k, (v, op) in metrics_buffer.additional_metrics.items()
-        },
+  if mode == sft_metrics_logger.Mode.TRAIN:
+    logging.info(
+        "Train step %d training loss: %f - training perplexity: %f",
+        step,
+        metrics["loss"],
+        metrics["perplexity"],
     )
 
-  def _may_update_pbar(
-      self,
-      train_ctx: PeftTrainer,
-      metrics: list[str],
-      step: int | None = None,
-      loss: ArrayLike | None = None,
-  ) -> None:
-    if self._pbar is not None:
-      self._pbar.update_metrics(metrics, self._mode, ndigits=3)
-      self._pbar.update()
-
-  def _write_train_metrics(self, train_ctx: PeftTrainer) -> None:
-    """Writes previous buffered train metrics."""
-    if self._prev_buffered_train_metrics is None:
-      # skip the first step so we can overlap I/O with next step.
-      self._prev_buffered_train_metrics = self._buffered_train_metrics
-      self._buffered_train_metrics = None
-      return
-
-    # increment the step by one for logging purpose, because train_step is not
-    # incremented until the next model update.
-    self._prev_buffered_train_metrics.step += 1
-    self._write_metrics(train_ctx, self._prev_buffered_train_metrics)
-    self._may_update_pbar(
-        train_ctx,
-        self._tqdm_train_metrics,
-        step=self._prev_buffered_train_metrics.step,
-        loss=self._prev_buffered_train_metrics.loss,
-    )
-    self._prev_buffered_train_metrics = self._buffered_train_metrics
-    self._buffered_train_metrics = None
-
-  @override
-  def on_train_micro_step_end(
-      self,
-      train_ctx: PeftTrainer,
-      train_loss: ArrayLike,
-      grad_norm: ArrayLike | None = None,
-  ) -> None:
-    self._mode = sft_metrics_logger.Mode.TRAIN
-    additional_metrics = (
-        {"grad_norm": (grad_norm, np.mean)}
-        if grad_norm is not None
-        else None
-    )
-    self._buffered_train_metrics = self._buffer_metrics(
-        self._buffered_train_metrics,
-        loss=train_loss,
-        step=train_ctx._train_steps,
-        additional_metrics=additional_metrics,
-    )
-
-  @override
-  def on_train_step_end(
-      self,
-      train_ctx: PeftTrainer,
-      train_step: int,
-      train_loss: ArrayLike,
-  ) -> None:
-    self._mode = sft_metrics_logger.Mode.TRAIN
-    self._write_train_metrics(train_ctx)
-
-  @override
-  def on_eval_micro_step_end(
-      self, train_ctx: PeftTrainer, eval_loss: ArrayLike
-  ) -> None:
-    self._mode = sft_metrics_logger.Mode.EVAL
-    self._buffered_eval_metrics = self._buffer_metrics(
-        self._buffered_eval_metrics,
-        loss=eval_loss,
-        step=train_ctx._train_steps,
-    )
-
-  @override
-  def on_eval_end(
-      self,
-      train_ctx: PeftTrainer,
-      eval_loss: ArrayLike,
-  ) -> None:
-    self._mode = sft_metrics_logger.Mode.EVAL
-    if self._buffered_eval_metrics is not None:
-      self._write_metrics(train_ctx, self._buffered_eval_metrics)
-      self._buffered_eval_metrics = None
+  learning_rate = train_ctx._try_get_learning_rate()
+  if learning_rate is not None:
+    metrics["learning_rate"] = learning_rate
 
 
 class PeftTrainer:
@@ -490,18 +243,32 @@ class PeftTrainer:
         max_step=max_step,
         profiler_options=self.config.profiler_options,
     )
-    self.training_hooks: list[hooks.TrainingHooks] = [SFTLoggingHook()]
+
+    metric_name_formatter = sft_metrics_logger.MetricNameFormatter(
+        template="{mode}/{metric}",
+        mode_names={"train": "train", "eval": "eval"},
+    )
+    metric_logging_hook = sft_metrics_logger.MetricLoggingHook(
+        metric_name_formatter=metric_name_formatter,
+        log_epoch_metrics=False,
+        log_eval_batch_metrics=False,
+        tqdm_train_metrics=["loss", "perplexity", "learning_rate"],
+        step_metrics_fn=_sft_step_metrics_fn,
+    )
+    self.with_training_hooks(metric_logging_hook)
+
     self.data_hooks = None
     self._jit_cache = set()
     self._mini_batch_size = None
 
   def with_training_hooks(
-      self, training_hooks: hooks.TrainingHooks | list[hooks.TrainingHooks]
+      self, training_hooks: hooks.TrainingHooks | Iterable[hooks.TrainingHooks]
   ) -> Self:
-    if isinstance(training_hooks, list):
-      self.training_hooks.extend(training_hooks)
-    else:
-      self.training_hooks.append(training_hooks)
+    self.training_hooks = (
+        list(training_hooks)
+        if isinstance(training_hooks, Iterable)
+        else [training_hooks]
+    )
     return self
 
   def with_data_hooks(self, data_hooks: hooks.DataHooks):
@@ -806,7 +573,7 @@ class PeftTrainer:
 
         self._throttler.add_computation(train_loss)
         for hook in self.training_hooks:
-          hook.on_train_micro_step_end(self, train_loss, grad_norm)
+          hook.on_train_micro_step_end(self, train_loss, grad_norm, aux)
         # NB: put this after _buffer_metrics is important
         self._post_process_train_step(aux)
         self._iter_steps += 1
@@ -916,7 +683,7 @@ class PeftTrainer:
         loss, aux = eval_step_fn(eval_example)
         loss = jax.lax.stop_gradient(loss)
         for hook in self.training_hooks:
-          hook.on_eval_micro_step_end(self, loss)
+          hook.on_eval_micro_step_end(self, loss, aux)
         self._post_process_eval_step(aux)
         eval_loss += loss
         eval_steps += 1

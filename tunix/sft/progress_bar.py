@@ -1,10 +1,15 @@
 """Progress bar."""
 
+from __future__ import annotations
+
 import sys
+from typing import TYPE_CHECKING
 
 from absl import logging
 from tqdm import auto
-from tunix.sft import metrics_logger as ml
+
+if TYPE_CHECKING:
+  from tunix.sft import metrics_logger as sft_metrics_logger
 
 
 def _is_in_ipython() -> bool:
@@ -24,7 +29,7 @@ class ProgressBar:
   def __init__(
       self,
       metrics_prefix: str,
-      metrics_logger: ml.MetricsLogger,
+      metrics_logger: sft_metrics_logger.MetricsLogger,
       initial_steps: int,
       max_steps: int,
       description: str | None = None,
@@ -54,7 +59,12 @@ class ProgressBar:
     self.description = description
     self.disable_warning_for_metrics = {"learning_rate"}
 
-  def _update_metric(self, metric_name: str, mode: ml.Mode, ndigits: int = 3):
+  def _update_metric(
+      self,
+      metric_name: str,
+      mode: sft_metrics_logger.Mode,
+      ndigits: int = 3,
+  ) -> None:
     """Update metric corresponding to `metric_name`."""
 
     mode_str = str(mode)
@@ -75,8 +85,11 @@ class ProgressBar:
       )
 
   def update_metrics(
-      self, metric_names: list[str], mode: ml.Mode, ndigits: int = 3
-  ):
+      self,
+      metric_names: list[str],
+      mode: sft_metrics_logger.Mode,
+      ndigits: int = 3,
+  ) -> None:
     """Update metrics corresponding to `metric_names`."""
 
     for metric_name in metric_names:

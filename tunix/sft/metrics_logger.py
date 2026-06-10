@@ -1,3 +1,17 @@
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Metric logger with a unified, protocol-based backend system."""
 
 from __future__ import annotations
@@ -5,16 +19,25 @@ from __future__ import annotations
 import collections
 import dataclasses
 import enum
-from typing import Any, Callable, TypedDict, TYPE_CHECKING
+from typing import Any, Callable, Protocol, TypeAlias, TypedDict, override, overload, TYPE_CHECKING
 
 from absl import logging
 import jax
 from metrax import logging as metrax_logging
 import numpy as np
+from tunix.sft import hooks
+from tunix.sft import progress_bar
 from tunix.utils import env_utils
 
 if TYPE_CHECKING:
-  from numpy._typing import _FloatLike_co
+  from jax.typing import ArrayLike
+  from numpy._typing import _ArrayLikeFloat_co, _FloatLike_co
+
+  from tunix.sft import peft_trainer
+
+  _ReductionFunction: TypeAlias = Callable[
+      [_ArrayLikeFloat_co], np.floating[Any]
+  ]
 
 LoggingBackend = metrax_logging.LoggingBackend
 TensorboardBackend = metrax_logging.TensorboardBackend
@@ -139,6 +162,24 @@ def _calculate_geometric_mean(x: np.ndarray) -> np.ndarray:
   return np.exp(np.mean(np.log(x)))
 
 
+@overload
+def _to_np_array(v: ArrayLike) -> np.ndarray:
+  ...
+
+
+@overload
+def _to_np_array(v: list[ArrayLike]) -> list[np.ndarray]:
+  ...
+
+
+def _to_np_array(
+    v: ArrayLike | list[ArrayLike],
+) -> np.ndarray | list[np.ndarray]:
+  if isinstance(v, list):
+    return [_to_np_array(x) for x in v]
+  return np.asarray(v, dtype=np.float32)
+
+
 class MetricsLogger:
   """Simple Metrics logger.
 
@@ -149,8 +190,14 @@ class MetricsLogger:
   def __init__(
       self,
       metrics_logger_options: MetricsLoggerOptions | None = None,
-  ):
-    self._metrics = {}
+  ) -> None:
+    self._metrics: dict[str, dict[str, dict[str, list[_FloatLike_co]]]] = (
+        collections.defaultdict(
+            lambda: collections.defaultdict(
+                lambda: collections.defaultdict(list)
+            )
+        )
+    )
     self._backends = (
         metrics_logger_options.create_backends()
         if metrics_logger_options
@@ -167,17 +214,30 @@ class MetricsLogger:
       scalar_value: _FloatLike_co,
       mode: Mode | str,
       step: int,
+      *,
+      formatted_name: str | None = None,
   ):
-    """Logs the scalar metric value to local history and via jax.monitoring."""
-    prefix_metrics = self._metrics.setdefault(metrics_prefix, {})
-    mode_metrics = prefix_metrics.setdefault(
-        mode, collections.defaultdict(list)
-    )
-    mode_metrics[metric_name].append(scalar_value)
+    """Logs the scalar metric value to local history and via jax.monitoring.
 
-    jax.monitoring.record_scalar(
-        f"{metrics_prefix}/{mode}/{metric_name}", float(scalar_value), step=step
-    )
+    Args:
+      metrics_prefix: Prefix for metric grouping in internal storage.
+      metric_name: Name of the metric (e.g., "loss", "perplexity").
+      scalar_value: The scalar value to log.
+      mode: Training mode (train/eval).
+      step: The training step number.
+      formatted_name: Optional pre-formatted metric name for
+        ``jax.monitoring.record_scalar``. If ``None``, defaults to
+        ``"{metrics_prefix}/{mode}/{metric_name}"``. This allows callers
+        to override the name format (e.g., ``"loss/train/batch"``) while
+        keeping internal storage keyed by ``(prefix, mode, metric_name)``
+        for progress bar compatibility.
+    """
+    self._metrics[metrics_prefix][mode][metric_name].append(scalar_value)
+
+    if formatted_name is None:
+      formatted_name = f"{metrics_prefix}/{mode}/{metric_name}"
+
+    jax.monitoring.record_scalar(formatted_name, float(scalar_value), step=step)
 
   def metric_exists(
       self, metrics_prefix, metric_name: str, mode: Mode | str
@@ -221,3 +281,406 @@ class MetricsLogger:
     except Exception:  # pylint: disable=broad-exception-caught
       # We didn't register the scalar listener, so this is expected.
       pass
+
+
+@dataclasses.dataclass(slots=True, kw_only=True)
+class MetricsBuffer:
+  """Metrics collected for a specific step.
+
+  Attributes:
+    step: The training step number.
+    metrics: Dictionary for storing all metrics. The key is
+      the metric name, and the value is a list of metric values.
+  """
+
+  step: int
+  metrics: dict[str, list[ArrayLike]] = dataclasses.field(
+      default_factory=lambda: collections.defaultdict(list)
+  )
+
+
+@dataclasses.dataclass(frozen=True)
+class MetricNameFormatter:
+  """Controls how metric names are formatted for logging.
+
+  The default format produces TensorBoard-friendly names where the
+  metric name comes first for natural grouping::
+
+      loss/train/batch
+      perplexity/valid/epoch
+
+  For the legacy tunix format (mode/metric), use::
+
+      MetricNameFormatter(template="{mode}/{metric}")
+
+  Available placeholders:
+
+  - ``{metric}`` — metric name (e.g., "loss", "perplexity")
+  - ``{mode}`` — training mode, after ``mode_names`` mapping
+  - ``{level}`` — aggregation level ("batch" or "epoch")
+  - ``{prefix}`` — ``metrics_prefix`` from ``TrainingConfig``
+  """
+
+  template: str = "{metric}/{mode}/{level}"
+  mode_names: dict[str, str] = dataclasses.field(
+      default_factory=lambda: {"train": "train", "eval": "valid"},
+  )
+
+  def format(
+      self,
+      metric: str,
+      mode: Mode | str,
+      level: str,
+      prefix: str = "",
+  ) -> str:
+    mode_str = self.mode_names.get(str(mode), str(mode))
+    return self.template.format(
+        metric=metric,
+        mode=mode_str,
+        level=level,
+        prefix=prefix,
+    )
+
+
+class StepMetricsFn(Protocol):
+  """Protocol for mutating aggregated metrics before logging.
+
+  This function receives the aggregated metrics dict and may add
+  derived metrics (e.g. perplexity from loss) by mutating it in place.
+  """
+
+  def __call__(
+      self,
+      train_ctx: peft_trainer.PeftTrainer,
+      step: int,
+      mode: Mode,
+      metrics: dict[str, _FloatLike_co],
+  ) -> None:
+    ...
+
+
+class MetricLoggingHook(hooks.TrainingHooks):
+  """General-purpose metric logging hook with buffering and formatting.
+
+  Handles:
+
+  - Double-buffered metric writing (overlap I/O with next step)
+  - JAX array → numpy conversion via ``_to_np_array``
+  - Configurable metric naming via :class:`MetricNameFormatter`
+  - Both batch-level (per-step) and epoch-level (aggregated) logging
+  - Progress bar integration
+
+  **What** gets logged is controlled by the ``step_metrics_fn`` callback
+  provided during initialization. The default implementation logs all
+  metrics from the buffer.
+
+  The hook logs at two levels:
+
+  - **batch** — logged at each training step (for train) or each eval step
+    (for eval).
+  - **epoch** — logged at the end of each eval phase: the mean training
+    loss since the last eval, and the mean eval loss across all eval steps.
+
+  Args:
+    formatter: Controls metric name formatting.  Defaults to
+      ``"{metric}/{mode}/{level}"`` which produces TensorBoard-friendly
+      names like ``"loss/train/batch"``.
+    log_epoch_metrics: If ``True``, additionally accumulate and log
+      epoch-level aggregates at each eval boundary.  Defaults to ``True``.
+    log_eval_batch_metrics: If ``True``, log per-step eval metrics during
+      the eval phase.  Defaults to ``True``.
+    show_progress_bar: If ``True``, show a tqdm progress bar during
+      training.  Defaults to ``True``.
+    tqdm_train_metrics: Metric names to display in the progress bar.
+  """
+
+  def __init__(
+      self,
+      metric_name_formatter: MetricNameFormatter | None = None,
+      *,
+      log_epoch_metrics: bool = True,
+      log_eval_batch_metrics: bool = True,
+      show_progress_bar: bool = True,
+      tqdm_train_metrics: list[str] | None = None,
+      step_metrics_fn: StepMetricsFn | None = None,
+      metric_reducers: dict[str, _ReductionFunction] | None = None,
+  ) -> None:
+    self._metric_name_formatter = metric_name_formatter or MetricNameFormatter()
+    self._log_epoch_metrics = log_epoch_metrics
+    self._log_eval_batch_metrics = log_eval_batch_metrics
+    self._show_progress_bar = show_progress_bar
+    self._tqdm_train_metrics = tqdm_train_metrics or ["loss"]
+    self._step_metrics_fn = step_metrics_fn
+    self._metric_reducers = metric_reducers or {}
+    self._metric_reducers.setdefault("loss", np.mean)
+    self._metric_reducers.setdefault("grad_norm", np.mean)
+
+    self._buffered_train_metrics: MetricsBuffer | None = None
+    self._prev_buffered_train_metrics: MetricsBuffer | None = None
+    self._buffered_eval_metrics: MetricsBuffer | None = None
+    self._pbar: progress_bar.ProgressBar | None = None
+    self._mode: Mode = Mode.TRAIN
+
+    # Epoch-level accumulators (cleared at each eval boundary).
+    self._epoch_train_buffer: MetricsBuffer | None = None
+    self._epoch_eval_buffer: MetricsBuffer | None = None
+
+  def _buffer_metrics(
+      self,
+      metrics_buffer: MetricsBuffer | None,
+      loss: ArrayLike,
+      step: int,
+      aux: dict[str, ArrayLike] | None = None,
+  ) -> MetricsBuffer:
+    if metrics_buffer is None:
+      metrics_buffer = MetricsBuffer(step=step)
+    else:
+      assert metrics_buffer.step == step
+
+    metrics_buffer.metrics["loss"].append(loss)
+
+    if aux is not None:
+      for k, v in aux.items():
+        metrics_buffer.metrics[k].append(v)
+
+    return metrics_buffer
+
+  def _format_name(
+      self,
+      metric: str,
+      level: str,
+      prefix: str = "",
+  ) -> str:
+    """Format a metric name using the configured formatter."""
+    return self._metric_name_formatter.format(
+        metric=metric,
+        mode=self._mode,
+        level=level,
+        prefix=prefix,
+    )
+
+  def _log_metrics(
+      self,
+      train_ctx: peft_trainer.PeftTrainer,
+      metrics: dict[str, _FloatLike_co],
+      step: int,
+      level: str,
+  ) -> None:
+    """Log a flat dict of metrics using the configured formatter."""
+    if (metrics_logger := train_ctx.metrics_logger) is None:
+      return
+
+    prefix = train_ctx.metrics_prefix
+    for metric_name, value in metrics.items():
+      formatted = self._format_name(metric_name, level=level, prefix=prefix)
+      metrics_logger.log(
+          prefix,
+          metric_name,
+          value,
+          self._mode,
+          step,
+          formatted_name=formatted,
+      )
+
+  def _write_metrics(
+      self,
+      train_ctx: peft_trainer.PeftTrainer,
+      metrics_buffer: MetricsBuffer,
+      level: str = "batch",
+  ) -> None:
+    aggregated_metrics: dict[str, _FloatLike_co] = {
+        k: self._metric_reducers[k](_to_np_array(v))
+        for k, v in metrics_buffer.metrics.items()
+    }
+    if self._step_metrics_fn is not None:
+      self._step_metrics_fn(
+          train_ctx,
+          step=metrics_buffer.step,
+          mode=self._mode,
+          metrics=aggregated_metrics,
+      )
+    self._log_metrics(train_ctx, aggregated_metrics, metrics_buffer.step, level)
+
+  @staticmethod
+  def _accumulate_epoch(
+      epoch_buffer: MetricsBuffer | None,
+      step_buffer: MetricsBuffer,
+  ) -> MetricsBuffer:
+    """Merge a per-step buffer into an epoch-level accumulator."""
+    if epoch_buffer is None:
+      epoch_buffer = MetricsBuffer(step=step_buffer.step)
+    else:
+      epoch_buffer.step = step_buffer.step
+    for k, v in step_buffer.metrics.items():
+      epoch_buffer.metrics[k].extend(v)
+    return epoch_buffer
+
+  def _may_update_pbar(
+      self,
+      train_ctx: peft_trainer.PeftTrainer,
+      metrics: list[str],
+  ) -> None:
+    if self._pbar is not None:
+      self._pbar.update_metrics(metrics, self._mode, ndigits=3)
+      self._pbar.update()
+
+  def _write_train_metrics(
+      self,
+      train_ctx: peft_trainer.PeftTrainer,
+  ) -> None:
+    """Writes previous buffered train metrics.
+
+    Uses double-buffering to overlap I/O with the next training step:
+    the first step is skipped so its metrics can be written while the
+    second step is computing.
+    """
+    if self._prev_buffered_train_metrics is None:
+      # skip the first step so we can overlap I/O with next step.
+      self._prev_buffered_train_metrics = self._buffered_train_metrics
+      self._buffered_train_metrics = None
+      return
+
+    # increment the step by one for logging purpose, because train_step is not
+    # incremented until the next model update.
+    self._prev_buffered_train_metrics.step += 1
+    self._write_metrics(
+        train_ctx, self._prev_buffered_train_metrics, level="batch"
+    )
+    self._may_update_pbar(train_ctx, self._tqdm_train_metrics)
+
+    # Accumulate for epoch-level train metrics.
+    if self._log_epoch_metrics:
+      self._epoch_train_buffer = self._accumulate_epoch(
+          self._epoch_train_buffer,
+          self._prev_buffered_train_metrics,
+      )
+
+    self._prev_buffered_train_metrics = self._buffered_train_metrics
+    self._buffered_train_metrics = None
+
+  @override
+  def on_train_start(
+      self,
+      train_ctx: peft_trainer.PeftTrainer,
+  ) -> None:
+    if (
+        self._show_progress_bar
+        and self._pbar is None
+        and train_ctx.config.max_steps is not None
+        and train_ctx.metrics_logger is not None
+    ):
+      self._pbar = progress_bar.ProgressBar(
+          metrics_prefix=train_ctx.metrics_prefix,
+          metrics_logger=train_ctx.metrics_logger,
+          initial_steps=train_ctx._train_steps,
+          max_steps=train_ctx.config.max_steps,
+          description=train_ctx.config.pbar_description,
+      )
+
+  @override
+  def on_train_end(
+      self,
+      train_ctx: peft_trainer.PeftTrainer,
+  ) -> None:
+    if self._pbar is not None:
+      self._pbar.close()
+      self._pbar = None
+
+  @override
+  def on_train_micro_step_end(
+      self,
+      train_ctx: peft_trainer.PeftTrainer,
+      train_loss: ArrayLike,
+      grad_norm: ArrayLike | None = None,
+      aux: dict[str, ArrayLike] | None = None,
+  ) -> None:
+    self._mode = Mode.TRAIN
+
+    aux = {
+        **(aux or {}),
+        **({"grad_norm": grad_norm} if grad_norm is not None else {}),
+    }
+    self._buffered_train_metrics = self._buffer_metrics(
+        self._buffered_train_metrics,
+        loss=train_loss,
+        step=train_ctx._train_steps,
+        aux=aux,
+    )
+
+  @override
+  def on_train_step_end(
+      self,
+      train_ctx: peft_trainer.PeftTrainer,
+      train_step: int,
+      train_loss: ArrayLike,
+  ) -> None:
+    self._mode = Mode.TRAIN
+    self._write_train_metrics(train_ctx)
+
+  @override
+  def on_eval_micro_step_end(
+      self,
+      train_ctx: peft_trainer.PeftTrainer,
+      eval_loss: ArrayLike,
+      aux: dict[str, ArrayLike] | None = None,
+  ) -> None:
+    self._mode = Mode.EVAL
+    self._buffered_eval_metrics = self._buffer_metrics(
+        self._buffered_eval_metrics,
+        loss=eval_loss,
+        step=train_ctx._train_steps,
+        aux=aux,
+    )
+
+  @override
+  def on_eval_step_end(
+      self,
+      train_ctx: peft_trainer.PeftTrainer,
+      eval_loss: ArrayLike,
+  ) -> None:
+    self._mode = Mode.EVAL
+    if self._buffered_eval_metrics is not None:
+      if self._log_eval_batch_metrics:
+        self._write_metrics(
+            train_ctx,
+            self._buffered_eval_metrics,
+            level="batch",
+        )
+      # Accumulate for epoch-level eval metrics.
+      self._epoch_eval_buffer = self._accumulate_epoch(
+          self._epoch_eval_buffer,
+          self._buffered_eval_metrics,
+      )
+      self._buffered_eval_metrics = None
+
+  @override
+  def on_eval_end(
+      self,
+      train_ctx: peft_trainer.PeftTrainer,
+      eval_loss: ArrayLike,
+  ) -> None:
+    self._mode = Mode.EVAL
+
+    # Write epoch-level eval metrics. If eval batch metrics were logged
+    # per-step, the epoch buffer holds the accumulated data. Otherwise,
+    # fall back to the per-step buffer that has been growing naturally.
+    eval_epoch_buffer = self._epoch_eval_buffer or self._buffered_eval_metrics
+    if eval_epoch_buffer is not None:
+      self._write_metrics(
+          train_ctx,
+          eval_epoch_buffer,
+          level="epoch",
+      )
+    self._epoch_eval_buffer = None
+    self._buffered_eval_metrics = None
+
+    # Write epoch-level train metrics accumulated since last eval.
+    if self._log_epoch_metrics and self._epoch_train_buffer is not None:
+      self._mode = Mode.TRAIN
+      self._write_metrics(
+          train_ctx,
+          self._epoch_train_buffer,
+          level="epoch",
+      )
+      self._epoch_train_buffer = None
+      self._mode = Mode.EVAL
