@@ -45,6 +45,36 @@ LayerCache = dict[str, jaxtyping.Array]
 Cache = dict[str, LayerCache]
 
 
+@dataclasses.dataclass
+class GemmaOutput:
+  """Output of the Gemma4 model.
+
+  Attributes:
+    logits: Predicted logits of the model.
+    cache: Updated KV cache, or None if no cache was provided.
+    hidden_states: The hidden states of the model (post final norm, pre decode).
+      Only populated when ``return_hidden_states=True``.
+
+  This class supports tuple unpacking for backward compatibility::
+
+      logits, cache = model(tokens, ...)  # still works
+      out = model(tokens, ...)            # preferred
+      out.logits, out.cache, out.hidden_states
+  """
+
+  logits: jaxtyping.Array
+  cache: Cache | None = None
+  hidden_states: jaxtyping.Array | None = None
+
+  def __iter__(self):
+    """Yield (logits, cache) for backward-compatible tuple unpacking."""
+    yield self.logits
+    yield self.cache
+
+  def __getitem__(self, idx):
+    return (self.logits, self.cache)[idx]
+
+
 class RematConfig(enum.Enum):
   NONE = enum.auto()
   BLOCK = enum.auto()
@@ -1238,8 +1268,33 @@ class Gemma4(BackendMappingMixin, nnx.Module):
       attention_mask=None,
       decode_only_last_token=False,
       segment_ids=None,
-  ):
-    # Accepted for RL pipeline compatibility; unused until seq packing lands.
+      *,
+      target_indices: jaxtyping.Array | None = None,
+      return_hidden_states: bool = False,
+  ) -> GemmaOutput:
+    """Gemma4 forward pass.
+
+    Args:
+      tokens: Input token IDs, shape ``[B, L]``.
+      positions: RoPE position indices, shape ``[B, L]``. Computed from
+        ``tokens`` if not provided.
+      cache: KV cache dict, or ``None`` for training / prefill without cache.
+      attention_mask: Causal attention mask.
+      decode_only_last_token: If ``True``, only decode the last sequence
+        position. Kept for backward compatibility with the sampler.
+      segment_ids: Accepted for RL pipeline compatibility; currently unused.
+      target_indices: Optional ``[B, K]`` array of sequence-axis indices.
+        When provided, only those hidden states are projected through the
+        embedder decode, producing logits of shape ``[B, K, V]`` instead of
+        ``[B, L, V]``. This is mutually exclusive with
+        ``decode_only_last_token``.
+      return_hidden_states: If ``True``, populate ``GemmaOutput.hidden_states``
+        with the post-norm, pre-decode hidden states.
+
+    Returns:
+      A ``GemmaOutput`` with ``logits``, ``cache``, and optionally
+      ``hidden_states``.
+    """
     del segment_ids
     if positions is None:
       B, T = tokens.shape  # pylint: disable=invalid-name
@@ -1294,18 +1349,29 @@ class Gemma4(BackendMappingMixin, nnx.Module):
         new_cache[layer_name] = layer_cache
 
     x = self.final_norm(x)
-    if decode_only_last_token:
+
+    # Sparse gather: select specific hidden states before the expensive decode.
+    if target_indices is not None:
+      # target_indices shape: [B, K] — gather K positions per batch element.
+      x = jnp.take_along_axis(x, target_indices[..., None], axis=1)
+    elif decode_only_last_token:
       # Only compute logits for the last token. This can significantly reduce
       # memory requirements during prefill (when sampling), since we only need
       # the logits for the last token to sample from.
       x = x[:, -1:, :]
+
+    hidden_states_out = x if return_hidden_states else None
     logits = self.embedder.decode(x).astype(jnp.float32)
 
     if self.config.final_logit_softcap is not None:
       logits /= self.config.final_logit_softcap
       logits = jnp.tanh(logits) * self.config.final_logit_softcap
 
-    return logits, (None if cache is None else new_cache)
+    return GemmaOutput(
+        logits=logits,
+        cache=None if cache is None else new_cache,
+        hidden_states=hidden_states_out,
+    )
 
   def init_cache(self, batch_size, max_seq_len, dtype):
     cache = {}
