@@ -825,6 +825,141 @@ class Sampler(base_sampler.BaseSampler):
         for x in tokens
     ])
 
+    return self._generate_impl(
+        all_input_ids=all_input_ids,
+        max_prompt_length=max_prompt_length,
+        max_generation_steps=max_generation_steps,
+        echo=echo,
+        return_logits=return_logits,
+        return_logprobs=return_logprobs,
+        forbidden_token_ids=forbidden_token_ids,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        beam_size=beam_size,
+        seed=seed,
+        pad_output=pad_output,
+        processed_images=processed_images,
+    )
+
+  def generate_from_tokens(
+      self,
+      input_ids: np.ndarray | jnp.ndarray,
+      max_generation_steps: int,
+      *,
+      eos_tokens: Sequence[int] | None = None,
+      forbidden_tokens: Iterable[int] | None = None,
+      temperature: float = 0.0,
+      top_p: Optional[float] = None,
+      top_k: Optional[int] = None,
+      beam_size: Optional[int] = None,
+      seed: int | None = None,
+      echo: bool = False,
+      return_logits: bool = False,
+      return_logprobs: bool = False,
+      pad_output: bool = False,
+  ) -> base_sampler.SamplerOutput:
+    """Generate from pre-tokenized, pre-padded token arrays.
+
+    Bypasses tokenize() and host-side padding. Callers are responsible for:
+      1. Tokenization (e.g. via BatchTokenizer or HuggingFace tokenizer)
+      2. Left-padding to uniform prompt length
+      3. Optionally transferring to device (arrays will be converted to
+         jax arrays if they aren't already)
+
+    This enables efficient pipelines where tokenization and device transfer
+    happen on a background thread (e.g. via PrefetchDataLoader), while the
+    accelerator is busy decoding the previous batch.
+
+    Args:
+      input_ids: Left-padded token IDs of shape [B, prompt_len]. Padding
+        should use the tokenizer's pad_id.
+      max_generation_steps: Maximum number of tokens to generate.
+      eos_tokens: End-of-sequence tokens. Defaults to tokenizer's eos_id.
+      forbidden_tokens: Token IDs that are disallowed during generation.
+      temperature: Sampling temperature (0.0 = greedy).
+      top_p: Nucleus sampling threshold.
+      top_k: Top-k sampling threshold.
+      beam_size: Beam size for beam search.
+      seed: Random seed.
+      echo: Whether to include the prompt in the output.
+      return_logits: Whether to return per-step logits.
+      return_logprobs: Whether to return per-step log probabilities.
+      pad_output: Whether to pad output to maximum length.
+
+    Returns:
+      SamplerOutput with generated text, tokens, and optional logits/logprobs.
+    """
+    self.eos_ids = jnp.array(eos_tokens or [self.tokenizer.eos_id()])
+    forbidden_token_ids = tuple(forbidden_tokens) if forbidden_tokens else None
+
+    # Ensure we have a numpy array for padded_prompt_tokens in the output.
+    if isinstance(input_ids, jnp.ndarray):
+      all_input_ids_np = np.asarray(input_ids)
+    else:
+      all_input_ids_np = np.asarray(input_ids)
+
+    max_prompt_length = input_ids.shape[1]
+
+    return self._generate_impl(
+        all_input_ids=all_input_ids_np,
+        max_prompt_length=max_prompt_length,
+        max_generation_steps=max_generation_steps,
+        echo=echo,
+        return_logits=return_logits,
+        return_logprobs=return_logprobs,
+        forbidden_token_ids=forbidden_token_ids,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        beam_size=beam_size,
+        seed=seed,
+        pad_output=pad_output,
+        processed_images=None,
+    )
+
+  def _generate_impl(
+      self,
+      all_input_ids: np.ndarray,
+      max_prompt_length: int,
+      max_generation_steps: int,
+      *,
+      echo: bool = False,
+      return_logits: bool = False,
+      return_logprobs: bool = False,
+      forbidden_token_ids: tuple[int, ...] | None = None,
+      temperature: float = 0.0,
+      top_p: Optional[float] = None,
+      top_k: Optional[int] = None,
+      beam_size: Optional[int] = None,
+      seed: int | jax.Array | None = None,
+      pad_output: bool = False,
+      processed_images: jnp.ndarray | None = None,
+  ) -> base_sampler.SamplerOutput:
+    """Core generation logic shared by __call__ and generate_from_tokens.
+
+    Takes pre-tokenized, pre-padded numpy arrays and runs the full
+    prefill → decode → extract output pipeline.
+
+    Args:
+      all_input_ids: Left-padded token IDs [B, max_prompt_length].
+      max_prompt_length: Prompt length (with padding).
+      max_generation_steps: Maximum tokens to generate.
+      echo: Include prompt in output.
+      return_logits: Return per-step logits.
+      return_logprobs: Return per-step log probabilities.
+      forbidden_token_ids: Disallowed token IDs.
+      temperature: Sampling temperature.
+      top_p: Nucleus sampling threshold.
+      top_k: Top-k sampling threshold.
+      beam_size: Beam search beam size.
+      seed: Random seed (int, PRNGKey, or None).
+      pad_output: Pad output to max length.
+      processed_images: Pre-processed images, or None.
+
+    Returns:
+      SamplerOutput.
+    """
     total_sampling_steps = max_prompt_length + max_generation_steps
     if total_sampling_steps > self.cache_config.cache_size:
       raise ValueError(
