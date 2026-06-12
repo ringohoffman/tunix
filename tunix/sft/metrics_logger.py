@@ -669,10 +669,12 @@ class MetricLoggingHook(hooks.TrainingHooks):
     self._epoch_eval_buffer = None
     self._buffered_eval_metrics = None
 
-    # Write epoch-level train metrics accumulated since last eval.
     # Write aggregate train metrics accumulated since last eval.
+    # Override step to align with the eval boundary — the double-buffering
+    # in _write_train_metrics causes the buffer's step to lag by 1.
     if self._epoch_train_buffer is not None:
       self._mode = Mode.TRAIN
+      self._epoch_train_buffer.step = train_ctx._train_steps
       self._write_metrics(train_ctx, self._epoch_train_buffer)
       self._epoch_train_buffer = None
       self._mode = Mode.EVAL
