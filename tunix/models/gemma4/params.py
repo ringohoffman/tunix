@@ -50,6 +50,7 @@ def create_model_from_checkpoint(
     model_config: model_lib.ModelConfig,
     mesh: jax.sharding.Mesh | None = None,
     dtype: jnp.dtype = jnp.bfloat16,
+    fallback_sharding: jax.sharding.Sharding | None | str = 'auto',
 ) -> model_lib.Gemma4:
   """Load a Gemma4 model from an Orbax checkpoint.
 
@@ -58,6 +59,11 @@ def create_model_from_checkpoint(
     model_config: Gemma4 model configuration.
     mesh: Optional JAX sharding mesh for distributed loading.
     dtype: Parameter dtype (default: bfloat16).
+    fallback_sharding: Sharding to use when the checkpoint's saved topology
+        doesn't match the current devices.  ``'auto'`` (default) uses
+        ``NamedSharding(mesh, PartitionSpec())`` when a mesh is provided,
+        or ``SingleDeviceSharding(jax.devices()[0])`` otherwise.  Pass
+        ``None`` to disable (strict topology match required).
 
   Returns:
     A Gemma4 model instance with loaded weights.
@@ -65,7 +71,34 @@ def create_model_from_checkpoint(
   abs_model = nnx.eval_shape(
       lambda: model_lib.Gemma4(model_config, rngs=nnx.Rngs(0))
   )
-  raw_params = ocp.StandardCheckpointer().restore(checkpoint_path)
+
+  # Resolve fallback_sharding.
+  if fallback_sharding == 'auto':
+    if mesh is not None:
+      fallback_sharding = jax.sharding.NamedSharding(
+          mesh, jax.sharding.PartitionSpec()
+      )
+    else:
+      fallback_sharding = jax.sharding.SingleDeviceSharding(jax.devices()[0])
+
+  # Restore checkpoint.  Use the parent Checkpointer.restore with
+  # StandardRestore to pass fallback_sharding, which handles topology
+  # mismatches (e.g., checkpoint saved on 16 TPUs, restored on 1 CPU).
+  ckptr = ocp.StandardCheckpointer()
+  if fallback_sharding is not None:
+    from orbax.checkpoint import args as ocp_args
+    raw_params = ocp.Checkpointer.restore(
+        ckptr,
+        checkpoint_path,
+        args=ocp_args.StandardRestore(
+            item=None,
+            strict=False,
+            fallback_sharding=fallback_sharding,
+        ),
+    )
+  else:
+    raw_params = ckptr.restore(checkpoint_path)
+
   mapped_params = map_from_upstream_checkpoint(raw_params)
   model_state = nnx.state(abs_model)
 
