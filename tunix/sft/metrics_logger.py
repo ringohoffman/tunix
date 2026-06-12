@@ -346,12 +346,14 @@ class MetricNameFormatter:
       prefix: str = "",
   ) -> str:
     mode_str = self.mode_names.get(str(mode), str(mode))
-    return self.template.format(
+    name = self.template.format(
         metric=metric,
         mode=mode_str,
         level=level,
         prefix=prefix,
     )
+    # Strip trailing slashes when level is empty (e.g. "loss/train/" -> "loss/train").
+    return name.rstrip("/")
 
 
 class StepMetricsFn(Protocol):
@@ -379,7 +381,7 @@ class MetricLoggingHook(hooks.TrainingHooks):
   - Double-buffered metric writing (overlap I/O with next step)
   - JAX array → numpy conversion via ``_to_np_array``
   - Configurable metric naming via :class:`MetricNameFormatter`
-  - Both batch-level (per-step) and epoch-level (aggregated) logging
+  - Both per-step (train) and aggregate (eval) logging
   - Progress bar integration
 
   **What** gets logged is controlled by the ``step_metrics_fn`` callback
@@ -388,19 +390,14 @@ class MetricLoggingHook(hooks.TrainingHooks):
 
   The hook logs at two levels:
 
-  - **batch** — logged at each training step (for train) or each eval step
-    (for eval).
-  - **epoch** — logged at the end of each eval phase: the mean training
+  - **step** — logged at each training step.
+  - **aggregate** — logged at the end of each eval phase: the mean training
     loss since the last eval, and the mean eval loss across all eval steps.
 
   Args:
     formatter: Controls metric name formatting.  Defaults to
       ``"{metric}/{mode}/{level}"`` which produces TensorBoard-friendly
-      names like ``"loss/train/batch"``.
-    log_epoch_metrics: If ``True``, additionally accumulate and log
-      epoch-level aggregates at each eval boundary.  Defaults to ``True``.
-    log_eval_batch_metrics: If ``True``, log per-step eval metrics during
-      the eval phase.  Defaults to ``True``.
+      names like ``"loss/train/step"``.
     show_progress_bar: If ``True``, show a tqdm progress bar during
       training.  Defaults to ``True``.
     tqdm_train_metrics: Metric names to display in the progress bar.
@@ -410,16 +407,12 @@ class MetricLoggingHook(hooks.TrainingHooks):
       self,
       metric_name_formatter: MetricNameFormatter | None = None,
       *,
-      log_epoch_metrics: bool = True,
-      log_eval_batch_metrics: bool = True,
       show_progress_bar: bool = True,
       tqdm_train_metrics: list[str] | None = None,
       step_metrics_fn: StepMetricsFn | None = None,
       metric_reducers: dict[str, _ReductionFunction] | None = None,
   ) -> None:
     self._metric_name_formatter = metric_name_formatter or MetricNameFormatter()
-    self._log_epoch_metrics = log_epoch_metrics
-    self._log_eval_batch_metrics = log_eval_batch_metrics
     self._show_progress_bar = show_progress_bar
     self._tqdm_train_metrics = tqdm_train_metrics or ["loss"]
     self._step_metrics_fn = step_metrics_fn
@@ -498,7 +491,7 @@ class MetricLoggingHook(hooks.TrainingHooks):
       self,
       train_ctx: peft_trainer.PeftTrainer,
       metrics_buffer: MetricsBuffer,
-      level: str = "batch",
+      level: str = "",
   ) -> None:
     aggregated_metrics: dict[str, _FloatLike_co] = {
         k: self._metric_reducers[k](_to_np_array(v))
@@ -556,16 +549,16 @@ class MetricLoggingHook(hooks.TrainingHooks):
     # incremented until the next model update.
     self._prev_buffered_train_metrics.step += 1
     self._write_metrics(
-        train_ctx, self._prev_buffered_train_metrics, level="batch"
+        train_ctx, self._prev_buffered_train_metrics, level="step"
     )
     self._may_update_pbar(train_ctx, self._tqdm_train_metrics)
 
     # Accumulate for epoch-level train metrics.
-    if self._log_epoch_metrics:
-      self._epoch_train_buffer = self._accumulate_epoch(
-          self._epoch_train_buffer,
-          self._prev_buffered_train_metrics,
-      )
+    # Accumulate for aggregate train metrics.
+    self._epoch_train_buffer = self._accumulate_epoch(
+        self._epoch_train_buffer,
+        self._prev_buffered_train_metrics,
+    )
 
     self._prev_buffered_train_metrics = self._buffered_train_metrics
     self._buffered_train_metrics = None
@@ -652,12 +645,6 @@ class MetricLoggingHook(hooks.TrainingHooks):
   ) -> None:
     self._mode = Mode.EVAL
     if self._buffered_eval_metrics is not None:
-      if self._log_eval_batch_metrics:
-        self._write_metrics(
-            train_ctx,
-            self._buffered_eval_metrics,
-            level="batch",
-        )
       # Accumulate for epoch-level eval metrics.
       self._epoch_eval_buffer = self._accumulate_epoch(
           self._epoch_eval_buffer,
@@ -678,21 +665,14 @@ class MetricLoggingHook(hooks.TrainingHooks):
     # fall back to the per-step buffer that has been growing naturally.
     eval_epoch_buffer = self._epoch_eval_buffer or self._buffered_eval_metrics
     if eval_epoch_buffer is not None:
-      self._write_metrics(
-          train_ctx,
-          eval_epoch_buffer,
-          level="epoch",
-      )
+      self._write_metrics(train_ctx, eval_epoch_buffer)
     self._epoch_eval_buffer = None
     self._buffered_eval_metrics = None
 
     # Write epoch-level train metrics accumulated since last eval.
-    if self._log_epoch_metrics and self._epoch_train_buffer is not None:
+    # Write aggregate train metrics accumulated since last eval.
+    if self._epoch_train_buffer is not None:
       self._mode = Mode.TRAIN
-      self._write_metrics(
-          train_ctx,
-          self._epoch_train_buffer,
-          level="epoch",
-      )
+      self._write_metrics(train_ctx, self._epoch_train_buffer)
       self._epoch_train_buffer = None
       self._mode = Mode.EVAL

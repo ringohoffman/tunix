@@ -250,8 +250,6 @@ class PeftTrainer:
     )
     metric_logging_hook = sft_metrics_logger.MetricLoggingHook(
         metric_name_formatter=metric_name_formatter,
-        log_epoch_metrics=False,
-        log_eval_batch_metrics=False,
         tqdm_train_metrics=["loss", "perplexity", "learning_rate"],
         step_metrics_fn=_sft_step_metrics_fn,
     )
