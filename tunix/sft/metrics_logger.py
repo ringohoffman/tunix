@@ -204,7 +204,19 @@ class MetricsLogger:
         else []
     )
     if metrics_logger_options and jax.process_index() == 0:
+      has_tensorboard_backend = any(
+          isinstance(babckend, TensorboardBackend)
+          for babckend in self._backends
+      )
       for backend in self._backends:
+        if (
+            isinstance(backend, WandbBackend)
+            and backend._sync_tensorboard
+            and has_tensorboard_backend
+        ):
+          # if sync_tensorboard=True, wandb automatically copies its scalars
+          # from Tensorboard and wandb.log must not be used
+          continue
         jax.monitoring.register_scalar_listener(backend.log_scalar)
 
   def log(
