@@ -300,6 +300,11 @@ def load_and_create_model_orig(
       state_dict = jax.tree.map_with_path(
           current_file_update_tensor, state_dict
       )
+    
+    # Block to ensure the tensors from this file are fully transferred to the TPU devices
+    # before we load the next file. This prevents the host memory from ballooning
+    # to the entire size of the model.
+    jax.block_until_ready(state_dict)
 
   return nnx.merge(graph_def, state_dict)
 
