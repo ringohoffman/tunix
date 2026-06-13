@@ -31,7 +31,7 @@ dependencies = [
   "kagglehub",
   "numba",
   "omegaconf", # CLI config
-  "orbax-checkpoint>=0.12.0",
+  "orbax-checkpoint @ git+https://github.com/ringohoffman/orbax.git@CheckpointManagerOptions-save_device_host_concurrent_gb#subdirectory=checkpoint",
   "pillow",  # Image processing
   "pylatexenc",  # Eval result parsing
   "python-dotenv",  # Huggingface API key
