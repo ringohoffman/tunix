@@ -1385,7 +1385,6 @@ class Gemma4(BackendMappingMixin, nnx.Module):
       A ``GemmaOutput`` with ``logits``, ``cache``, and optionally
       ``hidden_states``.
     """
-    del segment_ids
     if positions is None:
       B, T = tokens.shape  # pylint: disable=invalid-name
       positions = jnp.tile(jnp.arange(T)[None, :], (B, 1))
