@@ -55,10 +55,12 @@ class CheckpointManager:
             'model_params': ocp.PyTreeCheckpointHandler(
                 use_ocdbt=False,
                 use_zarr3=False,
+                save_device_host_concurrent_gb=4,
             ),
             'optimizer_state': ocp.PyTreeCheckpointHandler(
                 use_ocdbt=False,
                 use_zarr3=False,
+                save_device_host_concurrent_gb=4,
             ),
         }
         if os.getenv('ENABLE_PATHWAYS_PERSISTENCE', ''):
