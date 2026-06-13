@@ -249,6 +249,8 @@ def _get_key_and_transform_mapping(cfg: model_lib.ModelConfig):
   return mapping
 
 
+import numpy as np
+
 def _make_preprocess_fn(cfg: model_lib.ModelConfig):
   """Creates a tensor preprocessing function for Gemma 4 safetensors."""
   q_pat = re.compile(r"tmp\.layers\.([0-9]+)\.attn\.q$")
@@ -261,20 +263,20 @@ def _make_preprocess_fn(cfg: model_lib.ModelConfig):
     if q.shape == (cfg.num_heads, cfg.embed_dim, head_dim):
       return q
     if q.shape == (cfg.embed_dim, cfg.num_heads, head_dim):
-      return jnp.transpose(q, (1, 0, 2))
+      return np.transpose(q, (1, 0, 2))
     if q.shape == (cfg.num_heads, head_dim, cfg.embed_dim):
-      return jnp.transpose(q, (0, 2, 1))
+      return np.transpose(q, (0, 2, 1))
     raise ValueError(f"Unexpected q shape: {q.shape}")
 
   def _to_kdh(x: jnp.ndarray, head_dim: int, num_kv_heads: int) -> jnp.ndarray:
     # 2D shape handling (Heads * HeadDim, Hidden) or (Hidden, Heads * HeadDim)
     if x.ndim == 2:
       if x.shape == (num_kv_heads * head_dim, cfg.embed_dim):
-        x = jnp.reshape(x, (num_kv_heads, head_dim, cfg.embed_dim))
-        return jnp.transpose(x, (0, 2, 1))
+        x = np.reshape(x, (num_kv_heads, head_dim, cfg.embed_dim))
+        return np.transpose(x, (0, 2, 1))
       if x.shape == (cfg.embed_dim, num_kv_heads * head_dim):
-        x = jnp.reshape(x, (cfg.embed_dim, num_kv_heads, head_dim))
-        return jnp.transpose(x, (1, 0, 2))
+        x = np.reshape(x, (cfg.embed_dim, num_kv_heads, head_dim))
+        return np.transpose(x, (1, 0, 2))
       raise ValueError(
           f"Unexpected 2D kv shape: {x.shape}, expected dims to contain {num_kv_heads * head_dim} and {cfg.embed_dim}"
       )
@@ -286,7 +288,7 @@ def _make_preprocess_fn(cfg: model_lib.ModelConfig):
       all_axes = {0, 1, 2}
       h_axis = list(all_axes - {f_axis, k_axis})[0]
 
-      x = jnp.transpose(x, (h_axis, f_axis, k_axis))
+      x = np.transpose(x, (h_axis, f_axis, k_axis))
       return x[:num_kv_heads]
     raise ValueError(
         f"Unexpected kv shape: {x.shape}, expected dims to contain {cfg.embed_dim} and {head_dim}"
@@ -345,7 +347,7 @@ def _make_preprocess_fn(cfg: model_lib.ModelConfig):
       elif (not k_eq_v_active) and (k is not None) and (v is not None):
         k = _to_kdh(k, effective_head_dim, effective_num_kv_heads)
         v = _to_kdh(v, effective_head_dim, effective_num_kv_heads)
-        out[f"layers.{layer_id_str}.attn.kv_einsum.w"] = jnp.stack(
+        out[f"layers.{layer_id_str}.attn.kv_einsum.w"] = np.stack(
             [k, v], axis=0
         )
         slots.pop("k", None)
