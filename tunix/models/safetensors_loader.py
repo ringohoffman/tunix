@@ -215,9 +215,20 @@ def load_and_create_model_orig(
             if reshape:
               v = v.reshape(reshape)
 
-          current_arr = jnp.array(v)
+          current_arr = v
           if dtype and current_arr.dtype != dtype:
-            current_arr = current_arr.astype(dtype)
+            # We must use numpy to cast because jax.numpy casts onto the device.
+            import numpy as np
+            # JAX dtypes (like jax.numpy.bfloat16) need to be converted to numpy dtypes
+            try:
+              np_dtype = np.dtype(dtype)
+            except TypeError:
+              from ml_dtypes import bfloat16
+              if dtype == jnp.bfloat16:
+                np_dtype = bfloat16
+              else:
+                np_dtype = dtype
+            current_arr = current_arr.astype(np_dtype)
 
           if jax_key_mapped in file_loaded_tensors:
             raise ValueError(
@@ -271,10 +282,6 @@ def load_and_create_model_orig(
                   f' {loaded_arr.shape}, expected {param.shape}'
               )
             if shard is not None:
-              # Ensure loaded_arr is a numpy array on host. device_put on a
-              # device array will compile an expensive device-to-device
-              # broadcast program instead of a simple host-to-device copy.
-              loaded_arr = jax.device_get(loaded_arr)
               return jax.device_put(loaded_arr, shard)
             else:
               return jax.device_put(loaded_arr, jax.devices()[0])
