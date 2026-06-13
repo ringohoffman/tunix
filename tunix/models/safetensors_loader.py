@@ -282,9 +282,18 @@ def load_and_create_model_orig(
                   f' {loaded_arr.shape}, expected {param.shape}'
               )
             if shard is not None:
-              return jax.device_put(loaded_arr, shard)
+              result = jax.device_put(loaded_arr, shard)
             else:
-              return jax.device_put(loaded_arr, jax.devices()[0])
+              result = jax.device_put(loaded_arr, jax.devices()[0])
+            # Block until this tensor is fully transferred to prevent
+            # the Pathways proxy buffer from accumulating too much data.
+            # Without this, the proxy sidecar (100G limit) OOMs when all
+            # 62GB of model weights are queued simultaneously.
+            result.block_until_ready()
+            # Remove the numpy array reference so it can be GC'd immediately,
+            # reducing host memory pressure.
+            del current_file_tensors[k]
+            return result
 
         return param
 
@@ -300,11 +309,6 @@ def load_and_create_model_orig(
       state_dict = jax.tree.map_with_path(
           current_file_update_tensor, state_dict
       )
-    
-    # Block to ensure the tensors from this file are fully transferred to the TPU devices
-    # before we load the next file. This prevents the host memory from ballooning
-    # to the entire size of the model.
-    jax.block_until_ready(state_dict)
 
   return nnx.merge(graph_def, state_dict)
 
