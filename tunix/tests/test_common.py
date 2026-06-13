@@ -132,6 +132,7 @@ class ModelConfig:
   head_dim: int = 16
   vocab_size: int = 256
   vision_config: VisionConfig | None = None
+  remat_config: int | None = None
 
 
 class ToyTransformer(nnx.Module):

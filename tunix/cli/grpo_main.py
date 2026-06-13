@@ -604,9 +604,11 @@ class GrpoPipeline(config.HyperParameters):
   # ------------------------------------------------------------------
 
   def _get_tokenizer(self):
+    model_config = self.config.get("actor_model_config") or self.config.get("model_config")
     return model_lib.create_tokenizer(
         self.config["tokenizer_config"],
         self.config["tokenizer_config"]["tokenizer_path"],
+        model_config=model_config,
     )
 
   def _get_data_module(self,):

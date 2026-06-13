@@ -16,7 +16,7 @@
 set -x # Enable xtrace
 
 batch_size=${batch_size:-1}
-train_micro_batch_size=${train_micro_batch_size:-2}
+train_micro_batch_size=${train_micro_batch_size:-1}
 total_generation_steps=${total_generation_steps:-512}
 max_prompt_length=${max_prompt_length:-128}
 num_batches=${num_batches:-3738}
@@ -52,7 +52,6 @@ python3 -m tunix.cli.grpo_main \
   override_config_file=examples/rl/grpo/gsm8k/configs/gemma2_2b.yaml \
   model_config.model_download_path="/tmp/models/gemma-2-2b" \
   model_config.intermediate_ckpt_dir="$intermediate_ckpt_dir" \
-  tokenizer_config.tokenizer_path="/tmp/models/gemma-2-2b/models/google/gemma-2/flax/gemma2-2b-it/1/tokenizer.model" \
   batch_size=$batch_size \
   num_batches=$num_batches \
   num_train_epochs=$num_train_epochs \

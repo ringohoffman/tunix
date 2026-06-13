@@ -643,6 +643,11 @@ class Attention(nnx.Module):
           param_dtype=config.param_dtype,
       )
     else:
+      if self.num_kv_heads == 1:
+        kv_sharding = (None, None, 'fsdp', None)
+      else:
+        kv_sharding = config.shd_config.kv_weight_cndh
+
       self.kv_einsum = Einsum(
           einsum_str='BSD,CKDH->CBSKH',
           shape=(
@@ -652,9 +657,7 @@ class Attention(nnx.Module):
               self.head_dim,
           ),
           rngs=rngs,
-          sharding=(None, None, 'fsdp', None)
-          if self.num_kv_heads == 1
-          else config.shd_config.kv_weight_cndh,
+          sharding=kv_sharding,
           dtype=config.dtype,
           param_dtype=config.param_dtype,
       )
@@ -680,6 +683,7 @@ class Attention(nnx.Module):
       cache: LayerCache | None,
       attn_mask: jaxtyping.Array,
       kv_shared_cache: LayerCache | None = None,
+      segment_ids: jaxtyping.Array | None = None,
   ) -> tuple[
       LayerCache | None,
       jaxtyping.Array,
@@ -773,7 +777,8 @@ class Attention(nnx.Module):
           'k': key_proj,
       }
 
-    _, _, qh, _ = query_proj.shape
+    b, _, qh, _ = query_proj.shape
+    _, _, kh, _ = key_proj.shape
 
     if self.config.use_flash_attention and seq_len > 1:
       query_proj = query_proj.transpose(0, 2, 1, 3)
@@ -803,6 +808,8 @@ class Attention(nnx.Module):
       )
 
       shd_b, shd_t, shd_n, shd_h = self.config.shd_config.act_btnh
+      if mesh is not None and shd_b is not None and shd_b in mesh.shape and b % mesh.shape[shd_b] != 0:
+        shd_b = None
       head_shards = (
           mesh.shape[shd_n] if shd_n is not None and shd_n in mesh.shape else 1
       )
@@ -818,25 +825,81 @@ class Attention(nnx.Module):
       )
 
       shd_spec = P(shd_b, shd_n, shd_t, shd_h)
-      unsharded_seq = P(shd_b, shd_n, None, shd_h)
+      shd_n_kv = (
+          shd_n
+          if mesh is not None
+          and shd_n is not None
+          and shd_n in mesh.shape
+          and kh % mesh.shape[shd_n] == 0
+          else None
+      )
+      unsharded_seq_kv = P(shd_b, shd_n_kv, None, shd_h)
       kernel_spec = splash_attn_kernel.manual_sharding_spec(
           shd.NamedSharding(mesh, P(shd_n, shd_t))
       )
 
-      @partial(
-          shard_map,
-          mesh=mesh,
-          in_specs=(kernel_spec, shd_spec, unsharded_seq, unsharded_seq),
-          out_specs=shd_spec,
-          check_rep=False,
-      )
-      def sharded_splash_attn(kernel, q_block, k_block, v_block):
-        return jax.vmap(kernel)(q_block, k_block, v_block)
+      if segment_ids is not None:
+        seg_spec = P(shd_b, shd_t)
+        unsharded_seg_spec = P(shd_b, None)
 
-      qkv: jaxtyping.Array = sharded_splash_attn(
-          splash_attn_kernel, query_proj, key_proj, value_proj
-      )
+        @partial(
+            shard_map,
+            mesh=mesh,
+            in_specs=(
+                kernel_spec,
+                shd_spec,
+                unsharded_seq_kv,
+                unsharded_seq_kv,
+                seg_spec,
+                unsharded_seg_spec,
+            ),
+            out_specs=shd_spec,
+            check_rep=False,
+        )
+        def sharded_splash_attn(
+            kernel, q_block, k_block, v_block, q_seg_block, kv_seg_block
+        ):
+          seg_ids = splash.SegmentIds(q=q_seg_block, kv=kv_seg_block)
+          return jax.vmap(kernel)(
+              q_block, k_block, v_block, segment_ids=seg_ids
+          )
+
+        qkv: jaxtyping.Array = sharded_splash_attn(
+            splash_attn_kernel,
+            query_proj,
+            key_proj,
+            value_proj,
+            segment_ids,
+            segment_ids,
+        )
+      else:
+
+        @partial(
+            shard_map,
+            mesh=mesh,
+            in_specs=(
+                kernel_spec,
+                shd_spec,
+                unsharded_seq_kv,
+                unsharded_seq_kv,
+            ),
+            out_specs=shd_spec,
+            check_rep=False,
+        )
+        def sharded_splash_attn(kernel, q_block, k_block, v_block):
+          return jax.vmap(kernel)(q_block, k_block, v_block)
+
+        qkv: jaxtyping.Array = sharded_splash_attn(
+            splash_attn_kernel,
+            query_proj,
+            key_proj,
+            value_proj,
+        )
       encoded = qkv.transpose(0, 2, 1, 3)
+      query_proj = query_proj.transpose(0, 2, 1, 3)
+      key_proj = key_proj.transpose(0, 2, 1, 3)
+      value_proj = value_proj.transpose(0, 2, 1, 3)
+
     else:
       if self.use_gqa:
         b, t, kg, h = query_proj.shape
@@ -922,7 +985,15 @@ class Attention(nnx.Module):
   def use_gqa(self):
     return self.num_kv_heads != self.config.num_heads and self.num_kv_heads > 1
 
-  def __call__(self, x, segment_pos, cache, attn_mask, kv_shared_cache=None):
+  def __call__(
+      self,
+      x,
+      segment_pos,
+      cache,
+      attn_mask,
+      kv_shared_cache=None,
+      segment_ids=None,
+  ):
     remat_config = getattr(self.config, 'remat_config', RematConfig.NONE)
     if (
         remat_config == RematConfig.BLOCK
@@ -932,11 +1003,16 @@ class Attention(nnx.Module):
       # as the first argument. graph_updates=False prevents TraceContextError
       # when mutating params across jax transformation trace levels.
       return nnx.remat(self.block.__func__, graph_updates=False)(
-          self, x, segment_pos, cache, attn_mask, kv_shared_cache
+          self, x, segment_pos, cache, attn_mask, kv_shared_cache, segment_ids
       )
     else:
       return self.block(
-          x, segment_pos, cache, attn_mask, kv_shared_cache=kv_shared_cache
+          x,
+          segment_pos,
+          cache,
+          attn_mask,
+          kv_shared_cache=kv_shared_cache,
+          segment_ids=segment_ids,
       )
 
   def init_cache(self, batch_size, max_seq_len, dtype):
@@ -1144,10 +1220,16 @@ class DecoderLayer(nnx.Module):
       attn_mask,
       per_layer_input=None,
       kv_shared_cache=None,
+      segment_ids=None,
   ):
     norm = self.pre_attention_norm(x)
     cache, attn, kv = self.attn(
-        norm, segment_pos, cache, attn_mask, kv_shared_cache=kv_shared_cache
+        norm,
+        segment_pos,
+        cache,
+        attn_mask,
+        kv_shared_cache=kv_shared_cache,
+        segment_ids=segment_ids,
     )
     attn = self.post_attention_norm(attn)
     attn += x
@@ -1157,7 +1239,7 @@ class DecoderLayer(nnx.Module):
     if self.config.enable_moe:
       ffw = self.dense_post_ffw_norm(ffw)
       moe_norm_ffw = self.moe_pre_ffw_norm(attn)
-      moe_out = self.moe(moe_norm_ffw)
+      moe_out = self.moe(moe_norm_ffw, router_input=attn)
       moe_out = self.moe_post_ffw_norm(moe_out)
       ffw += moe_out
     ffw = self.post_ffw_norm(ffw)
@@ -1183,6 +1265,7 @@ class DecoderLayer(nnx.Module):
       attn_mask,
       per_layer_input=None,
       kv_shared_cache=None,
+      segment_ids=None,
   ):
     remat_config = getattr(self.config, 'remat_config', RematConfig.NONE)
     if (
@@ -1197,10 +1280,17 @@ class DecoderLayer(nnx.Module):
           attn_mask,
           per_layer_input,
           kv_shared_cache,
+          segment_ids,
       )
     else:
       return self.block(
-          x, segment_pos, cache, attn_mask, per_layer_input, kv_shared_cache
+          x,
+          segment_pos,
+          cache,
+          attn_mask,
+          per_layer_input,
+          kv_shared_cache,
+          segment_ids=segment_ids,
       )
 
   def init_cache(self, batch_size, max_seq_len, dtype):
@@ -1300,6 +1390,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
       B, T = tokens.shape  # pylint: disable=invalid-name
       positions = jnp.tile(jnp.arange(T)[None, :], (B, 1))
 
+    return_cache = cache is not None
     new_cache = {}
     x = self.embedder.encode(tokens)
 
@@ -1342,6 +1433,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
           if per_layer_inputs is not None
           else None,
           kv_shared_cache=kv_shared_cache,
+          segment_ids=segment_ids,
       )
       if is_prefill and i in self.shared_layer_origins:
         transient_kvs[layer_name] = layers_kvs
@@ -1369,7 +1461,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
 
     return GemmaOutput(
         logits=logits,
-        cache=None if cache is None else new_cache,
+        cache=new_cache if return_cache else None,
         hidden_states=hidden_states_out,
     )
 
