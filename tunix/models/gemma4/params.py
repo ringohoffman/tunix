@@ -93,7 +93,7 @@ def create_model_from_checkpoint(
   model_state = nnx.state(abs_model)
   logging.info('[TIMING] eval_shape: %.1fs', time.monotonic() - t0)
 
-  ckptr = ocp.StandardCheckpointer()
+  ckptr = ocp.PyTreeCheckpointer()
 
   if mesh is not None:
     # ── Phase 2: Build sharded restore target via MockTensor tracing ─────
@@ -188,7 +188,6 @@ def create_model_from_checkpoint(
       )
 
     upstream_target = flax.traverse_util.unflatten_dict(upstream_target)
-    upstream_target.pop('vision_encoder', None)
 
     logging.info(
         '[TIMING] build_sharded_target: %.1fs  (%d upstream keys mapped)',
@@ -206,9 +205,10 @@ def create_model_from_checkpoint(
         '(direct-to-device, %d devices)...',
         len(jax.devices()),
     )
-    raw_params = ocp.StandardCheckpointer().restore(
+    raw_params = ckptr.restore(
         checkpoint_path,
         target=upstream_target,
+        partial_restore=True,
     )
     t_restore = time.monotonic() - t0
     # Estimate total bytes for throughput calculation.
