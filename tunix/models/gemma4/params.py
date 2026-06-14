@@ -22,6 +22,7 @@ Tunix NNX implementation.
 
 from collections.abc import Mapping
 import itertools
+import time
 from typing import Any
 
 from absl import logging
@@ -68,9 +69,7 @@ def create_model_from_checkpoint(
   Returns:
     A Gemma4 model instance with loaded weights.
   """
-  abs_model = nnx.eval_shape(
-      lambda: model_lib.Gemma4(model_config, rngs=nnx.Rngs(0))
-  )
+  t_total = time.monotonic()
 
   # Resolve fallback_sharding.
   if fallback_sharding == 'auto':
@@ -81,34 +80,171 @@ def create_model_from_checkpoint(
     else:
       fallback_sharding = jax.sharding.SingleDeviceSharding(jax.devices()[0])
 
-  # Restore checkpoint.  Use the parent Checkpointer.restore with
-  # StandardRestore to pass fallback_sharding, which handles topology
-  # mismatches (e.g., checkpoint saved on 16 TPUs, restored on 1 CPU).
+  # ── Phase 1: Build abstract model (no memory allocated) ────────────────
+  t0 = time.monotonic()
+  with nnx.use_eager_sharding(True):
+    with jax.set_mesh(mesh):
+      abs_model = nnx.eval_shape(
+          lambda: model_lib.Gemma4(
+              model_config,
+              rngs=nnx.Rngs(0),
+          )
+      )
+  model_state = nnx.state(abs_model)
+  logging.info('[TIMING] eval_shape: %.1fs', time.monotonic() - t0)
+
   ckptr = ocp.StandardCheckpointer()
-  if fallback_sharding is not None:
-    from orbax.checkpoint import args as ocp_args
-    raw_params = ocp.Checkpointer.restore(
-        ckptr,
+
+  if mesh is not None:
+    # ── Phase 2: Build sharded restore target via MockTensor tracing ─────
+    #
+    # The upstream Orbax checkpoint keys/shapes differ from our Tunix NNX
+    # model (e.g. gating_einsum → gate_proj + up_proj via slice+transpose).
+    # MockTensor traces these operations so we can invert the PartitionSpec
+    # and tell Orbax exactly how to shard each upstream tensor for
+    # direct-to-device loading.
+    t0 = time.monotonic()
+
+    class MockTensor:
+      """Lightweight tracer that records .T and __getitem__ operations."""
+
+      def __init__(self, key_path, shape, is_t=False, slice_idx=None):
+        self.key_path = key_path
+        self.shape = shape
+        self.is_t = is_t
+        self.slice_idx = slice_idx
+
+      @property
+      def T(self):
+        return MockTensor(
+            self.key_path, self.shape[::-1],
+            is_t=not self.is_t, slice_idx=self.slice_idx,
+        )
+
+      def __getitem__(self, idx):
+        if isinstance(idx, int):
+          return MockTensor(
+              self.key_path, self.shape[1:],
+              is_t=self.is_t, slice_idx=idx,
+          )
+        return self
+
+    # Read checkpoint metadata (keys + shapes, no tensor data).
+    meta = ckptr.metadata(checkpoint_path)
+    upstream_tree = meta.item_metadata.tree
+    flat_upstream = flax.traverse_util.flatten_dict(upstream_tree)
+
+    # Create mock upstream and trace through the key mapper.
+    mock_upstream = {}
+    for k, v in flat_upstream.items():
+      mock_upstream[k] = MockTensor(k, v.shape)
+    mock_upstream = flax.traverse_util.unflatten_dict(mock_upstream)
+
+    mapped_mock = map_from_upstream_checkpoint(mock_upstream)
+    flat_mapped_mock = flax.traverse_util.flatten_dict(mapped_mock)
+
+    # Get downstream sharding specs from the abstract model.
+    downstream_shardings = nnx.to_pure_dict(
+        nnx.get_named_sharding(model_state, mesh)
+    )
+    flat_downstream_shardings = flax.traverse_util.flatten_dict(
+        downstream_shardings
+    )
+
+    # Invert MockTensor operations to compute upstream PartitionSpecs.
+    upstream_target = {}
+    skipped_keys = []
+    for k, mock_val in flat_mapped_mock.items():
+      sharding = flat_downstream_shardings.get(k)
+      if sharding is None:
+        sharding = fallback_sharding
+      if sharding is None:
+        skipped_keys.append(k)
+        continue
+
+      spec = sharding.spec
+      # Invert transpose: if downstream = upstream.T, reverse the spec.
+      if mock_val.is_t:
+        spec = spec[::-1]
+      # Invert slice: if downstream = upstream[i], prepend a None axis.
+      if mock_val.slice_idx is not None:
+        spec = (None,) + tuple(spec)
+
+      upstream_sharding = jax.sharding.NamedSharding(
+          mesh, jax.sharding.PartitionSpec(*spec)
+      )
+      orig_val = flat_upstream[mock_val.key_path]
+      upstream_target[mock_val.key_path] = jax.ShapeDtypeStruct(
+          shape=orig_val.shape,
+          dtype=orig_val.dtype,
+          sharding=upstream_sharding,
+      )
+
+    if skipped_keys:
+      logging.info(
+          'Skipped %d upstream keys with no downstream sharding: %s',
+          len(skipped_keys),
+          sorted(str(k) for k in skipped_keys[:5]),
+      )
+
+    upstream_target = flax.traverse_util.unflatten_dict(upstream_target)
+
+    logging.info(
+        '[TIMING] build_sharded_target: %.1fs  (%d upstream keys mapped)',
+        time.monotonic() - t0,
+        len(flat_upstream) - len(skipped_keys),
+    )
+
+    # ── Phase 3: Distributed restore (direct-to-device) ──────────────────
+    # Each TPU worker reads its required shard directly from storage into
+    # local HBM, bypassing the host proxy.  partial_restore=True skips
+    # keys not present in upstream_target (e.g. unused vision weights).
+    t0 = time.monotonic()
+    logging.info(
+        'Restoring checkpoint with sharded target '
+        '(direct-to-device, %d devices)...',
+        len(jax.devices()),
+    )
+    raw_params = ocp.PyTreeCheckpointer().restore(
         checkpoint_path,
-        args=ocp_args.StandardRestore(
-            item=None,
-            strict=False,
-            fallback_sharding=fallback_sharding,
-        ),
+        item=upstream_target,
+        transforms=None,
+        partial_restore=True,
+    )
+    t_restore = time.monotonic() - t0
+    # Estimate total bytes for throughput calculation.
+    total_bytes = sum(
+        v.nbytes for v in jax.tree_util.tree_leaves(raw_params)
+        if hasattr(v, 'nbytes')
+    )
+    logging.info(
+        '[TIMING] restore: %.1fs  (%.1f GB, %.2f GB/s)',
+        t_restore,
+        total_bytes / 1e9,
+        total_bytes / t_restore / 1e9 if t_restore > 0 else float('inf'),
     )
   else:
-    raw_params = ckptr.restore(checkpoint_path)
+    # ── Fallback: unsharded restore (single device / no mesh) ────────────
+    t0 = time.monotonic()
+    logging.info('Restoring checkpoint without mesh (unsharded)...')
+    raw_params = ocp.PyTreeCheckpointer().restore(checkpoint_path)
+    logging.info('[TIMING] restore (unsharded): %.1fs', time.monotonic() - t0)
 
+  # ── Phase 4: Map upstream keys → downstream Tunix NNX layout ───────────
+  t0 = time.monotonic()
   mapped_params = map_from_upstream_checkpoint(raw_params)
-  model_state = nnx.state(abs_model)
+  logging.info('[TIMING] map_from_upstream: %.1fs', time.monotonic() - t0)
 
-  # Prune multimodal params (e.g., audio_input_projection) not in the
-  # text-only model. Must precede validation to avoid false mismatches.
+  # ── Phase 5: Prune multimodal params not in text-only model ────────────
+  t0 = time.monotonic()
   pruned_params = _prune_to_model_keys(mapped_params, model_state)
   _validate_param_shapes(pruned_params, model_state)
+  logging.info('[TIMING] prune+validate: %.1fs', time.monotonic() - t0)
 
+  # ── Phase 6: Cast to target dtype and apply downstream shardings ───────
   # TODO: b/343224716 - Add per-component dtype handling (like Gemma 3's
   # _get_param_dtype) when multimodal Gemma 4 loading is needed.
+  t0 = time.monotonic()
   if mesh is not None:
     typed_params = jax.tree_util.tree_map_with_path(
         lambda p, x, s: jnp.asarray(x, device=s, dtype=dtype),
@@ -120,8 +256,56 @@ def create_model_from_checkpoint(
         lambda p, x: jnp.asarray(x, dtype=dtype),
         pruned_params,
     )
+  logging.info('[TIMING] dtype_cast+reshard: %.1fs', time.monotonic() - t0)
+
   nnx.update(abs_model, typed_params)
+
+  # ── Sharding verification (log a sample of tensor shardings) ───────────
+  if mesh is not None:
+    _log_sharding_summary(abs_model)
+
+  logging.info(
+      '[TIMING] TOTAL create_model_from_checkpoint: %.1fs',
+      time.monotonic() - t_total,
+  )
   return abs_model
+
+
+def _log_sharding_summary(model: model_lib.Gemma4) -> None:
+  """Log a sample of tensor shardings to verify distributed loading."""
+  model_state = nnx.state(model)
+  flat_state = jax.tree_util.tree_leaves_with_path(model_state)
+
+  replicated_large = []
+  sample_count = 0
+  for path, leaf in flat_state:
+    if not hasattr(leaf, 'sharding') or not hasattr(leaf, 'shape'):
+      continue
+    key_str = '/'.join(str(k) for k in path)
+    spec = getattr(leaf.sharding, 'spec', None)
+
+    # Log first 5 tensors as a sample.
+    if sample_count < 5:
+      logging.info(
+          '  [SHARDING] %s: shape=%s spec=%s', key_str, leaf.shape, spec
+      )
+      sample_count += 1
+
+    # Flag large fully-replicated tensors (>1MB).
+    if spec is not None and all(s is None for s in spec):
+      if hasattr(leaf, 'nbytes') and leaf.nbytes > 1_000_000:
+        replicated_large.append((key_str, leaf.shape, leaf.nbytes))
+
+  if replicated_large:
+    logging.warning(
+        '⚠️ %d large tensors are fully replicated (not sharded):',
+        len(replicated_large),
+    )
+    for key_str, shape, nbytes in replicated_large[:10]:
+      logging.warning('    %s: shape=%s (%.1f MB)', key_str, shape, nbytes/1e6)
+  else:
+    logging.info('✓ All large tensors are properly sharded.')
+
 
 
 def _validate_param_shapes(
