@@ -188,6 +188,7 @@ def create_model_from_checkpoint(
       )
 
     upstream_target = flax.traverse_util.unflatten_dict(upstream_target)
+    upstream_target.pop('vision_encoder', None)
 
     logging.info(
         '[TIMING] build_sharded_target: %.1fs  (%d upstream keys mapped)',
