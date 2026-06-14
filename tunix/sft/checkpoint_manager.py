@@ -50,15 +50,21 @@ class CheckpointManager:
     if root_directory is not None:
       # When using Pathways, the checkpoint manager only supports persistence
       # APIs now.
+      concurrent_gb_args = {}
+      if options and hasattr(options, 'save_device_host_concurrent_gb') and options.save_device_host_concurrent_gb is not None:
+        concurrent_gb_args['save_device_host_concurrent_gb'] = options.save_device_host_concurrent_gb
+
       if 'proxy' in os.getenv('JAX_PLATFORMS', ''):
         item_handlers = {
             'model_params': ocp.PyTreeCheckpointHandler(
                 use_ocdbt=False,
                 use_zarr3=False,
+                **concurrent_gb_args,
             ),
             'optimizer_state': ocp.PyTreeCheckpointHandler(
                 use_ocdbt=False,
                 use_zarr3=False,
+                **concurrent_gb_args,
             ),
         }
         if os.getenv('ENABLE_PATHWAYS_PERSISTENCE', ''):
@@ -72,8 +78,8 @@ class CheckpointManager:
           )
       else:
         item_handlers = {
-            'model_params': ocp.PyTreeCheckpointHandler(),
-            'optimizer_state': ocp.PyTreeCheckpointHandler(),
+            'model_params': ocp.PyTreeCheckpointHandler(**concurrent_gb_args),
+            'optimizer_state': ocp.PyTreeCheckpointHandler(**concurrent_gb_args),
         }
       item_handlers['custom_metadata'] = ocp.JsonCheckpointHandler()
       self._checkpoint_manager = ocp.CheckpointManager(
