@@ -198,8 +198,6 @@ def load_and_create_model_orig(
 
       def process_key(k_name, f, sf_file, file_loaded_tensors):
         try:
-          with file_lock:
-            v = sf_file.get_tensor(k_name)  # get_tensor is not thread-safe
           try:
             jax_key_mapped, transform = torch_utils.torch_key_to_jax_key(
                 key_map, k_name
@@ -207,6 +205,9 @@ def load_and_create_model_orig(
           except ValueError:
             skipped_keys.append(k_name)
             return
+
+          with file_lock:
+            v = sf_file.get_tensor(k_name)  # get_tensor is not thread-safe
 
           if transform is not None:
             permute, reshape = transform
