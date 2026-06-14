@@ -40,6 +40,15 @@ from tunix.utils.sharding_utils import shard
 
 env_utils.setup_sharding_environment()
 
+import inspect as _inspect
+_REMAT_SUPPORTS_GRAPH_UPDATES = 'graph_updates' in _inspect.signature(nnx.remat).parameters
+
+def _compat_remat(fn, **kwargs):
+  """nnx.remat wrapper that drops graph_updates if Flax doesn't support it."""
+  if not _REMAT_SUPPORTS_GRAPH_UPDATES:
+    kwargs.pop('graph_updates', None)
+  return nnx.remat(fn, **kwargs)
+
 
 LayerCache = dict[str, jaxtyping.Array]
 Cache = dict[str, LayerCache]
@@ -1002,7 +1011,7 @@ class Attention(nnx.Module):
       # nnx.remat needs to be applied to the unbound function and take self
       # as the first argument. graph_updates=False prevents TraceContextError
       # when mutating params across jax transformation trace levels.
-      return nnx.remat(self.block.__func__, graph_updates=False)(
+      return _compat_remat(self.block.__func__, graph_updates=False)(
           self, x, segment_pos, cache, attn_mask, kv_shared_cache, segment_ids
       )
     else:
@@ -1101,7 +1110,7 @@ class FeedForward(nnx.Module):
         remat_config == RematConfig.BLOCK
         or remat_config == RematConfig.BLOCK.value
     ):
-      return nnx.remat(self.block.__func__, graph_updates=False)(self, x)
+      return _compat_remat(self.block.__func__, graph_updates=False)(self, x)
     else:
       return self.block(x)
 
@@ -1272,7 +1281,7 @@ class DecoderLayer(nnx.Module):
         remat_config == RematConfig.DECODER
         or remat_config == RematConfig.DECODER.value
     ):
-      return nnx.remat(self.block.__func__, graph_updates=False)(
+      return _compat_remat(self.block.__func__, graph_updates=False)(
           self,
           x,
           segment_pos,
