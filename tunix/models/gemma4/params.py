@@ -205,11 +205,9 @@ def create_model_from_checkpoint(
         '(direct-to-device, %d devices)...',
         len(jax.devices()),
     )
-    raw_params = ocp.PyTreeCheckpointer().restore(
+    raw_params = ocp.StandardCheckpointer().restore(
         checkpoint_path,
-        item=upstream_target,
-        transforms=None,
-        partial_restore=True,
+        target=upstream_target,
     )
     t_restore = time.monotonic() - t0
     # Estimate total bytes for throughput calculation.
