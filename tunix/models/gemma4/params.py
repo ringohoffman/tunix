@@ -256,11 +256,26 @@ def create_model_from_checkpoint(
         pruned_params,
     )
   logging.info('[TIMING] dtype_cast+reshard: %.1fs', time.monotonic() - t0)
-
   nnx.update(abs_model, typed_params)
+
+  # Initialize any skipped variables (e.g. from partial_restore) with zeros.
+  # This replaces their ShapeDtypeStructs (and the associated eval_shape trace
+  # context) with real eager-mode JAX arrays, preventing TraceContextErrors
+  # when returning from nnx.jit functions later on.
+  def _instantiate_skipped(x):
+    if isinstance(x, jax.ShapeDtypeStruct):
+      if hasattr(x, 'sharding'):
+        return jnp.zeros(x.shape, dtype=x.dtype, device=x.sharding)
+      return jnp.zeros(x.shape, dtype=x.dtype)
+    return x
+
+  full_state = nnx.state(abs_model)
+  full_state = jax.tree_util.tree_map(_instantiate_skipped, full_state)
+  nnx.update(abs_model, full_state)
 
   # ── Sharding verification (log a sample of tensor shardings) ───────────
   if mesh is not None:
+
     _log_sharding_summary(abs_model)
 
   logging.info(
