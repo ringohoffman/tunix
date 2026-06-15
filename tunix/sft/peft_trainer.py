@@ -571,7 +571,13 @@ class PeftTrainer:
 
         self._throttler.add_computation(train_loss)
         for hook in self.training_hooks:
-          hook.on_train_micro_step_end(self, train_loss, grad_norm, aux)
+          hook.on_train_micro_step_end(
+              self,
+              train_example,
+              train_loss,
+              grad_norm,
+              aux,
+          )
         # NB: put this after _buffer_metrics is important
         self._post_process_train_step(aux)
         self._iter_steps += 1
@@ -583,7 +589,12 @@ class PeftTrainer:
         ):
           self._train_steps += 1
           for hook in self.training_hooks:
-            hook.on_train_step_end(self, self._train_steps, train_loss)
+            hook.on_train_step_end(
+                self,
+                self._train_steps,
+                train_example,
+                train_loss,
+            )
 
           # Checkpoint frequency is configured by checkpointing_options.
           self.checkpoint_manager.save(
@@ -644,7 +655,7 @@ class PeftTrainer:
     and closing the checkpoint manager and metrics logger.
     """
     for hook in self.training_hooks:
-      hook.on_train_step_end(self, self._train_steps, 0.0)
+      hook.on_train_step_end(self, self._train_steps, None, 0.0)
     self._save_last_checkpoint()
     self.checkpoint_manager.close()
     if self.metrics_logger is not None:
@@ -681,12 +692,12 @@ class PeftTrainer:
         loss, aux = eval_step_fn(eval_example)
         loss = jax.lax.stop_gradient(loss)
         for hook in self.training_hooks:
-          hook.on_eval_micro_step_end(self, loss, aux)
+          hook.on_eval_micro_step_end(self, eval_example, loss, aux)
         self._post_process_eval_step(aux)
         eval_loss += loss
         eval_steps += 1
         for hook in self.training_hooks:
-          hook.on_eval_step_end(self, loss)
+          hook.on_eval_step_end(self, eval_example, loss)
 
       if eval_steps == 0:
         logging.warning(

@@ -595,6 +595,7 @@ class MetricLoggingHook(hooks.TrainingHooks):
   def on_train_micro_step_end(
       self,
       train_ctx: peft_trainer.PeftTrainer,
+      batch: Any,
       train_loss: ArrayLike,
       grad_norm: ArrayLike | None = None,
       aux: dict[str, ArrayLike] | None = None,
@@ -617,6 +618,7 @@ class MetricLoggingHook(hooks.TrainingHooks):
       self,
       train_ctx: peft_trainer.PeftTrainer,
       train_step: int,
+      batch: Any,
       train_loss: ArrayLike,
   ) -> None:
     self._mode = Mode.TRAIN
@@ -626,6 +628,7 @@ class MetricLoggingHook(hooks.TrainingHooks):
   def on_eval_micro_step_end(
       self,
       train_ctx: peft_trainer.PeftTrainer,
+      batch: Any,
       eval_loss: ArrayLike,
       aux: dict[str, ArrayLike] | None = None,
   ) -> None:
@@ -641,6 +644,7 @@ class MetricLoggingHook(hooks.TrainingHooks):
   def on_eval_step_end(
       self,
       train_ctx: peft_trainer.PeftTrainer,
+      batch: Any,
       eval_loss: ArrayLike,
   ) -> None:
     self._mode = Mode.EVAL
