@@ -37,6 +37,8 @@ from tunix.utils import compat
 from tunix.utils import env_utils
 from tunix.utils.sharding_utils import shard
 
+from jax import checkpoint_policies as cp
+from jax.ad_checkpoint import checkpoint_name
 
 env_utils.setup_sharding_environment()
 
@@ -48,6 +50,33 @@ def _compat_remat(fn, **kwargs):
   if not _REMAT_SUPPORTS_GRAPH_UPDATES:
     kwargs.pop('graph_updates', None)
   return nnx.remat(fn, **kwargs)
+
+
+
+def get_block_offload_policy():
+  return cp.save_and_offload_only_these_names(
+      names_which_can_be_saved=[],
+      names_which_can_be_offloaded=["residual_attn", "residual_ffw"],
+      offload_src="device",
+      offload_dst="pinned_host"
+  )
+
+def get_decoder_offload_policy():
+  return cp.save_and_offload_only_these_names(
+      names_which_can_be_saved=[],
+      names_which_can_be_offloaded=["decoder_input"],
+      offload_src="device",
+      offload_dst="pinned_host"
+  )
+
+def get_full_offload_policy():
+  return cp.save_and_offload_only_these_names(
+      names_which_can_be_saved=[],
+      names_which_can_be_offloaded=["residual_attn", "residual_ffw", "decoder_input"],
+      offload_src="device",
+      offload_dst="pinned_host"
+  )
+
 
 
 LayerCache = dict[str, jaxtyping.Array]
@@ -88,6 +117,12 @@ class RematConfig(enum.Enum):
   NONE = enum.auto()
   BLOCK = enum.auto()
   DECODER = enum.auto()
+  
+  # Offload Variants
+  FULL_OFFLOAD = enum.auto()     # Offload all activations, no recompute
+  BLOCK_OFFLOAD = enum.auto()    # Recompute blocks, offload block inputs
+  DECODER_OFFLOAD = enum.auto()  # Recompute layers, offload layer inputs
+
 
 
 @dataclasses.dataclass(slots=True, frozen=True)
@@ -698,6 +733,7 @@ class Attention(nnx.Module):
       jaxtyping.Array,
       tuple[jaxtyping.Array, jaxtyping.Array],
   ]:
+    x = checkpoint_name(x, "residual_attn")
     x = x.astype(self.config.dtype)
     seq_len = x.shape[1]
     query_proj = self.q_einsum(x)
@@ -1004,7 +1040,17 @@ class Attention(nnx.Module):
       segment_ids=None,
   ):
     remat_config = getattr(self.config, 'remat_config', RematConfig.NONE)
-    if (
+    if remat_config == RematConfig.BLOCK_OFFLOAD:
+      policy = get_block_offload_policy()
+      return _compat_remat(self.block.__func__, graph_updates=False, policy=policy)(
+          self, x, segment_pos, cache, attn_mask, kv_shared_cache, segment_ids
+      )
+    elif remat_config == RematConfig.FULL_OFFLOAD:
+      policy = get_full_offload_policy()
+      return _compat_remat(self.block.__func__, graph_updates=False, policy=policy)(
+          self, x, segment_pos, cache, attn_mask, kv_shared_cache, segment_ids
+      )
+    elif (
         remat_config == RematConfig.BLOCK
         or remat_config == RematConfig.BLOCK.value
     ):
@@ -1102,11 +1148,18 @@ class FeedForward(nnx.Module):
     )
 
   def block(self, x):
+    x = checkpoint_name(x, "residual_ffw")
     return self.down_proj(nnx.gelu(self.gate_proj(x)) * self.up_proj(x))
 
   def __call__(self, x):
     remat_config = getattr(self.config, 'remat_config', RematConfig.NONE)
-    if (
+    if remat_config == RematConfig.BLOCK_OFFLOAD:
+      policy = get_block_offload_policy()
+      return _compat_remat(self.block.__func__, graph_updates=False, policy=policy)(self, x)
+    elif remat_config == RematConfig.FULL_OFFLOAD:
+      policy = get_full_offload_policy()
+      return _compat_remat(self.block.__func__, graph_updates=False, policy=policy)(self, x)
+    elif (
         remat_config == RematConfig.BLOCK
         or remat_config == RematConfig.BLOCK.value
     ):
@@ -1231,6 +1284,7 @@ class DecoderLayer(nnx.Module):
       kv_shared_cache=None,
       segment_ids=None,
   ):
+    x = checkpoint_name(x, "decoder_input")
     norm = self.pre_attention_norm(x)
     cache, attn, kv = self.attn(
         norm,
@@ -1277,7 +1331,31 @@ class DecoderLayer(nnx.Module):
       segment_ids=None,
   ):
     remat_config = getattr(self.config, 'remat_config', RematConfig.NONE)
-    if (
+    if remat_config == RematConfig.DECODER_OFFLOAD:
+      policy = get_decoder_offload_policy()
+      return _compat_remat(self.block.__func__, graph_updates=False, policy=policy)(
+          self,
+          x,
+          segment_pos,
+          cache,
+          attn_mask,
+          per_layer_input,
+          kv_shared_cache,
+          segment_ids,
+      )
+    elif remat_config == RematConfig.FULL_OFFLOAD:
+      policy = get_full_offload_policy()
+      return _compat_remat(self.block.__func__, graph_updates=False, policy=policy)(
+          self,
+          x,
+          segment_pos,
+          cache,
+          attn_mask,
+          per_layer_input,
+          kv_shared_cache,
+          segment_ids,
+      )
+    elif (
         remat_config == RematConfig.DECODER
         or remat_config == RematConfig.DECODER.value
     ):
