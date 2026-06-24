@@ -960,6 +960,7 @@ class Attention(nnx.Module):
         block_sizes=block_sizes,
         head_shards=head_shards,
         q_seq_shards=q_seq_shards,
+        interpret=(jax.devices()[0].platform == "cpu"),
       )
 
       shd_spec = P(shd_b, shd_n, shd_t, shd_h)
@@ -1002,13 +1003,20 @@ class Attention(nnx.Module):
             q_block, k_block, v_block, segment_ids=seg_ids
           )
 
+        if hasattr(segment_ids, "q") and hasattr(segment_ids, "kv"):
+          q_seg = segment_ids.q
+          kv_seg = segment_ids.kv
+        else:
+          q_seg = segment_ids
+          kv_seg = segment_ids
+
         qkv: jaxtyping.Array = sharded_splash_attn(
           splash_attn_kernel,
           query_proj,
           key_proj,
           value_proj,
-          segment_ids,
-          segment_ids,
+          q_seg,
+          kv_seg,
         )
       else:
 
