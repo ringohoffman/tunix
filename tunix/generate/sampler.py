@@ -452,7 +452,7 @@ class Sampler(base_sampler.BaseSampler):
 
     return _SamplingState(
         decoding_step=num_input_tokens - 1,
-        num_input_tokens=jnp.array(num_input_tokens, dtype=jnp.int32),
+        num_input_tokens=int(num_input_tokens),
         token_buffer=token_buffer,
         positions=positions,
         logits_buffer=logits_buffer,
@@ -599,6 +599,7 @@ class Sampler(base_sampler.BaseSampler):
           input_mask, self.cache_config.cache_size
       )
 
+    # Merge once at the JIT boundary, outside any traced control flow.
     transformer = nnx.merge(self._transformer_graphdef, params)
     kwargs = {} if images is None else {'images': images}
     decode_only_last_token = (
@@ -681,22 +682,50 @@ class Sampler(base_sampler.BaseSampler):
       params: statelib.State,
       sampling_state: _SamplingState,
   ) -> _SamplingState:
-    """Internal generating function (to be jitted)."""
+    """Internal generating function (to be jitted).
 
-    def sample_with_params(sampler_state: _SamplingState):
-      return self._sample_step(params, sampler_state)
+    Uses nnx.while_loop instead of jax.lax.while_loop so that NNX graph
+    operations (merge/split on the transformer module) happen at the
+    correct trace level.  This makes the function compatible with
+    jax.jit(...).lower() for programmatic HLO inspection.
+    """
+    # Merge once at the JIT boundary, outside the while_loop.
+    transformer = nnx.merge(self._transformer_graphdef, params)
 
-    def cond_fn(sampler_state: _SamplingState):
+    def sample_with_transformer(
+        carry: tuple[nnx.Module, _SamplingState],
+    ) -> tuple[nnx.Module, _SamplingState]:
+      transformer, sampler_state = carry
+      return transformer, self._sample_step(transformer, sampler_state)
+
+    def cond_fn(
+        carry: tuple[nnx.Module, _SamplingState],
+    ) -> jax.Array:
+      _, sampler_state = carry
       return (
           sampler_state.decoding_step < sampler_state.total_sampling_steps
       ) & jnp.any(jnp.logical_not(sampler_state.done))
 
-    return jax.lax.while_loop(cond_fn, sample_with_params, sampling_state)
+    _, sampling_state = nnx.while_loop(
+        cond_fn, sample_with_transformer, (transformer, sampling_state)
+    )
+    return sampling_state
 
   def _sample_step(
-      self, params: statelib.State, sampler_state: _SamplingState
+      self, transformer: nnx.Module, sampler_state: _SamplingState
   ) -> _SamplingState:
-    """Performs a single sampling step."""
+    """Performs a single sampling step.
+
+    Args:
+      transformer: An already-merged NNX module. Must NOT be re-merged
+        from (graphdef, state) inside this function, because it is called
+        inside an nnx.while_loop body where NNX handles the graph state
+        serialization automatically.
+      sampler_state: The current sampling state.
+
+    Returns:
+      Updated sampling state after one decode step.
+    """
     batch_size = sampler_state.token_buffer.shape[0]
     decoding_step = sampler_state.decoding_step
 
@@ -711,7 +740,6 @@ class Sampler(base_sampler.BaseSampler):
         decoding_step, self.cache_config.cache_size, input_mask
     )
 
-    transformer = nnx.merge(self._transformer_graphdef, params)
     logits, cache = transformer(
         last_token,
         positions=step_positions,
