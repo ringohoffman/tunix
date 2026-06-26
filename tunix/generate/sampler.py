@@ -210,6 +210,7 @@ class Sampler(base_sampler.BaseSampler):
       tokenizer: Any,
       cache_config: CacheConfig,
       image_processor: image_processor_lib.ImageProcessor | None = None,
+      eos_tokens: Sequence[int] | None = None,
   ):
     """Initializes the sampler.
 
@@ -218,12 +219,18 @@ class Sampler(base_sampler.BaseSampler):
       tokenizer: a tokenizer for the given model.
       cache_config: configuration for the KV cache.
       image_processor: The image processor.
+      eos_tokens: End-of-sequence token IDs.  Defaults to the tokenizer's
+        eos_id.  Can be overridden per-call in __call__/generate/
+        generate_from_tokens.
     """
     self.tokenizer = tokenizer
     if not isinstance(tokenizer, tok_adapter.TokenizerAdapter):
       self.tokenizer = tok_adapter.TokenizerAdapter(tokenizer)
     self.cache_config = cache_config
     self.image_processor = image_processor
+    self.eos_ids = jnp.array(
+        eos_tokens if eos_tokens is not None else [self.tokenizer.eos_id()]
+    )
     self._transformer_graphdef: graph.NodeDef = nnx.graphdef(transformer)
     self._transformer_state: list[statelib.State] = nnx.variables(transformer)
     self._flattened_transformer_state: list[statelib.State] = jax.tree.leaves(
@@ -825,7 +832,8 @@ class Sampler(base_sampler.BaseSampler):
     Returns:
       sampler_output: A SamplerOutput object containing the generated samples.
     """
-    self.eos_ids = jnp.array(eos_tokens or [self.tokenizer.eos_id()])
+    if eos_tokens is not None:
+      self.eos_ids = jnp.array(eos_tokens)
     input_strings = (
         [input_strings] if isinstance(input_strings, str) else input_strings
     )
@@ -918,7 +926,8 @@ class Sampler(base_sampler.BaseSampler):
     Returns:
       SamplerOutput with generated text, tokens, and optional logits/logprobs.
     """
-    self.eos_ids = jnp.array(eos_tokens or [self.tokenizer.eos_id()])
+    if eos_tokens is not None:
+      self.eos_ids = jnp.array(eos_tokens)
     forbidden_token_ids = tuple(forbidden_tokens) if forbidden_tokens else None
 
     # Ensure we have a numpy array for padded_prompt_tokens in the output.
