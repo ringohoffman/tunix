@@ -27,6 +27,7 @@ from absl import logging
 import flax
 from flax import nnx
 import jax
+import jax.stages
 from jax.interpreters import pxla
 import jax.numpy as jnp
 import jax.sharding as shd
@@ -92,6 +93,9 @@ class TrainingConfig:
 
   # Sequence packing configuration.
   max_seq_token_per_tpu: int | None = None
+
+  # Optional JAX compiler options (env overrides)
+  compiler_options: jax.stages.CompilerOptions | None = None
 
   def get_with_default(self, key: str, default: Any) -> Any:
     val = getattr(self, key)
@@ -404,9 +408,14 @@ class PeftTrainer:
     if self._jitted_train_step_fn is None:
       self._shard_optimizer(pxla.thread_resources.env.physical_mesh)
       self._jitted_train_step_fn = nnx.jit(
-          train_step, donate_argnames=("optimizer",)
+          train_step,
+          donate_argnames=("optimizer",),
+          compiler_options=self.config.compiler_options,
       )
-      self._jitted_eval_step_fn = nnx.jit(eval_step)
+      self._jitted_eval_step_fn = nnx.jit(
+          eval_step,
+          compiler_options=self.config.compiler_options,
+      )
 
       def maybe_cache_and_partial(f, *args):
         if cache_nnx_graph:
