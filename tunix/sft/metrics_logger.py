@@ -19,7 +19,7 @@ from __future__ import annotations
 import collections
 import dataclasses
 import enum
-from typing import Any, Callable, Protocol, TypeAlias, TypedDict, override, overload, TYPE_CHECKING
+from typing import Any, Callable, Protocol, TypeAlias, TypedDict, overload, TYPE_CHECKING
 
 from absl import logging
 import jax
@@ -28,6 +28,7 @@ import numpy as np
 from tunix.sft import hooks
 from tunix.sft import progress_bar
 from tunix.utils import env_utils
+from typing_extensions import override
 
 if TYPE_CHECKING:
   from jax.typing import ArrayLike
