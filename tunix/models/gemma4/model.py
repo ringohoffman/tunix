@@ -27,10 +27,10 @@ from flax import nnx
 import jax
 from jax import numpy as jnp
 from jax.experimental.pallas.ops.tpu.splash_attention import (
-  splash_attention_kernel as splash,
+    splash_attention_kernel as splash,
 )
 from jax.experimental.pallas.ops.tpu.splash_attention import (
-  splash_attention_mask as mask_lib,
+    splash_attention_mask as mask_lib,
 )
 from jax.experimental.shard_map import shard_map
 from jax.interpreters import pxla
@@ -55,15 +55,15 @@ env_utils.setup_sharding_environment()
 import inspect as _inspect
 
 _REMAT_SUPPORTS_GRAPH_UPDATES = (
-  "graph_updates" in _inspect.signature(nnx.remat).parameters
+    "graph_updates" in _inspect.signature(nnx.remat).parameters
 )
 
 
 def _compat_remat(
-  fn: Callable[..., object],
-  *,
-  graph_updates: bool = True,
-  policy: CheckpointPolicy | None = None,
+    fn: Callable[..., object],
+    *,
+    graph_updates: bool = True,
+    policy: CheckpointPolicy | None = None,
 ) -> Callable[..., object]:
   """nnx.remat wrapper that drops graph_updates if Flax doesn't support it."""
   if _REMAT_SUPPORTS_GRAPH_UPDATES:
@@ -158,20 +158,20 @@ class RematStrategy:
 
     if self.save_on_device or self.offload_to_host:
       policies.append(
-        cp.save_and_offload_only_these_names(
-          names_which_can_be_saved=self.save_on_device,
-          names_which_can_be_offloaded=self.offload_to_host,
-          offload_src=self.offload_src,
-          offload_dst=self.offload_dst,
-        )
+          cp.save_and_offload_only_these_names(
+              names_which_can_be_saved=self.save_on_device,
+              names_which_can_be_offloaded=self.offload_to_host,
+              offload_src=self.offload_src,
+              offload_dst=self.offload_dst,
+          )
       )
 
     if self.offload_dots:
       policies.append(
-        cp.offload_dot_with_no_batch_dims(
-          offload_src=self.offload_src,
-          offload_dst=self.offload_dst,
-        )
+          cp.offload_dot_with_no_batch_dims(
+              offload_src=self.offload_src,
+              offload_dst=self.offload_dst,
+          )
       )
 
     if self.custom_policy is not None:
@@ -187,13 +187,13 @@ class RematStrategy:
 
 
 def _remat_config_to_strategy(
-  config: RematConfig,
+    config: RematConfig,
 ) -> RematStrategy:
   """Convert a legacy ``RematConfig`` enum value to a ``RematStrategy``."""
   _MAP: dict[RematConfig, RematStrategy] = {
-    RematConfig.NONE: RematStrategy(boundary="none"),
-    RematConfig.BLOCK: RematStrategy(boundary="block"),
-    RematConfig.DECODER: RematStrategy(boundary="decoder"),
+      RematConfig.NONE: RematStrategy(boundary="none"),
+      RematConfig.BLOCK: RematStrategy(boundary="block"),
+      RematConfig.DECODER: RematStrategy(boundary="decoder"),
   }
   return _MAP.get(config, RematStrategy(boundary="none"))
 
@@ -244,25 +244,25 @@ class ShardingConfig:
     fsdp = "fsdp" if not is_sampling else None
 
     return ShardingConfig(
-      emb_vd=("tp", fsdp),
-      q_weight_ndh=("tp", fsdp, None),
-      kv_weight_cndh=(None, "tp", fsdp, None),
-      qkv_weight_cndh=(None, "tp", fsdp, None),
-      o_weight_nhd=("tp", None, fsdp),
-      ffw_weight_df=(fsdp, "tp"),
-      ffw_weight_fd=("tp", fsdp),
-      rms_norm_weight=("tp",),
-      act_btd=(fsdp, None, None if is_sampling else "tp"),
-      act_btf=(fsdp, None, "tp"),
-      act_btnh=(fsdp, None, "tp", None),
-      vision_proj=(fsdp, "tp"),
-      vision_soft_emb_norm_weight=("tp",),
-      exp_weight_edf=(fsdp, None, None, "tp"),
-      exp_weight_efd=(fsdp, "tp", None),
-      per_layer_model_projection=(fsdp, None, "tp"),
-      per_layer_input_gate=(fsdp, "tp"),
-      per_layer_projection=("tp", fsdp),
-      per_layer_input_embedding=("tp", None, fsdp),
+        emb_vd=("tp", fsdp),
+        q_weight_ndh=("tp", fsdp, None),
+        kv_weight_cndh=(None, "tp", fsdp, None),
+        qkv_weight_cndh=(None, "tp", fsdp, None),
+        o_weight_nhd=("tp", None, fsdp),
+        ffw_weight_df=(fsdp, "tp"),
+        ffw_weight_fd=("tp", fsdp),
+        rms_norm_weight=("tp",),
+        act_btd=(fsdp, None, None if is_sampling else "tp"),
+        act_btf=(fsdp, None, "tp"),
+        act_btnh=(fsdp, None, "tp", None),
+        vision_proj=(fsdp, "tp"),
+        vision_soft_emb_norm_weight=("tp",),
+        exp_weight_edf=(fsdp, None, None, "tp"),
+        exp_weight_efd=(fsdp, "tp", None),
+        per_layer_model_projection=(fsdp, None, "tp"),
+        per_layer_input_gate=(fsdp, "tp"),
+        per_layer_projection=("tp", fsdp),
+        per_layer_input_embedding=("tp", None, fsdp),
     )
 
 
@@ -309,125 +309,130 @@ class ModelConfig:
   expert_dim: int | None = None
   moe_dense_hidden_dim: int | None = None
 
+  # Scan-over-layers: when True, uses nnx.scan over attention-pattern groups
+  # instead of a Python for-loop, producing a while loop in HLO for tiled
+  # scheduling and reduced memory fragmentation.
+  use_scan_layers: bool = False
+
   def __post_init__(self):
     # TODO(tunix-dev): support flash attention with sliding window KV cache
     if self.use_sliding_window_kv_cache and self.use_flash_attention:
       raise ValueError(
-        "Flash attention and sliding window KV cache are mutually exclusive."
+          "Flash attention and sliding window KV cache are mutually exclusive."
       )
 
   @classmethod
   def gemma4_e2b(
-    cls,
-    sharding_config: ShardingConfig = ShardingConfig.get_default_sharding(),
+      cls,
+      sharding_config: ShardingConfig = ShardingConfig.get_default_sharding(),
   ) -> "ModelConfig":
     return cls(
-      num_layers=35,
-      num_embed=262144,
-      embed_dim=1536,
-      hidden_dim=1536 * 4,
-      num_heads=8,
-      head_dim=256,
-      num_kv_heads=1,
-      sliding_window_size=512,
-      shd_config=sharding_config,
-      per_layer_input_dim=256,
-      frac_shared_layers=20.0 / 35,
-      override_kv_shared_ffw_hidden=int(1536 * 4 * 2),
-      attention_pattern=(
-        AttentionType.LOCAL_SLIDING,
-        AttentionType.LOCAL_SLIDING,
-        AttentionType.LOCAL_SLIDING,
-        AttentionType.LOCAL_SLIDING,
-        AttentionType.GLOBAL,
-      ),
+        num_layers=35,
+        num_embed=262144,
+        embed_dim=1536,
+        hidden_dim=1536 * 4,
+        num_heads=8,
+        head_dim=256,
+        num_kv_heads=1,
+        sliding_window_size=512,
+        shd_config=sharding_config,
+        per_layer_input_dim=256,
+        frac_shared_layers=20.0 / 35,
+        override_kv_shared_ffw_hidden=int(1536 * 4 * 2),
+        attention_pattern=(
+            AttentionType.LOCAL_SLIDING,
+            AttentionType.LOCAL_SLIDING,
+            AttentionType.LOCAL_SLIDING,
+            AttentionType.LOCAL_SLIDING,
+            AttentionType.GLOBAL,
+        ),
     )
 
   @classmethod
   def gemma4_e4b(
-    cls,
-    sharding_config: ShardingConfig = ShardingConfig.get_default_sharding(),
+      cls,
+      sharding_config: ShardingConfig = ShardingConfig.get_default_sharding(),
   ) -> "ModelConfig":
     return cls(
-      num_layers=42,
-      num_embed=262144,
-      embed_dim=2560,
-      hidden_dim=2560 * 4,
-      num_heads=8,
-      head_dim=256,
-      num_kv_heads=2,
-      sliding_window_size=512,
-      shd_config=sharding_config,
-      per_layer_input_dim=256,
-      frac_shared_layers=18.0 / 42,
-      attention_pattern=(
-        AttentionType.LOCAL_SLIDING,
-        AttentionType.LOCAL_SLIDING,
-        AttentionType.LOCAL_SLIDING,
-        AttentionType.LOCAL_SLIDING,
-        AttentionType.LOCAL_SLIDING,
-        AttentionType.GLOBAL,
-      ),
+        num_layers=42,
+        num_embed=262144,
+        embed_dim=2560,
+        hidden_dim=2560 * 4,
+        num_heads=8,
+        head_dim=256,
+        num_kv_heads=2,
+        sliding_window_size=512,
+        shd_config=sharding_config,
+        per_layer_input_dim=256,
+        frac_shared_layers=18.0 / 42,
+        attention_pattern=(
+            AttentionType.LOCAL_SLIDING,
+            AttentionType.LOCAL_SLIDING,
+            AttentionType.LOCAL_SLIDING,
+            AttentionType.LOCAL_SLIDING,
+            AttentionType.LOCAL_SLIDING,
+            AttentionType.GLOBAL,
+        ),
     )
 
   @classmethod
   def gemma4_31b(
-    cls,
-    sharding_config: ShardingConfig = ShardingConfig.get_default_sharding(),
+      cls,
+      sharding_config: ShardingConfig = ShardingConfig.get_default_sharding(),
   ) -> "ModelConfig":
     return cls(
-      num_layers=60,
-      num_embed=262144,
-      embed_dim=5376,
-      hidden_dim=5376 * 4,
-      num_heads=32,
-      head_dim=256,
-      num_kv_heads=16,
-      num_global_kv_heads=4,
-      sliding_window_size=1024,
-      shd_config=sharding_config,
-      k_eq_v_global=True,
-      attention_pattern=(
-        AttentionType.LOCAL_SLIDING,
-        AttentionType.LOCAL_SLIDING,
-        AttentionType.LOCAL_SLIDING,
-        AttentionType.LOCAL_SLIDING,
-        AttentionType.LOCAL_SLIDING,
-        AttentionType.GLOBAL,
-      ),
+        num_layers=60,
+        num_embed=262144,
+        embed_dim=5376,
+        hidden_dim=5376 * 4,
+        num_heads=32,
+        head_dim=256,
+        num_kv_heads=16,
+        num_global_kv_heads=4,
+        sliding_window_size=1024,
+        shd_config=sharding_config,
+        k_eq_v_global=True,
+        attention_pattern=(
+            AttentionType.LOCAL_SLIDING,
+            AttentionType.LOCAL_SLIDING,
+            AttentionType.LOCAL_SLIDING,
+            AttentionType.LOCAL_SLIDING,
+            AttentionType.LOCAL_SLIDING,
+            AttentionType.GLOBAL,
+        ),
     )
 
   @classmethod
   def gemma4_26b_a4b(
-    cls,
-    sharding_config: ShardingConfig = ShardingConfig.get_default_sharding(),
+      cls,
+      sharding_config: ShardingConfig = ShardingConfig.get_default_sharding(),
   ) -> "ModelConfig":
     return cls(
-      num_layers=30,
-      num_embed=262144,
-      embed_dim=2816,
-      hidden_dim=2112,  # Dense shared MLP branch
-      num_heads=16,
-      head_dim=256,
-      num_kv_heads=8,
-      num_global_kv_heads=2,
-      sliding_window_size=1024,
-      shd_config=sharding_config,
-      enable_moe=True,
-      num_experts=128,
-      expert_dim=704,
-      num_experts_per_tok=8,
-      moe_dense_hidden_dim=2112,
-      k_eq_v_global=True,
-      global_rope_proportion=0.25,
-      attention_pattern=(
-        AttentionType.LOCAL_SLIDING,
-        AttentionType.LOCAL_SLIDING,
-        AttentionType.LOCAL_SLIDING,
-        AttentionType.LOCAL_SLIDING,
-        AttentionType.LOCAL_SLIDING,
-        AttentionType.GLOBAL,
-      ),
+        num_layers=30,
+        num_embed=262144,
+        embed_dim=2816,
+        hidden_dim=2112,  # Dense shared MLP branch
+        num_heads=16,
+        head_dim=256,
+        num_kv_heads=8,
+        num_global_kv_heads=2,
+        sliding_window_size=1024,
+        shd_config=sharding_config,
+        enable_moe=True,
+        num_experts=128,
+        expert_dim=704,
+        num_experts_per_tok=8,
+        moe_dense_hidden_dim=2112,
+        k_eq_v_global=True,
+        global_rope_proportion=0.25,
+        attention_pattern=(
+            AttentionType.LOCAL_SLIDING,
+            AttentionType.LOCAL_SLIDING,
+            AttentionType.LOCAL_SLIDING,
+            AttentionType.LOCAL_SLIDING,
+            AttentionType.LOCAL_SLIDING,
+            AttentionType.GLOBAL,
+        ),
     )
 
 
@@ -435,9 +440,9 @@ class Embedder(nnx.Module):
   """Embedder module."""
 
   def __init__(
-    self,
-    config: ModelConfig,
-    rngs: nnx.Rngs,
+      self,
+      config: ModelConfig,
+      rngs: nnx.Rngs,
   ):
     self.config = config
     self.vocab_size = config.num_embed
@@ -445,36 +450,36 @@ class Embedder(nnx.Module):
     self.param_dtype = config.param_dtype
 
     self.input_embedding = nnx.Param(
-      nnx.initializers.normal(dtype=self.param_dtype)(
-        rngs.params(), (self.vocab_size, self.embed_dim)
-      ),
-      sharding=config.shd_config.emb_vd,
+        nnx.initializers.normal(dtype=self.param_dtype)(
+            rngs.params(), (self.vocab_size, self.embed_dim)
+        ),
+        sharding=config.shd_config.emb_vd,
     )
 
     if config.per_layer_input_dim > 0:
       self.per_layer_model_projection = Einsum(
-        einsum_str="BTD,DNP->BTNP",
-        shape=(self.embed_dim, config.num_layers, config.per_layer_input_dim),
-        sharding=config.shd_config.per_layer_model_projection,
-        w_scale=(float(self.embed_dim) ** -0.5),
-        rngs=rngs,
-        dtype=self.config.dtype,
-        param_dtype=self.param_dtype,
+          einsum_str="BTD,DNP->BTNP",
+          shape=(self.embed_dim, config.num_layers, config.per_layer_input_dim),
+          sharding=config.shd_config.per_layer_model_projection,
+          w_scale=(float(self.embed_dim) ** -0.5),
+          rngs=rngs,
+          dtype=self.config.dtype,
+          param_dtype=self.param_dtype,
       )
 
       self.per_layer_projection_norm = RMSNorm(
-        config.per_layer_input_dim,
-        rngs=rngs,
-        sharding=config.shd_config,
-        dtype=self.config.dtype,
-        param_dtype=self.param_dtype,
+          config.per_layer_input_dim,
+          rngs=rngs,
+          sharding=config.shd_config,
+          dtype=self.config.dtype,
+          param_dtype=self.param_dtype,
       )
       self.per_layer_input_embedding = nnx.Param(
-        nnx.initializers.normal(dtype=self.param_dtype)(
-          rngs.params(),
-          (self.vocab_size, config.num_layers, config.per_layer_input_dim),
-        ),
-        sharding=config.shd_config.per_layer_input_embedding,
+          nnx.initializers.normal(dtype=self.param_dtype)(
+              rngs.params(),
+              (self.vocab_size, config.num_layers, config.per_layer_input_dim),
+          ),
+          sharding=config.shd_config.per_layer_input_embedding,
       )
 
   def encode(self, x: jaxtyping.ArrayLike) -> jaxtyping.Array:
@@ -485,10 +490,10 @@ class Embedder(nnx.Module):
     return x
 
   def encode_per_layer_input(
-    self, x: jaxtyping.ArrayLike, t: jaxtyping.ArrayLike
+      self, x: jaxtyping.ArrayLike, t: jaxtyping.ArrayLike
   ) -> jaxtyping.Array:
     t = jnp.where(
-      jnp.logical_and(t >= 0, t < self.vocab_size), t, jnp.zeros_like(t)
+        jnp.logical_and(t >= 0, t < self.vocab_size), t, jnp.zeros_like(t)
     )
     x = self.per_layer_model_projection(x)
     x = self.per_layer_projection_norm(x)
@@ -506,15 +511,15 @@ class Einsum(nnx.Module):
   """Einsum module."""
 
   def __init__(
-    self,
-    einsum_str: str,
-    shape: flax.typing.Shape,
-    *,
-    rngs: nnx.Rngs,
-    sharding: Tuple[str | None, ...],
-    dtype: jnp.dtype,
-    param_dtype: jnp.dtype,
-    w_scale: float | None = None,
+      self,
+      einsum_str: str,
+      shape: flax.typing.Shape,
+      *,
+      rngs: nnx.Rngs,
+      sharding: Tuple[str | None, ...],
+      dtype: jnp.dtype,
+      param_dtype: jnp.dtype,
+      w_scale: float | None = None,
   ):
     self.einsum_str = einsum_str
     self.dtype = dtype
@@ -522,8 +527,8 @@ class Einsum(nnx.Module):
 
     self.shape = shape
     self.w = nnx.Param(
-      nnx.initializers.normal(dtype=param_dtype)(rngs.params(), shape),
-      sharding=sharding,
+        nnx.initializers.normal(dtype=param_dtype)(rngs.params(), shape),
+        sharding=sharding,
     )
 
   def __call__(self, x: jaxtyping.ArrayLike) -> jaxtyping.Array:
@@ -553,17 +558,17 @@ def find_last_one_index(attn_mask: jnp.ndarray) -> jnp.ndarray:
 
   # 5. return the final index, 0 for rows are all zeros.
   final_indices = jnp.where(
-    all_zeros_mask,
-    0,
-    last_one_index_original,
+      all_zeros_mask,
+      0,
+      last_one_index_original,
   )
 
   return final_indices.squeeze(axis=-1)
 
 
 def create_sliding_window_mask(
-  attn_mask: jnp.ndarray,  # [B, seq_len, cache_len] seq_len=1 for decoding
-  sliding_window_size: int,
+    attn_mask: jnp.ndarray,  # [B, seq_len, cache_len] seq_len=1 for decoding
+    sliding_window_size: int,
 ) -> jnp.ndarray:
   """Helper function to create sliding window mask for local attention."""
   upper_index = find_last_one_index(attn_mask)
@@ -587,17 +592,17 @@ class RMSNorm(nnx.Module):
   """RMSNorm layer."""
 
   def __init__(
-    self,
-    dim: int,
-    *,
-    rngs: nnx.Rngs,
-    sharding: ShardingConfig = ShardingConfig.get_default_sharding(),
-    dtype: jnp.dtype,
-    param_dtype: jnp.dtype,
+      self,
+      dim: int,
+      *,
+      rngs: nnx.Rngs,
+      sharding: ShardingConfig = ShardingConfig.get_default_sharding(),
+      dtype: jnp.dtype,
+      param_dtype: jnp.dtype,
   ):
     self.scale = nnx.Param(
-      nnx.initializers.ones_init()(rngs.params(), dim).astype(param_dtype),
-      sharding=sharding.rms_norm_weight,
+        nnx.initializers.ones_init()(rngs.params(), dim).astype(param_dtype),
+        sharding=sharding.rms_norm_weight,
     )
     self.dtype = dtype
 
@@ -611,12 +616,12 @@ class RMSNorm(nnx.Module):
 
 
 def apply_rope(
-  inputs: jax.Array,
-  positions: jax.Array,
-  *,
-  base_frequency: int,
-  scale_factor: float = 1.0,
-  rope_proportion: float = 1.0,
+    inputs: jax.Array,
+    positions: jax.Array,
+    *,
+    base_frequency: int,
+    scale_factor: float = 1.0,
+    rope_proportion: float = 1.0,
 ) -> jax.Array:
   """Applies RoPE.
 
@@ -638,17 +643,17 @@ def apply_rope(
   rope_angles = int(rope_proportion * head_dim // 2)
   nope_angles = head_dim // 2 - rope_angles
   freq_exponents = (2.0 / head_dim) * jnp.arange(
-    0, rope_angles, dtype=jnp.float32
+      0, rope_angles, dtype=jnp.float32
   )
   timescale = jnp.pad(
-    base_frequency**freq_exponents,
-    (0, nope_angles),
-    mode="constant",
-    constant_values=(0, jnp.inf),
+      base_frequency**freq_exponents,
+      (0, nope_angles),
+      mode="constant",
+      constant_values=(0, jnp.inf),
   )
 
   sinusoid_inp = (
-    positions[..., jnp.newaxis] / timescale[jnp.newaxis, jnp.newaxis, :]
+      positions[..., jnp.newaxis] / timescale[jnp.newaxis, jnp.newaxis, :]
   )
   sinusoid_inp = sinusoid_inp[..., jnp.newaxis, :]
   if scale_factor < 1.0:
@@ -674,21 +679,21 @@ class AttentionType(enum.Enum):
 
 
 GEMMA4_ATTENTION_PATTERN = (
-  AttentionType.LOCAL_SLIDING,
-  AttentionType.LOCAL_SLIDING,
-  AttentionType.LOCAL_SLIDING,
-  AttentionType.LOCAL_SLIDING,
-  AttentionType.LOCAL_SLIDING,
-  AttentionType.GLOBAL,
+    AttentionType.LOCAL_SLIDING,
+    AttentionType.LOCAL_SLIDING,
+    AttentionType.LOCAL_SLIDING,
+    AttentionType.LOCAL_SLIDING,
+    AttentionType.LOCAL_SLIDING,
+    AttentionType.GLOBAL,
 )
 
 
 def create_kv_cache_sharing_patterns(
-  num_layers: int,
-  frac_shared_layers: float,
-  share_global: bool,
-  share_local: bool,
-  attention_types: tuple[AttentionType, ...],
+    num_layers: int,
+    frac_shared_layers: float,
+    share_global: bool,
+    share_local: bool,
+    attention_types: tuple[AttentionType, ...],
 ) -> list[int]:
   """Creates a list of layer indices for which KV cache is used."""
   kv_cache_sharing_patterns = []
@@ -710,27 +715,27 @@ class Attention(nnx.Module):
   """Attention module."""
 
   def __init__(
-    self,
-    config: ModelConfig,
-    attn_type: AttentionType,
-    rngs: nnx.Rngs,
+      self,
+      config: ModelConfig,
+      attn_type: AttentionType,
+      rngs: nnx.Rngs,
   ):
     self.config = config
     self.rope_proportion = (
-      config.global_rope_proportion
-      if attn_type == AttentionType.GLOBAL
-      else config.local_rope_proportion
+        config.global_rope_proportion
+        if attn_type == AttentionType.GLOBAL
+        else config.local_rope_proportion
     )
     self.attn_type = attn_type
     self.rope_base_frequency = (
-      config.local_base_frequency
-      if attn_type == AttentionType.LOCAL_SLIDING
-      else config.global_base_frequency
+        config.local_base_frequency
+        if attn_type == AttentionType.LOCAL_SLIDING
+        else config.global_base_frequency
     )
     self.rope_scale_factor = (
-      config.local_scale_factor
-      if attn_type == AttentionType.LOCAL_SLIDING
-      else config.global_scale_factor
+        config.local_scale_factor
+        if attn_type == AttentionType.LOCAL_SLIDING
+        else config.global_scale_factor
     )
 
     self.num_kv_heads = config.num_kv_heads
@@ -742,37 +747,37 @@ class Attention(nnx.Module):
         self.head_dim = config.global_key_size
 
     self.attn_vec_einsum = Einsum(
-      einsum_str="BTNH,NHD->BTD",
-      shape=(config.num_heads, self.head_dim, config.embed_dim),
-      rngs=rngs,
-      sharding=config.shd_config.o_weight_nhd,
-      dtype=config.dtype,
-      param_dtype=config.param_dtype,
+        einsum_str="BTNH,NHD->BTD",
+        shape=(config.num_heads, self.head_dim, config.embed_dim),
+        rngs=rngs,
+        sharding=config.shd_config.o_weight_nhd,
+        dtype=config.dtype,
+        param_dtype=config.param_dtype,
     )
     self.q_einsum = Einsum(
-      einsum_str="BTD,NDH->BTNH",
-      shape=(config.num_heads, config.embed_dim, self.head_dim),
-      rngs=rngs,
-      sharding=config.shd_config.q_weight_ndh,
-      dtype=config.dtype,
-      param_dtype=config.param_dtype,
-    )
-
-    k_eq_v = (
-      config.k_eq_v_global if attn_type == AttentionType.GLOBAL else False
-    )
-    if k_eq_v:
-      self.k_einsum = Einsum(
-        einsum_str="BSD,KDH->BSKH",
-        shape=(
-          self.num_kv_heads,
-          config.embed_dim,
-          self.head_dim,
-        ),
+        einsum_str="BTD,NDH->BTNH",
+        shape=(config.num_heads, config.embed_dim, self.head_dim),
         rngs=rngs,
         sharding=config.shd_config.q_weight_ndh,
         dtype=config.dtype,
         param_dtype=config.param_dtype,
+    )
+
+    k_eq_v = (
+        config.k_eq_v_global if attn_type == AttentionType.GLOBAL else False
+    )
+    if k_eq_v:
+      self.k_einsum = Einsum(
+          einsum_str="BSD,KDH->BSKH",
+          shape=(
+              self.num_kv_heads,
+              config.embed_dim,
+              self.head_dim,
+          ),
+          rngs=rngs,
+          sharding=config.shd_config.q_weight_ndh,
+          dtype=config.dtype,
+          param_dtype=config.param_dtype,
       )
     else:
       if self.num_kv_heads == 1:
@@ -781,45 +786,45 @@ class Attention(nnx.Module):
         kv_sharding = config.shd_config.kv_weight_cndh
 
       self.kv_einsum = Einsum(
-        einsum_str="BSD,CKDH->CBSKH",
-        shape=(
-          2,
-          self.num_kv_heads,
-          config.embed_dim,
-          self.head_dim,
-        ),
-        rngs=rngs,
-        sharding=kv_sharding,
-        dtype=config.dtype,
-        param_dtype=config.param_dtype,
+          einsum_str="BSD,CKDH->CBSKH",
+          shape=(
+              2,
+              self.num_kv_heads,
+              config.embed_dim,
+              self.head_dim,
+          ),
+          rngs=rngs,
+          sharding=kv_sharding,
+          dtype=config.dtype,
+          param_dtype=config.param_dtype,
       )
     self._query_norm = RMSNorm(
-      self.head_dim,
-      rngs=rngs,
-      sharding=config.shd_config,
-      dtype=config.dtype,
-      param_dtype=config.param_dtype,
+        self.head_dim,
+        rngs=rngs,
+        sharding=config.shd_config,
+        dtype=config.dtype,
+        param_dtype=config.param_dtype,
     )
     self._key_norm = RMSNorm(
-      self.head_dim,
-      rngs=rngs,
-      sharding=config.shd_config,
-      dtype=config.dtype,
-      param_dtype=config.param_dtype,
+        self.head_dim,
+        rngs=rngs,
+        sharding=config.shd_config,
+        dtype=config.dtype,
+        param_dtype=config.param_dtype,
     )
 
   def block(
-    self,
-    x: jaxtyping.Array,
-    segment_pos: jaxtyping.Array,
-    cache: LayerCache | None,
-    attn_mask: jaxtyping.Array,
-    kv_shared_cache: LayerCache | None = None,
-    segment_ids: jaxtyping.Array | None = None,
+      self,
+      x: jaxtyping.Array,
+      segment_pos: jaxtyping.Array,
+      cache: LayerCache | None,
+      attn_mask: jaxtyping.Array,
+      kv_shared_cache: LayerCache | None = None,
+      segment_ids: jaxtyping.Array | None = None,
   ) -> tuple[
-    LayerCache | None,
-    jaxtyping.Array,
-    tuple[jaxtyping.Array, jaxtyping.Array],
+      LayerCache | None,
+      jaxtyping.Array,
+      tuple[jaxtyping.Array, jaxtyping.Array],
   ]:
     x = checkpoint_name(x, "residual_attn")
     x = x.astype(self.config.dtype)
@@ -828,11 +833,11 @@ class Attention(nnx.Module):
     query_proj = shard(query_proj, self.config.shd_config.act_btnh)
     query_proj = self._query_norm(query_proj)
     query_proj = apply_rope(
-      query_proj,
-      segment_pos,
-      base_frequency=self.rope_base_frequency,
-      scale_factor=self.rope_scale_factor,
-      rope_proportion=self.rope_proportion,
+        query_proj,
+        segment_pos,
+        base_frequency=self.rope_base_frequency,
+        scale_factor=self.rope_scale_factor,
+        rope_proportion=self.rope_proportion,
     )
 
     if kv_shared_cache is not None:
@@ -854,11 +859,11 @@ class Attention(nnx.Module):
       value_proj = value_proj * jax.lax.rsqrt(value_var + 1e-06)
       key_proj = self._key_norm(key_proj)
       key_proj = apply_rope(
-        key_proj,
-        segment_pos,
-        base_frequency=self.rope_base_frequency,
-        scale_factor=self.rope_scale_factor,
-        rope_proportion=self.rope_proportion,
+          key_proj,
+          segment_pos,
+          base_frequency=self.rope_base_frequency,
+          scale_factor=self.rope_scale_factor,
+          rope_proportion=self.rope_proportion,
       )
 
     if cache is not None:
@@ -872,42 +877,42 @@ class Attention(nnx.Module):
           valid_len = min(seq_len, cache_len)
           latest_indices = jnp.arange(seq_len - valid_len, seq_len) % cache_len
           cache_v = (
-            cache["v"]
-            .at[:, latest_indices, ...]
-            .set(value_proj[:, -valid_len:, ...])
+              cache["v"]
+              .at[:, latest_indices, ...]
+              .set(value_proj[:, -valid_len:, ...])
           )
           cache_k = (
-            cache["k"]
-            .at[:, latest_indices, ...]
-            .set(key_proj[:, -valid_len:, ...])
+              cache["k"]
+              .at[:, latest_indices, ...]
+              .set(key_proj[:, -valid_len:, ...])
           )
         else:
           cache_v = cache["v"].at[:, :seq_len, ...].set(value_proj)
           cache_k = cache["k"].at[:, :seq_len, ...].set(key_proj)
 
         new_cache = {
-          "v": cache_v,
-          "k": cache_k,
-          "end_index": cache["end_index"] + seq_len,
+            "v": cache_v,
+            "k": cache_k,
+            "end_index": cache["end_index"] + seq_len,
         }
       else:  # decode
         end_index = cache["end_index"][0]
         slice_indices = (0, end_index % cache_len, 0, 0)
         value_proj = jax.lax.dynamic_update_slice(
-          cache["v"], value_proj, slice_indices
+            cache["v"], value_proj, slice_indices
         )
         key_proj = jax.lax.dynamic_update_slice(
-          cache["k"], key_proj, slice_indices
+            cache["k"], key_proj, slice_indices
         )
         new_cache = {
-          "v": value_proj,
-          "k": key_proj,
-          "end_index": cache["end_index"] + seq_len,
+            "v": value_proj,
+            "k": key_proj,
+            "end_index": cache["end_index"] + seq_len,
         }
     else:
       new_cache = {
-        "v": value_proj,
-        "k": key_proj,
+          "v": value_proj,
+          "k": key_proj,
       }
 
     b, _, qh, _ = query_proj.shape
@@ -921,9 +926,9 @@ class Attention(nnx.Module):
       mesh = pxla.thread_resources.env.physical_mesh
       if self.attn_type == AttentionType.LOCAL_SLIDING:
         mask = mask_lib.LocalMask(
-          (seq_len, seq_len),
-          window_size=(self.config.sliding_window_size - 1, 0),
-          offset=0,
+            (seq_len, seq_len),
+            window_size=(self.config.sliding_window_size - 1, 0),
+            offset=0,
         )
       else:
         mask = mask_lib.CausalMask((seq_len, seq_len))
@@ -931,50 +936,50 @@ class Attention(nnx.Module):
       multi_head_mask = mask_lib.MultiHeadMask([mask for _ in range(qh)])
 
       block_sizes = splash.BlockSizes(
-        block_q=self.config.flash_attention_block_size,
-        block_kv=self.config.flash_attention_block_size,
-        block_q_dkv=self.config.flash_attention_block_size,
-        block_kv_dkv=self.config.flash_attention_block_size,
-        block_kv_dkv_compute=self.config.flash_attention_block_size,
-        block_q_dq=self.config.flash_attention_block_size,
-        block_kv_dq=self.config.flash_attention_block_size,
+          block_q=self.config.flash_attention_block_size,
+          block_kv=self.config.flash_attention_block_size,
+          block_q_dkv=self.config.flash_attention_block_size,
+          block_kv_dkv=self.config.flash_attention_block_size,
+          block_kv_dkv_compute=self.config.flash_attention_block_size,
+          block_q_dq=self.config.flash_attention_block_size,
+          block_kv_dq=self.config.flash_attention_block_size,
       )
 
       shd_b, shd_t, shd_n, shd_h = self.config.shd_config.act_btnh
       if (
-        mesh is not None
-        and shd_b is not None
-        and shd_b in mesh.shape
-        and b % mesh.shape[shd_b] != 0
+          mesh is not None
+          and shd_b is not None
+          and shd_b in mesh.shape
+          and b % mesh.shape[shd_b] != 0
       ):
         shd_b = None
       head_shards = (
-        mesh.shape[shd_n] if shd_n is not None and shd_n in mesh.shape else 1
+          mesh.shape[shd_n] if shd_n is not None and shd_n in mesh.shape else 1
       )
       q_seq_shards = (
-        mesh.shape[shd_t] if shd_t is not None and shd_t in mesh.shape else 1
+          mesh.shape[shd_t] if shd_t is not None and shd_t in mesh.shape else 1
       )
 
       splash_attn_kernel = splash.make_splash_mha(
-        multi_head_mask,
-        block_sizes=block_sizes,
-        head_shards=head_shards,
-        q_seq_shards=q_seq_shards,
-        interpret=(jax.devices()[0].platform == "cpu"),
+          multi_head_mask,
+          block_sizes=block_sizes,
+          head_shards=head_shards,
+          q_seq_shards=q_seq_shards,
+          interpret=(jax.devices()[0].platform == "cpu"),
       )
 
       shd_spec = P(shd_b, shd_n, shd_t, shd_h)
       shd_n_kv = (
-        shd_n
-        if mesh is not None
-        and shd_n is not None
-        and shd_n in mesh.shape
-        and kh % mesh.shape[shd_n] == 0
-        else None
+          shd_n
+          if mesh is not None
+          and shd_n is not None
+          and shd_n in mesh.shape
+          and kh % mesh.shape[shd_n] == 0
+          else None
       )
       unsharded_seq_kv = P(shd_b, shd_n_kv, None, shd_h)
       kernel_spec = splash_attn_kernel.manual_sharding_spec(
-        shd.NamedSharding(mesh, P(shd_n, shd_t))
+          shd.NamedSharding(mesh, P(shd_n, shd_t))
       )
 
       if segment_ids is not None:
@@ -982,25 +987,25 @@ class Attention(nnx.Module):
         unsharded_seg_spec = P(shd_b, None)
 
         @partial(
-          shard_map,
-          mesh=mesh,
-          in_specs=(
-            kernel_spec,
-            shd_spec,
-            unsharded_seq_kv,
-            unsharded_seq_kv,
-            seg_spec,
-            unsharded_seg_spec,
-          ),
-          out_specs=shd_spec,
-          check_rep=False,
+            shard_map,
+            mesh=mesh,
+            in_specs=(
+                kernel_spec,
+                shd_spec,
+                unsharded_seq_kv,
+                unsharded_seq_kv,
+                seg_spec,
+                unsharded_seg_spec,
+            ),
+            out_specs=shd_spec,
+            check_rep=False,
         )
         def sharded_splash_attn(
-          kernel, q_block, k_block, v_block, q_seg_block, kv_seg_block
+            kernel, q_block, k_block, v_block, q_seg_block, kv_seg_block
         ):
           seg_ids = splash.SegmentIds(q=q_seg_block, kv=kv_seg_block)
           return jax.vmap(kernel)(
-            q_block, k_block, v_block, segment_ids=seg_ids
+              q_block, k_block, v_block, segment_ids=seg_ids
           )
 
         if hasattr(segment_ids, "q") and hasattr(segment_ids, "kv"):
@@ -1011,35 +1016,35 @@ class Attention(nnx.Module):
           kv_seg = segment_ids
 
         qkv: jaxtyping.Array = sharded_splash_attn(
-          splash_attn_kernel,
-          query_proj,
-          key_proj,
-          value_proj,
-          q_seg,
-          kv_seg,
+            splash_attn_kernel,
+            query_proj,
+            key_proj,
+            value_proj,
+            q_seg,
+            kv_seg,
         )
       else:
 
         @partial(
-          shard_map,
-          mesh=mesh,
-          in_specs=(
-            kernel_spec,
-            shd_spec,
-            unsharded_seq_kv,
-            unsharded_seq_kv,
-          ),
-          out_specs=shd_spec,
-          check_rep=False,
+            shard_map,
+            mesh=mesh,
+            in_specs=(
+                kernel_spec,
+                shd_spec,
+                unsharded_seq_kv,
+                unsharded_seq_kv,
+            ),
+            out_specs=shd_spec,
+            check_rep=False,
         )
         def sharded_splash_attn(kernel, q_block, k_block, v_block):
           return jax.vmap(kernel)(q_block, k_block, v_block)
 
         qkv: jaxtyping.Array = sharded_splash_attn(
-          splash_attn_kernel,
-          query_proj,
-          key_proj,
-          value_proj,
+            splash_attn_kernel,
+            query_proj,
+            key_proj,
+            value_proj,
         )
       encoded = qkv.transpose(0, 2, 1, 3)
       query_proj = query_proj.transpose(0, 2, 1, 3)
@@ -1051,7 +1056,7 @@ class Attention(nnx.Module):
         b, t, kg, h = query_proj.shape
         n_groups = kg // self.num_kv_heads
         query_reshaped = query_proj.reshape(
-          (b, t, self.num_kv_heads, n_groups, h)
+            (b, t, self.num_kv_heads, n_groups, h)
         )
         logits = jnp.einsum("BTKGH,BSKH->BTKGS", query_reshaped, key_proj)
         b, t, k, g, s = logits.shape
@@ -1065,14 +1070,15 @@ class Attention(nnx.Module):
 
       if self.attn_type == AttentionType.LOCAL_SLIDING:
         if (
-          segment_pos.shape[1] == 1 and self.config.use_sliding_window_kv_cache
+            segment_pos.shape[1] == 1
+            and self.config.use_sliding_window_kv_cache
         ):
           # for decoding with sliding window cache
           active_cache = cache if cache is not None else kv_shared_cache
           if active_cache is None:
             raise ValueError(
-              "Cache or shared cache is required for local sliding attention"
-              " in decoding."
+                "Cache or shared cache is required for local sliding attention"
+                " in decoding."
             )
           cache_len = key_proj.shape[1]
           end_idx = active_cache["end_index"]
@@ -1096,20 +1102,20 @@ class Attention(nnx.Module):
         elif segment_pos.shape[1] == 1:
           # for decoding without sliding window cache
           sliding_mask = create_sliding_window_mask(
-            attn_mask,
-            sliding_window_size=self.config.sliding_window_size,
+              attn_mask,
+              sliding_window_size=self.config.sliding_window_size,
           )
           attn_mask = sliding_mask * attn_mask
         else:  # for prefill
           all_ones = jnp.ones_like(attn_mask)
           sliding_mask = jnp.triu(
-            all_ones, -1 * self.config.sliding_window_size + 1
+              all_ones, -1 * self.config.sliding_window_size + 1
           ) * jnp.tril(all_ones, self.config.sliding_window_size - 1)
           attn_mask = sliding_mask * attn_mask
 
       attn = jnp.where((jnp.expand_dims(attn_mask, -2)), logits, K_MASK)
       attn = jax.nn.softmax(attn.astype(jnp.float32), axis=-1).astype(
-        key_proj.dtype
+          key_proj.dtype
       )
 
       if self.use_gqa:
@@ -1131,57 +1137,59 @@ class Attention(nnx.Module):
     return self.num_kv_heads != self.config.num_heads and self.num_kv_heads > 1
 
   def __call__(
-    self,
-    x,
-    segment_pos,
-    cache,
-    attn_mask,
-    kv_shared_cache=None,
-    segment_ids=None,
+      self,
+      x,
+      segment_pos,
+      cache,
+      attn_mask,
+      kv_shared_cache=None,
+      segment_ids=None,
   ):
     remat_config = getattr(self.config, "remat_config", RematConfig.NONE)
     if (
-      remat_config == RematConfig.BLOCK
-      or remat_config == RematConfig.BLOCK.value
+        remat_config == RematConfig.BLOCK
+        or remat_config == RematConfig.BLOCK.value
     ):
       # nnx.remat needs to be applied to the unbound function and take self
       # as the first argument. graph_updates=False prevents TraceContextError
       # when mutating params across jax transformation trace levels.
       return _compat_remat(self.block.__func__, graph_updates=False)(
-        self, x, segment_pos, cache, attn_mask, kv_shared_cache, segment_ids
+          self, x, segment_pos, cache, attn_mask, kv_shared_cache, segment_ids
       )
     else:
       return self.block(
-        x,
-        segment_pos,
-        cache,
-        attn_mask,
-        kv_shared_cache=kv_shared_cache,
-        segment_ids=segment_ids,
+          x,
+          segment_pos,
+          cache,
+          attn_mask,
+          kv_shared_cache=kv_shared_cache,
+          segment_ids=segment_ids,
       )
 
   def init_cache(self, batch_size, max_seq_len, dtype):
     cache_len = max_seq_len
     if (
-      self.config.use_sliding_window_kv_cache
-      and self.attn_type == AttentionType.LOCAL_SLIDING
-      and self.config.sliding_window_size is not None
+        self.config.use_sliding_window_kv_cache
+        and self.attn_type == AttentionType.LOCAL_SLIDING
+        and self.config.sliding_window_size is not None
     ):
       cache_len = min(max_seq_len, self.config.sliding_window_size)
 
     cache_shape = (batch_size, cache_len, self.num_kv_heads, self.head_dim)
     k = shard(
-      np.zeros(cache_shape, dtype), self.config.shd_config.act_btnh, eager=True
+        np.zeros(cache_shape, dtype),
+        self.config.shd_config.act_btnh,
+        eager=True,
     )
     v = shard(
-      np.zeros(cache_shape, dtype),
-      self.config.shd_config.act_btnh,
-      eager=True,
+        np.zeros(cache_shape, dtype),
+        self.config.shd_config.act_btnh,
+        eager=True,
     )
     end_index = shard(
-      np.zeros((batch_size,), np.int32),
-      self.config.shd_config.act_btnh[:1],
-      eager=True,
+        np.zeros((batch_size,), np.int32),
+        self.config.shd_config.act_btnh[:1],
+        eager=True,
     )
     return {"k": k, "v": v, "end_index": end_index}
 
@@ -1190,49 +1198,49 @@ class FeedForward(nnx.Module):
   """Feed forward module."""
 
   def __init__(
-    self,
-    config: ModelConfig,
-    *,
-    hidden_dim: int | None = None,
-    rngs: nnx.Rngs,
+      self,
+      config: ModelConfig,
+      *,
+      hidden_dim: int | None = None,
+      rngs: nnx.Rngs,
   ):
     self.config = config
     h_dim = hidden_dim if hidden_dim is not None else config.hidden_dim
     self.gate_proj = nnx.Linear(
-      config.embed_dim,
-      h_dim,
-      use_bias=False,
-      rngs=rngs,
-      kernel_init=nnx.with_partitioning(
-        nnx.initializers.zeros_init(),
-        config.shd_config.ffw_weight_df,
-      ),
-      dtype=config.dtype,
-      param_dtype=config.param_dtype,
+        config.embed_dim,
+        h_dim,
+        use_bias=False,
+        rngs=rngs,
+        kernel_init=nnx.with_partitioning(
+            nnx.initializers.zeros_init(),
+            config.shd_config.ffw_weight_df,
+        ),
+        dtype=config.dtype,
+        param_dtype=config.param_dtype,
     )
 
     self.up_proj = nnx.Linear(
-      config.embed_dim,
-      h_dim,
-      use_bias=False,
-      rngs=rngs,
-      kernel_init=nnx.with_partitioning(
-        nnx.initializers.zeros_init(),
-        config.shd_config.ffw_weight_df,
-      ),
-      dtype=config.dtype,
-      param_dtype=config.param_dtype,
+        config.embed_dim,
+        h_dim,
+        use_bias=False,
+        rngs=rngs,
+        kernel_init=nnx.with_partitioning(
+            nnx.initializers.zeros_init(),
+            config.shd_config.ffw_weight_df,
+        ),
+        dtype=config.dtype,
+        param_dtype=config.param_dtype,
     )
     self.down_proj = nnx.Linear(
-      h_dim,
-      config.embed_dim,
-      use_bias=False,
-      rngs=rngs,
-      kernel_init=nnx.with_partitioning(
-        nnx.initializers.zeros_init(), config.shd_config.ffw_weight_fd
-      ),
-      dtype=config.dtype,
-      param_dtype=config.param_dtype,
+        h_dim,
+        config.embed_dim,
+        use_bias=False,
+        rngs=rngs,
+        kernel_init=nnx.with_partitioning(
+            nnx.initializers.zeros_init(), config.shd_config.ffw_weight_fd
+        ),
+        dtype=config.dtype,
+        param_dtype=config.param_dtype,
     )
 
   def block(self, x):
@@ -1242,8 +1250,8 @@ class FeedForward(nnx.Module):
   def __call__(self, x):
     remat_config = getattr(self.config, "remat_config", RematConfig.NONE)
     if (
-      remat_config == RematConfig.BLOCK
-      or remat_config == RematConfig.BLOCK.value
+        remat_config == RematConfig.BLOCK
+        or remat_config == RematConfig.BLOCK.value
     ):
       return _compat_remat(self.block.__func__, graph_updates=False)(self, x)
     else:
@@ -1254,126 +1262,126 @@ class DecoderLayer(nnx.Module):
   """Decoder layer."""
 
   def __init__(
-    self,
-    config: ModelConfig,
-    attn_type: AttentionType,
-    *,
-    hidden_dim: int | None = None,
-    rngs: nnx.Rngs,
+      self,
+      config: ModelConfig,
+      attn_type: AttentionType,
+      *,
+      hidden_dim: int | None = None,
+      rngs: nnx.Rngs,
   ):
 
     self.config = config
     self.pre_attention_norm = RMSNorm(
-      config.embed_dim,
-      rngs=rngs,
-      sharding=config.shd_config,
-      dtype=config.dtype,
-      param_dtype=config.param_dtype,
+        config.embed_dim,
+        rngs=rngs,
+        sharding=config.shd_config,
+        dtype=config.dtype,
+        param_dtype=config.param_dtype,
     )
 
     self.attn = Attention(
-      config=config,
-      attn_type=attn_type,
-      rngs=rngs,
+        config=config,
+        attn_type=attn_type,
+        rngs=rngs,
     )
     self.post_attention_norm = RMSNorm(
-      config.embed_dim,
-      rngs=rngs,
-      sharding=config.shd_config,
-      dtype=config.dtype,
-      param_dtype=config.param_dtype,
+        config.embed_dim,
+        rngs=rngs,
+        sharding=config.shd_config,
+        dtype=config.dtype,
+        param_dtype=config.param_dtype,
     )
     self.pre_ffw_norm = RMSNorm(
-      config.embed_dim,
-      rngs=rngs,
-      sharding=config.shd_config,
-      dtype=config.dtype,
-      param_dtype=config.param_dtype,
+        config.embed_dim,
+        rngs=rngs,
+        sharding=config.shd_config,
+        dtype=config.dtype,
+        param_dtype=config.param_dtype,
     )
     self.mlp = FeedForward(config=config, hidden_dim=hidden_dim, rngs=rngs)
 
     if config.enable_moe:
       self.moe_pre_ffw_norm = RMSNorm(
-        config.embed_dim,
-        rngs=rngs,
-        sharding=config.shd_config,
-        dtype=config.dtype,
-        param_dtype=config.param_dtype,
+          config.embed_dim,
+          rngs=rngs,
+          sharding=config.shd_config,
+          dtype=config.dtype,
+          param_dtype=config.param_dtype,
       )
       self.moe = moe.MoERagged(
-        config=config,
-        rngs=rngs,
+          config=config,
+          rngs=rngs,
       )
       self.moe_post_ffw_norm = RMSNorm(
-        config.embed_dim,
-        rngs=rngs,
-        sharding=config.shd_config,
-        dtype=config.dtype,
-        param_dtype=config.param_dtype,
+          config.embed_dim,
+          rngs=rngs,
+          sharding=config.shd_config,
+          dtype=config.dtype,
+          param_dtype=config.param_dtype,
       )
       self.dense_post_ffw_norm = RMSNorm(
+          config.embed_dim,
+          rngs=rngs,
+          sharding=config.shd_config,
+          dtype=config.dtype,
+          param_dtype=config.param_dtype,
+      )
+    self.post_ffw_norm = RMSNorm(
         config.embed_dim,
         rngs=rngs,
         sharding=config.shd_config,
         dtype=config.dtype,
         param_dtype=config.param_dtype,
-      )
-    self.post_ffw_norm = RMSNorm(
-      config.embed_dim,
-      rngs=rngs,
-      sharding=config.shd_config,
-      dtype=config.dtype,
-      param_dtype=config.param_dtype,
     )
 
     if config.per_layer_input_dim > 0:
       self.per_layer_input_gate = Einsum(
-        einsum_str="BTD,DP->BTP",
-        shape=(config.embed_dim, config.per_layer_input_dim),
-        sharding=config.shd_config.per_layer_input_gate,
-        rngs=rngs,
-        dtype=config.dtype,
-        param_dtype=config.param_dtype,
+          einsum_str="BTD,DP->BTP",
+          shape=(config.embed_dim, config.per_layer_input_dim),
+          sharding=config.shd_config.per_layer_input_gate,
+          rngs=rngs,
+          dtype=config.dtype,
+          param_dtype=config.param_dtype,
       )
 
       self.per_layer_projection = Einsum(
-        einsum_str="BTP,PD->BTD",
-        shape=(config.per_layer_input_dim, config.embed_dim),
-        sharding=config.shd_config.per_layer_projection,
-        rngs=rngs,
-        dtype=config.dtype,
-        param_dtype=config.param_dtype,
+          einsum_str="BTP,PD->BTD",
+          shape=(config.per_layer_input_dim, config.embed_dim),
+          sharding=config.shd_config.per_layer_projection,
+          rngs=rngs,
+          dtype=config.dtype,
+          param_dtype=config.param_dtype,
       )
 
       self.post_per_layer_input_norm = RMSNorm(
-        config.embed_dim,
-        rngs=rngs,
-        sharding=config.shd_config,
-        dtype=config.dtype,
-        param_dtype=config.param_dtype,
+          config.embed_dim,
+          rngs=rngs,
+          sharding=config.shd_config,
+          dtype=config.dtype,
+          param_dtype=config.param_dtype,
       )
 
     self.skip_scale = nnx.Param(jnp.ones((1,), dtype=config.param_dtype))
 
   def block(
-    self,
-    x,
-    segment_pos,
-    cache,
-    attn_mask,
-    per_layer_input=None,
-    kv_shared_cache=None,
-    segment_ids=None,
+      self,
+      x,
+      segment_pos,
+      cache,
+      attn_mask,
+      per_layer_input=None,
+      kv_shared_cache=None,
+      segment_ids=None,
   ):
     x = checkpoint_name(x, "decoder_input")
     norm = self.pre_attention_norm(x)
     cache, attn, kv = self.attn(
-      norm,
-      segment_pos,
-      cache,
-      attn_mask,
-      kv_shared_cache=kv_shared_cache,
-      segment_ids=segment_ids,
+        norm,
+        segment_pos,
+        cache,
+        attn_mask,
+        kv_shared_cache=kv_shared_cache,
+        segment_ids=segment_ids,
     )
     attn = self.post_attention_norm(attn)
     attn += x
@@ -1402,43 +1410,93 @@ class DecoderLayer(nnx.Module):
     return cache, ffw, kv
 
   def __call__(
-    self,
-    x,
-    segment_pos,
-    cache,
-    attn_mask,
-    per_layer_input=None,
-    kv_shared_cache=None,
-    segment_ids=None,
+      self,
+      x,
+      segment_pos,
+      cache,
+      attn_mask,
+      per_layer_input=None,
+      kv_shared_cache=None,
+      segment_ids=None,
   ):
     remat_config = getattr(self.config, "remat_config", RematConfig.NONE)
     if (
-      remat_config == RematConfig.DECODER
-      or remat_config == RematConfig.DECODER.value
+        remat_config == RematConfig.DECODER
+        or remat_config == RematConfig.DECODER.value
     ):
       return _compat_remat(self.block.__func__, graph_updates=False)(
-        self,
-        x,
-        segment_pos,
-        cache,
-        attn_mask,
-        per_layer_input,
-        kv_shared_cache,
-        segment_ids,
+          self,
+          x,
+          segment_pos,
+          cache,
+          attn_mask,
+          per_layer_input,
+          kv_shared_cache,
+          segment_ids,
       )
     else:
       return self.block(
-        x,
-        segment_pos,
-        cache,
-        attn_mask,
-        per_layer_input,
-        kv_shared_cache,
-        segment_ids=segment_ids,
+          x,
+          segment_pos,
+          cache,
+          attn_mask,
+          per_layer_input,
+          kv_shared_cache,
+          segment_ids=segment_ids,
       )
 
   def init_cache(self, batch_size, max_seq_len, dtype):
     return self.attn.init_cache(batch_size, max_seq_len, dtype)
+
+
+class ScanLayerGroup(nnx.Module):
+  """A group of DecoderLayers matching one full attention pattern cycle.
+
+  For Gemma4 31B with pattern (L, L, L, L, L, G), each group contains
+  6 layers. When used with nnx.scan, XLA compiles the group body once
+  and executes it N times (where N = num_layers / pattern_length),
+  producing a tiled schedule with regular memory behavior.
+  """
+
+  def __init__(
+      self,
+      config: ModelConfig,
+      pattern: tuple[AttentionType, ...],
+      *,
+      rngs: nnx.Rngs,
+  ):
+    self.config = config
+    self.pattern = pattern
+    self.sub_layers = compat.ModuleList()
+    for attn_type in pattern:
+      self.sub_layers.append(
+          DecoderLayer(
+              config=config,
+              attn_type=attn_type,
+              hidden_dim=config.hidden_dim,
+              rngs=rngs,
+          )
+      )
+
+  def __call__(
+      self,
+      x: jaxtyping.Array,
+      positions: jaxtyping.Array,
+      attn_mask: jaxtyping.Array,
+      segment_ids: jaxtyping.Array | None = None,
+  ) -> jaxtyping.Array:
+    """Run one pattern-group of layers. Training-only (no cache)."""
+    for layer in self.sub_layers:
+      _, x, _ = layer(
+          x,
+          positions,
+          None,  # cache=None for training
+          attn_mask,
+          per_layer_input=None,
+          kv_shared_cache=None,
+          segment_ids=segment_ids,
+      )
+    return x
 
 
 class Gemma4(BackendMappingMixin, nnx.Module):
@@ -1449,62 +1507,107 @@ class Gemma4(BackendMappingMixin, nnx.Module):
     self.embedder = Embedder(config, rngs=rngs)
 
     pattern = (
-      config.attention_pattern
-      if config.attention_pattern
-      else GEMMA4_ATTENTION_PATTERN
+        config.attention_pattern
+        if config.attention_pattern
+        else GEMMA4_ATTENTION_PATTERN
     )
     attention_types = [
-      attn_type
-      for _, attn_type in zip(
-        range(config.num_layers), itertools.cycle(pattern)
-      )
+        attn_type
+        for _, attn_type in zip(
+            range(config.num_layers), itertools.cycle(pattern)
+        )
     ]
     self.kv_cache_sharing_patterns = create_kv_cache_sharing_patterns(
-      num_layers=config.num_layers,
-      frac_shared_layers=config.frac_shared_layers,
-      share_global=True,
-      share_local=True,
-      attention_types=tuple(attention_types),
+        num_layers=config.num_layers,
+        frac_shared_layers=config.frac_shared_layers,
+        share_global=True,
+        share_local=True,
+        attention_types=tuple(attention_types),
     )
     # Layers that shared layers depend on.
     self.shared_layer_origins = {
-      j for i, j in enumerate(self.kv_cache_sharing_patterns) if i != j
+        j for i, j in enumerate(self.kv_cache_sharing_patterns) if i != j
     }
 
+    if config.use_scan_layers:
+      self._init_scan_layers(config, pattern, rngs)
+    else:
+      self._init_loop_layers(config, attention_types, rngs)
+
+    self.final_norm = RMSNorm(
+        config.embed_dim,
+        rngs=rngs,
+        sharding=config.shd_config,
+        dtype=config.dtype,
+        param_dtype=config.param_dtype,
+    )
+
+  def _init_loop_layers(
+      self,
+      config: ModelConfig,
+      attention_types: list[AttentionType],
+      rngs: nnx.Rngs,
+  ) -> None:
+    """Original for-loop layer initialization."""
     self.layers = compat.ModuleList()
     for i in range(config.num_layers):
       attn_type = attention_types[i]
       h_dim = config.hidden_dim
       if (
-        self.kv_cache_sharing_patterns[i] != i
-        and config.override_kv_shared_ffw_hidden is not None
+          self.kv_cache_sharing_patterns[i] != i
+          and config.override_kv_shared_ffw_hidden is not None
       ):
         h_dim = config.override_kv_shared_ffw_hidden
       self.layers.append(
-        DecoderLayer(
-          config=config, attn_type=attn_type, hidden_dim=h_dim, rngs=rngs
-        )
+          DecoderLayer(
+              config=config, attn_type=attn_type, hidden_dim=h_dim, rngs=rngs
+          )
       )
 
-    self.final_norm = RMSNorm(
-      config.embed_dim,
-      rngs=rngs,
-      sharding=config.shd_config,
-      dtype=config.dtype,
-      param_dtype=config.param_dtype,
-    )
+  def _init_scan_layers(
+      self,
+      config: ModelConfig,
+      pattern: tuple[AttentionType, ...],
+      rngs: nnx.Rngs,
+  ) -> None:
+    """Scan-based layer initialization using nnx.vmap over pattern groups."""
+    pattern_len = len(pattern)
+    if config.num_layers % pattern_len != 0:
+      raise ValueError(
+          f"use_scan_layers requires num_layers ({config.num_layers}) to be "
+          f"divisible by the attention pattern length ({pattern_len})."
+      )
+    if config.frac_shared_layers > 0:
+      raise ValueError(
+          "use_scan_layers is not compatible with KV cache sharing "
+          "(frac_shared_layers > 0)."
+      )
+    if config.per_layer_input_dim > 0:
+      raise ValueError(
+          "use_scan_layers is not yet compatible with per-layer inputs "
+          "(per_layer_input_dim > 0)."
+      )
+    self.num_scan_groups = config.num_layers // pattern_len
+    self.scan_pattern = pattern
+
+    @nnx.split_rngs(splits=self.num_scan_groups)
+    @nnx.vmap(axis_size=self.num_scan_groups)
+    def create_group(rngs: nnx.Rngs) -> ScanLayerGroup:
+      return ScanLayerGroup(config, pattern, rngs=rngs)
+
+    self.scan_groups = create_group(rngs)
 
   def __call__(
-    self,
-    tokens,
-    positions=None,
-    cache=None,
-    attention_mask=None,
-    decode_only_last_token=False,
-    segment_ids=None,
-    *,
-    target_indices: jaxtyping.Array | None = None,
-    return_hidden_states: bool = False,
+      self,
+      tokens,
+      positions=None,
+      cache=None,
+      attention_mask=None,
+      decode_only_last_token=False,
+      segment_ids=None,
+      *,
+      target_indices: jaxtyping.Array | None = None,
+      return_hidden_states: bool = False,
   ) -> GemmaOutput:
     """Gemma4 forward pass.
 
@@ -1546,42 +1649,20 @@ class Gemma4(BackendMappingMixin, nnx.Module):
     transient_kvs = {}
     is_prefill = tokens.shape[1] > 1
 
-    for i, layer in enumerate(self.layers):
-      layer_name = f"layer_{i}"
-
-      shared_idx = self.kv_cache_sharing_patterns[i]
-      is_shared = shared_idx != i
-      if is_shared:
-        assert shared_idx in self.shared_layer_origins
-        layer_cache = None
-        shared_layer_name = f"layer_{shared_idx}"
-        if is_prefill:
-          # During prefill, use full KV projections from the shared layer.
-          shared_k, shared_v = transient_kvs[shared_layer_name]
-          kv_shared_cache = {"k": shared_k, "v": shared_v}
-        else:
-          # During decoding, use the shared layer's cache (which may be
-          # an optimized sliding window ring cache).
-          kv_shared_cache = new_cache.get(shared_layer_name)
-      else:
-        layer_cache = cache[layer_name] if cache else None
-        kv_shared_cache = None
-
-      layer_cache, x, layers_kvs = layer(
-        x,
-        positions,
-        layer_cache,
-        attention_mask,
-        per_layer_input=per_layer_inputs[:, :, i, :]
-        if per_layer_inputs is not None
-        else None,
-        kv_shared_cache=kv_shared_cache,
-        segment_ids=segment_ids,
+    if self.config.use_scan_layers and cache is None:
+      x = self._forward_scan(x, positions, attention_mask, segment_ids)
+    else:
+      x = self._forward_loop(
+          x,
+          positions,
+          cache,
+          attention_mask,
+          per_layer_inputs,
+          new_cache,
+          transient_kvs,
+          is_prefill,
+          segment_ids,
       )
-      if is_prefill and i in self.shared_layer_origins:
-        transient_kvs[layer_name] = layers_kvs
-      if not is_shared:
-        new_cache[layer_name] = layer_cache
 
     x = self.final_norm(x)
 
@@ -1603,10 +1684,84 @@ class Gemma4(BackendMappingMixin, nnx.Module):
       logits = jnp.tanh(logits) * self.config.final_logit_softcap
 
     return GemmaOutput(
-      logits=logits,
-      cache=new_cache if return_cache else None,
-      hidden_states=hidden_states_out,
+        logits=logits,
+        cache=new_cache if return_cache else None,
+        hidden_states=hidden_states_out,
     )
+
+  def _forward_loop(
+      self,
+      x: jaxtyping.Array,
+      positions: jaxtyping.Array,
+      cache: Cache | None,
+      attention_mask: jaxtyping.Array,
+      per_layer_inputs: jaxtyping.Array | None,
+      new_cache: dict,
+      transient_kvs: dict,
+      is_prefill: bool,
+      segment_ids: jaxtyping.Array | None,
+  ) -> jaxtyping.Array:
+    """Original for-loop forward pass over layers."""
+    for i, layer in enumerate(self.layers):
+      layer_name = f"layer_{i}"
+
+      shared_idx = self.kv_cache_sharing_patterns[i]
+      is_shared = shared_idx != i
+      if is_shared:
+        assert shared_idx in self.shared_layer_origins
+        layer_cache = None
+        shared_layer_name = f"layer_{shared_idx}"
+        if is_prefill:
+          shared_k, shared_v = transient_kvs[shared_layer_name]
+          kv_shared_cache = {"k": shared_k, "v": shared_v}
+        else:
+          kv_shared_cache = new_cache.get(shared_layer_name)
+      else:
+        layer_cache = cache[layer_name] if cache else None
+        kv_shared_cache = None
+
+      layer_cache, x, layers_kvs = layer(
+          x,
+          positions,
+          layer_cache,
+          attention_mask,
+          per_layer_input=per_layer_inputs[:, :, i, :]
+          if per_layer_inputs is not None
+          else None,
+          kv_shared_cache=kv_shared_cache,
+          segment_ids=segment_ids,
+      )
+      if is_prefill and i in self.shared_layer_origins:
+        transient_kvs[layer_name] = layers_kvs
+      if not is_shared:
+        new_cache[layer_name] = layer_cache
+    return x
+
+  def _forward_scan(
+      self,
+      x: jaxtyping.Array,
+      positions: jaxtyping.Array,
+      attention_mask: jaxtyping.Array,
+      segment_ids: jaxtyping.Array | None,
+  ) -> jaxtyping.Array:
+    """Scan-based forward pass. Training only (cache=None).
+
+    Produces a while loop in HLO: the body is one pattern-group of layers,
+    executed num_scan_groups times. The schedule is perfectly tiled.
+    """
+
+    @nnx.scan(in_axes=(nnx.Carry, 0, None, None, None), out_axes=nnx.Carry)
+    def scan_body(
+        x: jaxtyping.Array,
+        group: ScanLayerGroup,
+        positions: jaxtyping.Array,
+        attn_mask: jaxtyping.Array,
+        segment_ids: jaxtyping.Array | None,
+    ) -> jaxtyping.Array:
+      return group(x, positions, attn_mask, segment_ids)
+
+    x = scan_body(x, self.scan_groups, positions, attention_mask, segment_ids)
+    return x
 
   def init_cache(self, batch_size, max_seq_len, dtype):
     cache = {}
@@ -1625,12 +1780,14 @@ class Gemma4(BackendMappingMixin, nnx.Module):
     dummy_batch_size = 2
     dummy_seq_len = 2
     return {
-      "tokens": jnp.ones((dummy_batch_size, dummy_seq_len), dtype=jnp.int32),
-      "positions": jnp.ones((dummy_batch_size, dummy_seq_len), dtype=jnp.int32),
-      "cache": None,
-      "attention_mask": jnp.ones(
-        (dummy_batch_size, 1, dummy_seq_len), dtype=jnp.bool
-      ),
+        "tokens": jnp.ones((dummy_batch_size, dummy_seq_len), dtype=jnp.int32),
+        "positions": jnp.ones(
+            (dummy_batch_size, dummy_seq_len), dtype=jnp.int32
+        ),
+        "cache": None,
+        "attention_mask": jnp.ones(
+            (dummy_batch_size, 1, dummy_seq_len), dtype=jnp.bool
+        ),
     }
 
   @property
