@@ -121,20 +121,25 @@ class _ShapeTracer:
   @property
   def T(self) -> _ShapeTracer:
     return _ShapeTracer(
-        self.key, self.shape[::-1],
-        not self._transposed, self._slice_idx,
+        self.key,
+        self.shape[::-1],
+        not self._transposed,
+        self._slice_idx,
     )
 
   def __getitem__(self, idx: int | slice) -> _ShapeTracer:
     if isinstance(idx, int):
       return _ShapeTracer(
-          self.key, self.shape[1:],
-          self._transposed, idx,
+          self.key,
+          self.shape[1:],
+          self._transposed,
+          idx,
       )
     return self
 
   def invert_spec(
-      self, spec: jax.sharding.PartitionSpec,
+      self,
+      spec: jax.sharding.PartitionSpec,
   ) -> jax.sharding.PartitionSpec:
     """Given a downstream PartitionSpec, compute the upstream one."""
     s = tuple(spec)
@@ -149,6 +154,7 @@ def _build_sharded_restore_target(
     checkpoint_path: str,
     model_state: Any,
     mesh: jax.sharding.Mesh,
+    model_config: model_lib.ModelConfig,
 ) -> tuple[dict[str, Any], ocp.PyTreeCheckpointer]:
   """Build a sharded restore target for direct-to-device DMA loading.
 
@@ -161,6 +167,7 @@ def _build_sharded_restore_target(
     checkpoint_path: Path to the Orbax checkpoint.
     model_state: Abstract NNX model state (from nnx.eval_shape).
     mesh: JAX sharding mesh.
+    model_config: Gemma4 model configuration.
 
   Returns:
     (upstream_target, checkpointer) — the target tree of ShapeDtypeStructs
@@ -172,9 +179,9 @@ def _build_sharded_restore_target(
   flat_upstream = flax.traverse_util.flatten_dict(meta.item_metadata.tree)
 
   # Trace through the key mapper with abstract _ShapeTracer values.
-  mock_upstream = flax.traverse_util.unflatten_dict({
-      k: _ShapeTracer(k, v.shape) for k, v in flat_upstream.items()
-  })
+  mock_upstream = flax.traverse_util.unflatten_dict(
+      {k: _ShapeTracer(k, v.shape) for k, v in flat_upstream.items()}
+  )
   flat_traced = flax.traverse_util.flatten_dict(
       map_from_upstream_checkpoint(mock_upstream)
   )
@@ -183,13 +190,43 @@ def _build_sharded_restore_target(
   flat_shardings = flax.traverse_util.flatten_dict(
       nnx.to_pure_dict(nnx.get_named_sharding(model_state, mesh))
   )
-  fallback = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+  pattern_len = (
+      len(model_config.attention_pattern) if model_config.use_scan_layers else 0
+  )
 
   # Invert traced operations to compute upstream PartitionSpecs.
   upstream_target: dict[tuple[str, ...], jax.ShapeDtypeStruct] = {}
   for downstream_key, tracer in flat_traced.items():
-    sharding = flat_shardings.get(downstream_key, fallback)
-    upstream_spec = tracer.invert_spec(sharding.spec)
+    # If using scan layers, map flat downstream key to scan group key.
+    if (
+        pattern_len > 0
+        and len(downstream_key) >= 2
+        and downstream_key[0] == 'layers'
+        and isinstance(downstream_key[1], int)
+    ):
+      layer_idx = downstream_key[1]
+      param_path = downstream_key[2:]
+      sub_layer_idx = layer_idx % pattern_len
+      scan_key = ('scan_groups', 'sub_layers', sub_layer_idx) + param_path
+      if scan_key not in flat_shardings:
+        logging.info(
+            'Skipping sharded restore target for pruned scan key: %s',
+            '/'.join(str(p) for p in scan_key),
+        )
+        continue
+      sharding = flat_shardings[scan_key]
+      # Strip the leading scan axis spec (first element) to get the slice spec.
+      upstream_spec = tracer.invert_spec(sharding.spec[1:])
+    else:
+      if downstream_key not in flat_shardings:
+        logging.info(
+            'Skipping sharded restore target for pruned key: %s',
+            '/'.join(str(p) for p in downstream_key),
+        )
+        continue
+      sharding = flat_shardings[downstream_key]
+      upstream_spec = tracer.invert_spec(sharding.spec)
+
     orig = flat_upstream[tracer.key]
     upstream_target[tracer.key] = jax.ShapeDtypeStruct(
         shape=orig.shape,
@@ -235,35 +272,46 @@ def create_model_from_checkpoint(
   # ── Phase 2: Restore checkpoint ────────────────────────────────────────
   if mesh is not None:
     target, ckptr = _build_sharded_restore_target(
-        checkpoint_path, model_state, mesh,
+        checkpoint_path,
+        model_state,
+        mesh,
+        model_config,
     )
     raw_params = ckptr.restore(
-        checkpoint_path, target=target, partial_restore=True,
+        checkpoint_path,
+        target=target,
+        partial_restore=True,
     )
   else:
     raw_params = ocp.PyTreeCheckpointer().restore(checkpoint_path)
 
-  # ── Phase 3: Map upstream keys → downstream layout, prune, validate ────
+  # ── Phase 3: Map upstream keys → downstream layout ──────────────────────
   mapped = map_from_upstream_checkpoint(raw_params)
+
+  # ── Phase 4: Stack layers for scan (if enabled) ────────────────────────
+  if model_config.use_scan_layers:
+    mapped = _stack_layers_for_scan(
+        mapped,
+        model_config.num_layers,
+        len(model_config.attention_pattern),
+    )
+
+  # ── Phase 5: Prune and validate ────────────────────────────────────────
   pruned = _prune_to_model_keys(mapped, model_state)
   _validate_param_shapes(pruned, model_state)
 
-  # ── Phase 4: Cast dtype and apply target shardings ─────────────────────
+  # ── Phase 6: Cast dtype and apply target shardings ─────────────────────
   if mesh is not None:
     shardings = nnx.to_pure_dict(nnx.get_named_sharding(model_state, mesh))
     typed = jax.tree_util.tree_map_with_path(
         lambda p, x, s: jnp.asarray(x, device=s, dtype=dtype),
-        pruned, shardings,
+        pruned,
+        shardings,
     )
   else:
     typed = jax.tree_util.tree_map(
-        lambda x: jnp.asarray(x, dtype=dtype), pruned,
-    )
-
-  # ── Phase 5: Stack layers for scan (if enabled) ────────────────────────
-  if model_config.use_scan_layers:
-    typed = _stack_layers_for_scan(
-        typed, model_config.num_layers, len(model_config.attention_pattern),
+        lambda x: jnp.asarray(x, dtype=dtype),
+        pruned,
     )
 
   nnx.update(abs_model, typed)
@@ -275,7 +323,9 @@ def create_model_from_checkpoint(
   def _materialize(x: Any) -> Any:
     if isinstance(x, jax.ShapeDtypeStruct):
       return jnp.zeros(
-          x.shape, dtype=x.dtype, device=getattr(x, 'sharding', None),
+          x.shape,
+          dtype=x.dtype,
+          device=getattr(x, 'sharding', None),
       )
     return x
 
@@ -286,7 +336,8 @@ def create_model_from_checkpoint(
     _log_sharding_summary(abs_model)
 
   logging.info(
-      '[TIMING] create_model_from_checkpoint: %.1fs', time.monotonic() - t0,
+      '[TIMING] create_model_from_checkpoint: %.1fs',
+      time.monotonic() - t0,
   )
   return abs_model
 
@@ -302,16 +353,27 @@ def _log_sharding_summary(model: model_lib.Gemma4) -> None:
     spec = getattr(leaf.sharding, 'spec', None)
     if i < 5:
       key_str = '/'.join(str(k) for k in path)
-      logging.info('  [SHARDING] %s: shape=%s spec=%s', key_str, leaf.shape, spec)
-    if (spec is not None and all(s is None for s in spec)
-        and hasattr(leaf, 'nbytes') and leaf.nbytes > 1_000_000):
-      replicated_large.append(('/'.join(str(k) for k in path), leaf.shape, leaf.nbytes))
+      logging.info(
+          '  [SHARDING] %s: shape=%s spec=%s', key_str, leaf.shape, spec
+      )
+    if (
+        spec is not None
+        and all(s is None for s in spec)
+        and hasattr(leaf, 'nbytes')
+        and leaf.nbytes > 1_000_000
+    ):
+      replicated_large.append(
+          ('/'.join(str(k) for k in path), leaf.shape, leaf.nbytes)
+      )
 
   if replicated_large:
-    logging.warning('⚠️ %d large tensors fully replicated:', len(replicated_large))
+    logging.warning(
+        '⚠️ %d large tensors fully replicated:', len(replicated_large)
+    )
     for key_str, shape, nbytes in replicated_large[:10]:
-      logging.warning('    %s: shape=%s (%.1f MB)', key_str, shape, nbytes / 1e6)
-
+      logging.warning(
+          '    %s: shape=%s (%.1f MB)', key_str, shape, nbytes / 1e6
+      )
 
 
 def _validate_param_shapes(
@@ -494,7 +556,9 @@ def map_from_upstream_checkpoint(params: Mapping[str, Any]) -> dict[str, Any]:
 
     # Skip multimodal modules (e.g., audio_encoder).
     if not module_path[0].startswith('layer_'):
-      logging.info('Skipping non-layer module: %s', '/'.join(str(p) for p in parts))
+      logging.info(
+          'Skipping non-layer module: %s', '/'.join(str(p) for p in parts)
+      )
       continue
 
     layer_idx = ('layers', int(module_path[0].removeprefix('layer_')))

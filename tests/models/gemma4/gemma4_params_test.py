@@ -17,7 +17,9 @@ from unittest import mock
 
 from absl.testing import absltest
 from absl.testing import parameterized
+from flax import nnx
 from flax.traverse_util import flatten_dict
+import jax
 import numpy as np
 from tunix.models.gemma4 import params
 
@@ -486,6 +488,138 @@ class CreateModelTest(absltest.TestCase):
     mock_path_cls.assert_called_once_with('/fake/tokenizer.model')
     mock_processor.LoadFromSerializedProto.assert_called_once_with(fake_bytes)
     self.assertIs(result, mock_processor)
+
+
+class BuildShardedRestoreTargetTest(absltest.TestCase):
+  """Tests for _build_sharded_restore_target."""
+
+  def setUp(self):
+    super().setUp()
+    self.mock_ckptr_cls = self.enter_context(
+        mock.patch.object(params.ocp, 'PyTreeCheckpointer', autospec=True)
+    )
+    self.mock_ckptr = self.mock_ckptr_cls.return_value
+
+    # Upstream keys: one layer parameter, one non-layer parameter
+    self.fake_upstream = {
+        'layer_0': {'mlp': {'gating_einsum': {'w': np.zeros((2, 4, 8))}}},
+        'embedder': {'input_embedding': np.zeros((16, 4))},
+    }
+    mock_meta = mock.MagicMock()
+    mock_meta.item_metadata.tree = self.fake_upstream
+    self.mock_ckptr.metadata.return_value = mock_meta
+
+    devices = np.array(jax.devices()[:1]).reshape(1, 1)
+    self.mesh = jax.sharding.Mesh(devices, ('fsdp', 'tp'))
+    self.enter_context(jax.set_mesh(self.mesh))
+
+  def test_build_target_without_scan_layers(self):
+    config = mock.create_autospec(params.model_lib.ModelConfig, instance=True)
+    config.use_scan_layers = False
+
+    # Downstream layout matches upstream map output exactly
+    model_state = nnx.State({
+        'layers': {
+            0: {
+                'mlp': {
+                    'gate_proj': {
+                        'kernel': nnx.Param(
+                            np.zeros((4, 8)),
+                            sharding=jax.sharding.PartitionSpec('fsdp', 'tp'),
+                        )
+                    },
+                    'up_proj': {
+                        'kernel': nnx.Param(
+                            np.zeros((4, 8)),
+                            sharding=jax.sharding.PartitionSpec('fsdp', 'tp'),
+                        )
+                    },
+                }
+            }
+        },
+        'embedder': {
+            'input_embedding': nnx.Param(
+                np.zeros((16, 4)),
+                sharding=jax.sharding.PartitionSpec('fsdp', None),
+            )
+        },
+    })
+
+    target, _ = params._build_sharded_restore_target(
+        '/fake/checkpoint', model_state, self.mesh, config
+    )
+
+    # For embedder: matches directly, spec is ('fsdp', None)
+    self.assertEqual(
+        target['embedder']['input_embedding'].sharding.spec,
+        jax.sharding.PartitionSpec('fsdp', None),
+    )
+
+    # For layer 0 mlp gate_proj: upstream is gating_einsum/w.
+    # Inverted spec: ('fsdp', 'tp')[::-1] -> ('tp', 'fsdp') -> prepends None -> (None, 'tp', 'fsdp')
+    self.assertEqual(
+        target['layer_0']['mlp']['gating_einsum']['w'].sharding.spec,
+        jax.sharding.PartitionSpec(None, 'tp', 'fsdp'),
+    )
+
+  def test_build_target_with_scan_layers(self):
+    config = mock.create_autospec(params.model_lib.ModelConfig, instance=True)
+    config.use_scan_layers = True
+    config.attention_pattern = (params.model_lib.AttentionType.GLOBAL,)
+    config.num_layers = 1
+
+    # Downstream scan layout: scan_groups/sub_layers/0/...
+    model_state = nnx.State({
+        'scan_groups': {
+            'sub_layers': {
+                0: {
+                    'mlp': {
+                        'gate_proj': {
+                            'kernel': nnx.Param(
+                                np.zeros((1, 4, 8)),
+                                sharding=jax.sharding.PartitionSpec(
+                                    None, 'fsdp', 'tp'
+                                ),
+                            )
+                        },
+                        'up_proj': {
+                            'kernel': nnx.Param(
+                                np.zeros((1, 4, 8)),
+                                sharding=jax.sharding.PartitionSpec(
+                                    None, 'fsdp', 'tp'
+                                ),
+                            )
+                        },
+                    }
+                }
+            }
+        },
+        'embedder': {
+            'input_embedding': nnx.Param(
+                np.zeros((16, 4)),
+                sharding=jax.sharding.PartitionSpec('fsdp', None),
+            )
+        },
+    })
+
+    target, _ = params._build_sharded_restore_target(
+        '/fake/checkpoint', model_state, self.mesh, config
+    )
+
+    # Embedder remains unsharded scan, spec is unmodified: ('fsdp', None)
+    self.assertEqual(
+        target['embedder']['input_embedding'].sharding.spec,
+        jax.sharding.PartitionSpec('fsdp', None),
+    )
+
+    # For layer_0 gating_einsum/w:
+    # Downstream sharding on scan_groups is (None, 'fsdp', 'tp').
+    # 1. Strips first axis -> ('fsdp', 'tp').
+    # 2. Tracer inverts: transposes -> ('tp', 'fsdp'), prepends None -> (None, 'tp', 'fsdp')
+    self.assertEqual(
+        target['layer_0']['mlp']['gating_einsum']['w'].sharding.spec,
+        jax.sharding.PartitionSpec(None, 'tp', 'fsdp'),
+    )
 
 
 if __name__ == '__main__':
