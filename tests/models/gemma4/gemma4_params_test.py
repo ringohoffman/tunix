@@ -578,7 +578,7 @@ class BuildShardedRestoreTargetTest(absltest.TestCase):
                             'kernel': nnx.Param(
                                 np.zeros((1, 4, 8)),
                                 sharding=jax.sharding.PartitionSpec(
-                                    None, 'fsdp', 'tp'
+                                    'fsdp', 'tp'
                                 ),
                             )
                         },
@@ -586,7 +586,7 @@ class BuildShardedRestoreTargetTest(absltest.TestCase):
                             'kernel': nnx.Param(
                                 np.zeros((1, 4, 8)),
                                 sharding=jax.sharding.PartitionSpec(
-                                    None, 'fsdp', 'tp'
+                                    'fsdp', 'tp'
                                 ),
                             )
                         },
@@ -613,13 +613,61 @@ class BuildShardedRestoreTargetTest(absltest.TestCase):
     )
 
     # For layer_0 gating_einsum/w:
-    # Downstream sharding on scan_groups is (None, 'fsdp', 'tp').
-    # 1. Strips first axis -> ('fsdp', 'tp').
-    # 2. Tracer inverts: transposes -> ('tp', 'fsdp'), prepends None -> (None, 'tp', 'fsdp')
+    # Downstream sharding on scan_groups is ('fsdp', 'tp') (unstacked).
+    # Tracer inverts: transposes -> ('tp', 'fsdp'), prepends None -> (None, 'tp', 'fsdp')
     self.assertEqual(
         target['layer_0']['mlp']['gating_einsum']['w'].sharding.spec,
         jax.sharding.PartitionSpec(None, 'tp', 'fsdp'),
     )
+
+  def test_real_model_sharded_restore_target_with_scan_layers(self):
+    config = params.model_lib.ModelConfig(
+        num_layers=6,
+        num_embed=256000,
+        embed_dim=5376,
+        hidden_dim=16384,
+        num_heads=32,
+        head_dim=256,
+        num_kv_heads=16,
+        attention_pattern=(
+            params.model_lib.AttentionType.LOCAL_SLIDING,
+            params.model_lib.AttentionType.LOCAL_SLIDING,
+            params.model_lib.AttentionType.LOCAL_SLIDING,
+            params.model_lib.AttentionType.LOCAL_SLIDING,
+            params.model_lib.AttentionType.LOCAL_SLIDING,
+            params.model_lib.AttentionType.GLOBAL,
+        ),
+        use_scan_layers=True,
+    )
+
+    mock_devices = [mock.MagicMock(spec=jax.Device) for _ in range(32)]
+    mesh = jax.sharding.Mesh(
+        np.array(mock_devices).reshape(32, 1), ('fsdp', 'tp')
+    )
+
+    with nnx.use_eager_sharding(True), jax.set_mesh(mesh):
+      abs_model = nnx.eval_shape(
+          lambda: params.model_lib.Gemma4(config, rngs=nnx.Rngs(0))
+      )
+    model_state = nnx.state(abs_model)
+
+    fake_upstream = {
+        'layer_0': {'attn': {'kv_einsum': {'w': np.zeros((2, 16, 5376, 256))}}}
+    }
+    mock_meta = mock.MagicMock()
+    mock_meta.item_metadata.tree = fake_upstream
+    self.mock_ckptr.metadata.return_value = mock_meta
+
+    target, _ = params._build_sharded_restore_target(
+        '/fake/checkpoint', model_state, mesh, config
+    )
+
+    # Let's check if calling shard_shape raises an error or passes
+    sharding = target['layer_0']['attn']['kv_einsum']['w'].sharding
+    global_shape = (2, 16, 5376, 256)
+    # This should succeed without IndivisibleError.
+    shard_shape = sharding.shard_shape(global_shape)
+    self.assertEqual(shard_shape, (2, 16, 168, 256))
 
 
 if __name__ == '__main__':

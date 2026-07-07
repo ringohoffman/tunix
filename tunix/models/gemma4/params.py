@@ -215,8 +215,6 @@ def _build_sharded_restore_target(
         )
         continue
       sharding = flat_shardings[scan_key]
-      # Strip the leading scan axis spec (first element) to get the slice spec.
-      upstream_spec = tracer.invert_spec(sharding.spec[1:])
     else:
       if downstream_key not in flat_shardings:
         logging.info(
@@ -225,8 +223,8 @@ def _build_sharded_restore_target(
         )
         continue
       sharding = flat_shardings[downstream_key]
-      upstream_spec = tracer.invert_spec(sharding.spec)
 
+    upstream_spec = tracer.invert_spec(sharding.spec)
     orig = flat_upstream[tracer.key]
     upstream_target[tracer.key] = jax.ShapeDtypeStruct(
         shape=orig.shape,
