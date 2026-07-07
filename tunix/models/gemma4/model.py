@@ -265,6 +265,43 @@ class ShardingConfig:
         per_layer_input_embedding=("tp", None, fsdp),
     )
 
+  def with_scan_axis(self) -> "ShardingConfig":
+    """Return a copy with a leading ``None`` prepended to all weight specs.
+
+    When ``use_scan_layers=True``, ``nnx.vmap`` stacks per-layer parameters
+    along a new leading scan axis.  The stored ``nnx.Param(sharding=...)``
+    annotation is applied to the *stacked* tensor, so a 4-axis spec like
+    ``P(None, 'tp', 'fsdp', None)`` would be misapplied to a 5-dim tensor,
+    causing an ``IndivisibleError`` at optimizer initialisation.
+
+    This method prepends ``None`` to every *weight* sharding tuple (those that
+    annotate ``nnx.Param`` inside ``DecoderLayer``, ``Attention``, and
+    ``FeedForward``) while leaving activation specs unchanged (those are
+    applied at runtime to tensors that are NOT stacked).
+    """
+    def _prepend(t: Tuple[str | None, ...]) -> Tuple[str | None, ...]:
+      return (None,) + t
+
+    return dataclasses.replace(
+        self,
+        # per-layer weight specs — gain an extra scan leading axis
+        q_weight_ndh=_prepend(self.q_weight_ndh),
+        kv_weight_cndh=_prepend(self.kv_weight_cndh),
+        qkv_weight_cndh=_prepend(self.qkv_weight_cndh),
+        o_weight_nhd=_prepend(self.o_weight_nhd),
+        ffw_weight_df=_prepend(self.ffw_weight_df),
+        ffw_weight_fd=_prepend(self.ffw_weight_fd),
+        rms_norm_weight=_prepend(self.rms_norm_weight),
+        vision_proj=_prepend(self.vision_proj),
+        vision_soft_emb_norm_weight=_prepend(self.vision_soft_emb_norm_weight),
+        exp_weight_edf=_prepend(self.exp_weight_edf),
+        exp_weight_efd=_prepend(self.exp_weight_efd),
+        per_layer_input_gate=_prepend(self.per_layer_input_gate),
+        per_layer_projection=_prepend(self.per_layer_projection),
+        # activation specs, embedder-level weights, and per-layer projection
+        # are NOT inside scan groups — leave them unchanged.
+    )
+
 
 @dataclasses.dataclass(slots=True, kw_only=True)
 class ModelConfig:
@@ -1570,7 +1607,18 @@ class Gemma4(BackendMappingMixin, nnx.Module):
       pattern: tuple[AttentionType, ...],
       rngs: nnx.Rngs,
   ) -> None:
-    """Scan-based layer initialization using nnx.vmap over pattern groups."""
+    """Scan-based layer initialization using nnx.vmap over pattern groups.
+
+    ``nnx.vmap`` stacks per-layer parameters along a new leading axis of size
+    ``num_scan_groups``.  The ``nnx.Param(sharding=...)`` annotation on each
+    parameter is stored verbatim, so it must already account for the extra
+    leading dimension — otherwise ``with_sharding_constraint`` is applied to
+    the wrong rank and raises an ``IndivisibleError`` at optimizer init.
+
+    We fix this by deriving a *scan-aware* config whose weight sharding specs
+    all have ``None`` prepended (for the scan axis), while activation specs and
+    embedder-level weight specs are left unchanged.
+    """
     pattern_len = len(pattern)
     if config.num_layers % pattern_len != 0:
       raise ValueError(
@@ -1590,10 +1638,17 @@ class Gemma4(BackendMappingMixin, nnx.Module):
     self.num_scan_groups = config.num_layers // pattern_len
     self.scan_pattern = pattern
 
+    # Build a scan-aware config: weight sharding specs gain a leading None for
+    # the vmap/scan axis.  This ensures nnx.Param sharding annotations match
+    # the actual (stacked) parameter rank seen by the optimizer.
+    scan_config = dataclasses.replace(
+        config, shd_config=config.shd_config.with_scan_axis()
+    )
+
     @nnx.split_rngs(splits=self.num_scan_groups)
     @nnx.vmap(axis_size=self.num_scan_groups)
     def create_group(rngs: nnx.Rngs) -> ScanLayerGroup:
-      return ScanLayerGroup(config, pattern, rngs=rngs)
+      return ScanLayerGroup(scan_config, pattern, rngs=rngs)
 
     self.scan_groups = create_group(rngs)
 

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from absl.testing import absltest
 from flax import nnx
+import optax
 import jax
 import jax.numpy as jnp
 from tunix.models.gemma4 import model as model_lib
@@ -279,6 +280,151 @@ class ScanFallbackTest(absltest.TestCase):
     with self.assertRaises(AttributeError):
       cache = {}  # empty cache to trigger the loop path
       model(tokens, positions=positions, cache=cache, attention_mask=attn_mask)
+
+
+class ScanShardingSpecTest(absltest.TestCase):
+  """Tests that scan-axis sharding specs are correct.
+
+  Background
+  ----------
+  When ``use_scan_layers=True``, ``nnx.vmap`` stacks per-layer parameters
+  along a new leading axis of size ``num_scan_groups``.  The
+  ``nnx.Param(sharding=...)`` annotation is stored verbatim, so without the
+  fix it would be applied to the wrong rank, causing::
+
+      jax._src.sharding.IndivisibleError: Sharding ... implies that array
+      axis 2 is partitioned 32 times, but the dimension size is 16
+      (full shape: (10, 2, 16, 5376, 256), ...)
+
+  The fix: ``_init_scan_layers`` now builds a ``scan_config`` whose
+  ``shd_config`` has all weight specs prepended with ``None`` via
+  ``ShardingConfig.with_scan_axis()``.
+  """
+
+  def test_with_scan_axis_prepends_none_to_weight_specs(self):
+    """with_scan_axis() must prepend None to every weight spec."""
+    base = model_lib.ShardingConfig.get_default_sharding()
+    scan = base.with_scan_axis()
+
+    # Weight specs: all should have an extra leading None.
+    weight_fields = (
+        'q_weight_ndh',
+        'kv_weight_cndh',
+        'qkv_weight_cndh',
+        'o_weight_nhd',
+        'ffw_weight_df',
+        'ffw_weight_fd',
+        'rms_norm_weight',
+        'vision_proj',
+        'vision_soft_emb_norm_weight',
+        'exp_weight_edf',
+        'exp_weight_efd',
+        'per_layer_input_gate',
+        'per_layer_projection',
+    )
+    for field in weight_fields:
+      base_val = getattr(base, field)
+      scan_val = getattr(scan, field)
+      self.assertEqual(
+          scan_val,
+          (None,) + base_val,
+          msg=(
+              f'{field}: expected (None,) + {base_val!r}, got {scan_val!r}'
+          ),
+      )
+
+    # Activation and embedder specs must be unchanged.
+    unchanged_fields = (
+        'act_btd',
+        'act_btf',
+        'act_btnh',
+        'emb_vd',
+        'per_layer_model_projection',
+        'per_layer_input_embedding',
+    )
+    for field in unchanged_fields:
+      self.assertEqual(
+          getattr(scan, field),
+          getattr(base, field),
+          msg=f'{field} should not be modified by with_scan_axis()',
+      )
+
+  def test_scan_model_params_have_extra_leading_axis(self):
+    """Scan model weight params must have shape (num_groups, *per_layer_shape)."""
+    config = _make_config(num_layers=6, use_scan_layers=True)
+    num_groups = 6 // _PATTERN_LEN  # = 1
+    model = model_lib.Gemma4(config, rngs=nnx.Rngs(0))
+
+    state = nnx.state(model)
+    # sub_layers[0] is the first sub-layer; its params should have shape
+    # (num_groups, *per_layer_weight_shape).
+    sl0 = state['scan_groups']['sub_layers'][0]
+    q_w = sl0['attn']['q_einsum']['w']
+    self.assertEqual(
+        q_w.shape[0],
+        num_groups,
+        msg=f'Expected leading scan axis {num_groups}, got shape {q_w.shape}',
+    )
+
+  def test_scan_sharding_annotations_match_param_rank(self):
+    """Each scan param's stored tuple sharding rank must equal its actual ndim.
+
+    This is the key invariant violated by the bug: without the fix, the
+    kv_einsum weight (rank 5 after vmap) would carry a rank-4 sharding tuple.
+
+    Note: some params carry a real JAX Sharding object (not a tuple) if they
+    were initialised outside the tuple-annotation path.  We skip those — the
+    check only applies to the tuple-style ``sharding=(axis, ...)`` annotations
+    used by ``nnx.Param`` inside the model.
+    """
+    config = _make_config(num_layers=6, use_scan_layers=True)
+    model = model_lib.Gemma4(config, rngs=nnx.Rngs(0))
+
+    mismatches = []
+    for path, var in nnx.iter_graph(model):
+      if not isinstance(var, nnx.Param):
+        continue
+      sharding = getattr(var, 'sharding', None)
+      # Only check tuple-style annotations, not real JAX Sharding objects.
+      if not isinstance(sharding, tuple):
+        continue
+      value = var.value
+      if not hasattr(value, 'ndim'):
+        continue
+      if len(sharding) != value.ndim:
+        path_str = '.'.join(str(p) for p in path)
+        mismatches.append(
+            f'{path_str}: sharding rank {len(sharding)} != ndim {value.ndim}'
+            f' (shape={value.shape}, sharding={sharding})'
+        )
+
+    self.assertEmpty(
+        mismatches,
+        msg='Sharding rank mismatches found (scan axis bug):\n'
+        + '\n'.join(mismatches),
+    )
+
+  def test_optimizer_init_on_scan_model_does_not_raise(self):
+    """nnx.Optimizer init on a scan model must not raise IndivisibleError.
+
+    This directly reproduces the GKE failure: PeftTrainer calls
+    ``nnx.Optimizer(model, optimizer, wrt=nnx.Param)`` which calls
+    ``with_sharding_constraint`` on each param.  With the bug, the 4-axis
+    weight spec is applied to a 5-dim tensor, crashing on single-device too
+    when the sharding has any non-None axis that doesn't divide the dim.
+
+    On a CPU/single-device test, sharding constraints are no-ops so this
+    won't reproduce the exact DMA error — but the shape mismatch in the
+    *spec rank* check fires first.  We verify it doesn't raise.
+    """
+    config = _make_config(num_layers=6, use_scan_layers=True)
+    model = model_lib.Gemma4(config, rngs=nnx.Rngs(0))
+    optimizer = optax.adam(1e-4)
+    # This must not raise.
+    try:
+      nnx.Optimizer(model, optimizer, wrt=nnx.Param)
+    except Exception as e:  # pylint: disable=broad-except
+      self.fail(f'nnx.Optimizer init raised on scan model: {e}')
 
 
 if __name__ == '__main__':
