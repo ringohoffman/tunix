@@ -18,11 +18,14 @@ from __future__ import annotations
 
 import dataclasses
 
+from unittest import mock
+
 from absl.testing import absltest
 from flax import nnx
 import jax
 from jax._src.mesh import use_abstract_mesh
 import jax.numpy as jnp
+import numpy as np
 import optax
 from tunix.models.gemma4 import model as model_lib
 
@@ -405,6 +408,68 @@ class ScanShardingSpecTest(absltest.TestCase):
         )
     except Exception as e:  # pylint: disable=broad-except
       self.fail(f'nnx.Optimizer(31b scan) raised under fsdp=32 mesh: {e}')
+
+  def test_checkpoint_restore_target_31b_under_production_mesh(self):
+    """Building restore targets must not raise under the production mesh.
+
+    Without the params.py fix (stripping the scan axis before inverting specs),
+    this raises::
+
+        ValueError: Sharding NamedSharding(...) is only valid for values of
+        rank at least 4, but was applied to a value of rank 3.
+
+    for parameters like q_einsum.w (rank 3 in checkpoint, rank 4 stacked).
+    """
+    import tempfile
+    import shutil
+    import orbax.checkpoint as ocp
+    from tunix.models.gemma4 import params as params_lib
+    
+    config = dataclasses.replace(self._CONFIG_31B, use_scan_layers=True)
+    with use_abstract_mesh(self._MESH):
+      model = nnx.eval_shape(
+          lambda: model_lib.Gemma4(config, rngs=nnx.Rngs(0))
+      )
+    model_state = nnx.state(model)
+
+    # Real un-stacked checkpoint shapes (31B layout)
+    fake_upstream = {}
+    for i in range(config.num_layers):
+      fake_upstream[f'layer_{i}'] = {
+          'attn': {
+              'q_einsum': {'w': np.zeros((32, 5376, 256))},       # rank 3
+              'kv_einsum': {'w': np.zeros((2, 16, 5376, 256))},   # rank 4
+              'pre_attention_norm': {'scale': np.zeros((5376,))}, # rank 1
+          }
+      }
+    fake_upstream['embedder'] = {'input_embedding': np.zeros((262144, 5376))}
+    fake_upstream['final_norm'] = {'scale': np.zeros((5376,))}
+
+    # Write a real Orbax checkpoint to a temporary directory
+    temp_dir = tempfile.mkdtemp()
+    try:
+      ckptr = ocp.PyTreeCheckpointer()
+      ckptr.save(temp_dir + '/ckpt', fake_upstream)
+
+      # This must build restore targets without raising ValueError on rank mismatches.
+      with use_abstract_mesh(self._MESH):
+        target, _ = params_lib._build_sharded_restore_target(
+            temp_dir + '/ckpt', model_state, self._MESH, config
+        )
+    except Exception as e:  # pylint: disable=broad-except
+      self.fail(f'_build_sharded_restore_target raised: {e}')
+    finally:
+      shutil.rmtree(temp_dir)
+
+    # Verify that the returned target has un-stacked specs matching checkpoint ranks
+    # (i.e. the prepended scan axis None has been correctly stripped).
+    q_w_sharding = target['layer_0']['attn']['q_einsum']['w'].sharding
+    self.assertEqual(len(q_w_sharding.spec), 3) # rank 3 in checkpoint
+    self.assertEqual(q_w_sharding.spec, jax.sharding.PartitionSpec('tp', 'fsdp', None))
+
+    kv_w_sharding = target['layer_0']['attn']['kv_einsum']['w'].sharding
+    self.assertEqual(len(kv_w_sharding.spec), 4) # rank 4 in checkpoint
+    self.assertEqual(kv_w_sharding.spec, jax.sharding.PartitionSpec(None, 'tp', 'fsdp', None))
 
   def test_scan_sharding_annotations_match_param_rank(self):
     """After Phase-2 patching, every tuple out_sharding rank must equal ndim."""

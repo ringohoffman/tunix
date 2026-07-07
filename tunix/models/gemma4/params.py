@@ -215,6 +215,16 @@ def _build_sharded_restore_target(
         )
         continue
       sharding = flat_shardings[scan_key]
+      # The stacked param's spec has a leading None for the scan/vmap axis
+      # (prepended by _init_scan_layers Phase 2).  The checkpoint stores
+      # per-layer (un-stacked) tensors without that axis, so strip it before
+      # inverting to the upstream checkpoint spec.
+      spec_axes = tuple(sharding.spec)
+      if spec_axes and spec_axes[0] is None:
+        sharding = jax.sharding.NamedSharding(
+            sharding.mesh,
+            jax.sharding.PartitionSpec(*spec_axes[1:]),
+        )
     else:
       if downstream_key not in flat_shardings:
         logging.info(
@@ -302,20 +312,9 @@ def create_model_from_checkpoint(
   if mesh is not None:
     with jax.set_mesh(mesh):
       shardings = nnx.to_pure_dict(nnx.get_named_sharding(model_state, mesh))
-      if model_config.use_scan_layers:
-        flat_shardings = flax.traverse_util.flatten_dict(shardings)
-        new_flat = {}
-        for path, sharding in flat_shardings.items():
-          if (
-              len(path) >= 2
-              and path[0] == 'scan_groups'
-              and path[1] == 'sub_layers'
-          ):
-            new_spec = jax.sharding.PartitionSpec(None, *sharding.spec)
-            new_flat[path] = jax.sharding.NamedSharding(mesh, new_spec)
-          else:
-            new_flat[path] = sharding
-        shardings = flax.traverse_util.unflatten_dict(new_flat)
+      # Model state already contains the correct scan-axis prepended sharding
+      # (from _init_scan_layers Phase 2).
+      pass
 
       typed = jax.tree_util.tree_map_with_path(
           lambda p, x, s: jnp.asarray(x, device=s, dtype=dtype),
