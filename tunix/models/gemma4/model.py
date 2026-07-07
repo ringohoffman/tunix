@@ -1609,15 +1609,26 @@ class Gemma4(BackendMappingMixin, nnx.Module):
   ) -> None:
     """Scan-based layer initialization using nnx.vmap over pattern groups.
 
-    ``nnx.vmap`` stacks per-layer parameters along a new leading axis of size
-    ``num_scan_groups``.  The ``nnx.Param(sharding=...)`` annotation on each
-    parameter is stored verbatim, so it must already account for the extra
-    leading dimension — otherwise ``with_sharding_constraint`` is applied to
-    the wrong rank and raises an ``IndivisibleError`` at optimizer init.
+    Two-phase approach to get sharding right:
 
-    We fix this by deriving a *scan-aware* config whose weight sharding specs
-    all have ``None`` prepended (for the scan axis), while activation specs and
-    embedder-level weight specs are left unchanged.
+    Phase 1 (inside vmap body): use the **original** config so that
+    ``nnx.Param(sharding=spec)`` fires ``with_sharding_constraint`` on the
+    *per-instance* value with the correct per-instance rank.  Using a
+    scan-axis-prepended spec here would cause::
+
+        ValueError: spec P(None, 'tp') requires rank ≥ 2 but value has rank 1
+
+    Phase 2 (post-vmap): ``nnx.vmap`` stacks all params along a new leading
+    axis of size ``num_scan_groups``.  The stored ``out_sharding`` metadata
+    still reflects the per-instance rank, so when the optimizer later calls
+    ``with_sharding_constraint`` on the *stacked* value it gets::
+
+        IndivisibleError: spec P(None, 'fsdp', None) axis 1 partitioned 32
+        times, but stacked dim size is 16 (shape: (10, 2, 16, ...))
+
+    We fix this by walking ``scan_groups`` after vmap and prepending ``None``
+    to every tuple-style ``out_sharding`` annotation.  The prepended ``None``
+    tells JAX that the scan axis is replicated / unsharded.
     """
     pattern_len = len(pattern)
     if config.num_layers % pattern_len != 0:
@@ -1638,19 +1649,25 @@ class Gemma4(BackendMappingMixin, nnx.Module):
     self.num_scan_groups = config.num_layers // pattern_len
     self.scan_pattern = pattern
 
-    # Build a scan-aware config: weight sharding specs gain a leading None for
-    # the vmap/scan axis.  This ensures nnx.Param sharding annotations match
-    # the actual (stacked) parameter rank seen by the optimizer.
-    scan_config = dataclasses.replace(
-        config, shd_config=config.shd_config.with_scan_axis()
-    )
-
+    # Phase 1: initialize with original config so per-instance sharding
+    # constraints match the per-instance value rank.
     @nnx.split_rngs(splits=self.num_scan_groups)
     @nnx.vmap(axis_size=self.num_scan_groups)
     def create_group(rngs: nnx.Rngs) -> ScanLayerGroup:
-      return ScanLayerGroup(scan_config, pattern, rngs=rngs)
+      return ScanLayerGroup(config, pattern, rngs=rngs)
 
     self.scan_groups = create_group(rngs)
+
+    # Phase 2: patch out_sharding metadata on stacked params.  After vmap,
+    # every weight has a new leading axis (size = num_scan_groups) but its
+    # stored out_sharding is still the per-instance spec.  Prepend None so
+    # the optimizer's with_sharding_constraint sees the correct rank.
+    for _, var in nnx.iter_graph(self.scan_groups):
+      if not isinstance(var, nnx.Param):
+        continue
+      spec = var.get_metadata('out_sharding', None)
+      if isinstance(spec, tuple):
+        var.set_metadata('out_sharding', (None,) + spec)
 
   def __call__(
       self,

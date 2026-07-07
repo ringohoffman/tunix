@@ -16,11 +16,14 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 from absl.testing import absltest
 from flax import nnx
-import optax
 import jax
+from jax._src.mesh import use_abstract_mesh
 import jax.numpy as jnp
+import optax
 from tunix.models.gemma4 import model as model_lib
 
 
@@ -285,28 +288,38 @@ class ScanFallbackTest(absltest.TestCase):
 class ScanShardingSpecTest(absltest.TestCase):
   """Tests that scan-axis sharding specs are correct.
 
-  Background
-  ----------
-  When ``use_scan_layers=True``, ``nnx.vmap`` stacks per-layer parameters
-  along a new leading axis of size ``num_scan_groups``.  The
-  ``nnx.Param(sharding=...)`` annotation is stored verbatim, so without the
-  fix it would be applied to the wrong rank, causing::
+  **Why a mesh is required to catch these errors locally**
 
-      jax._src.sharding.IndivisibleError: Sharding ... implies that array
-      axis 2 is partitioned 32 times, but the dimension size is 16
-      (full shape: (10, 2, 16, 5376, 256), ...)
+  Without an active JAX mesh, ``nnx.Param(sharding=spec)`` calls
+  ``shard_value`` which immediately returns the value unchanged — the
+  ``with_sharding_constraint`` is a **no-op**.  Both the ``IndivisibleError``
+  and the ``ValueError: rank ≥ N required`` only fire when JAX resolves the
+  ``PartitionSpec`` against real axis sizes.
 
-  The fix: ``_init_scan_layers`` now builds a ``scan_config`` whose
-  ``shd_config`` has all weight specs prepended with ``None`` via
-  ``ShardingConfig.with_scan_axis()``.
+  We use ``jax.sharding.AbstractMesh`` + ``nnx.eval_shape`` to simulate the
+  production Pathways topology (fsdp=32, tp=1) without physical TPU devices.
+  This is the same code path as ``create_model_from_checkpoint`` and is where
+  both production crashes occurred.
   """
+
+  # Production mesh: 32-way FSDP, 1-way TP.  AbstractMesh only works inside
+  # jax.eval_shape / nnx.eval_shape, not in eager mode.
+  _MESH = jax.sharding.AbstractMesh((32, 1), ('fsdp', 'tp'))
+
+  # Full production config.  nnx.eval_shape allocates no memory so we can
+  # use the real model sizes (embed_dim=5376, num_kv_heads=16, etc.).
+  _CONFIG_31B = model_lib.ModelConfig.gemma4_31b()
+
+  def _eval_model(self, config):
+    """Trace model init under the production abstract mesh."""
+    with use_abstract_mesh(self._MESH):
+      nnx.eval_shape(lambda: model_lib.Gemma4(config, rngs=nnx.Rngs(0)))
 
   def test_with_scan_axis_prepends_none_to_weight_specs(self):
     """with_scan_axis() must prepend None to every weight spec."""
     base = model_lib.ShardingConfig.get_default_sharding()
     scan = base.with_scan_axis()
 
-    # Weight specs: all should have an extra leading None.
     weight_fields = (
         'q_weight_ndh',
         'kv_weight_cndh',
@@ -328,55 +341,73 @@ class ScanShardingSpecTest(absltest.TestCase):
       self.assertEqual(
           scan_val,
           (None,) + base_val,
-          msg=(
-              f'{field}: expected (None,) + {base_val!r}, got {scan_val!r}'
-          ),
+          msg=f'{field}: expected (None,) + {base_val!r}, got {scan_val!r}',
       )
 
-    # Activation and embedder specs must be unchanged.
-    unchanged_fields = (
-        'act_btd',
-        'act_btf',
-        'act_btnh',
-        'emb_vd',
-        'per_layer_model_projection',
-        'per_layer_input_embedding',
-    )
-    for field in unchanged_fields:
+    # Activation / embedder specs unchanged.
+    for field in ('act_btd', 'act_btf', 'act_btnh', 'emb_vd',
+                  'per_layer_model_projection', 'per_layer_input_embedding'):
       self.assertEqual(
           getattr(scan, field),
           getattr(base, field),
           msg=f'{field} should not be modified by with_scan_axis()',
       )
 
-  def test_scan_model_params_have_extra_leading_axis(self):
-    """Scan model weight params must have shape (num_groups, *per_layer_shape)."""
-    config = _make_config(num_layers=6, use_scan_layers=True)
-    num_groups = 6 // _PATTERN_LEN  # = 1
-    model = model_lib.Gemma4(config, rngs=nnx.Rngs(0))
+  def test_non_scan_31b_init_under_production_mesh(self):
+    """Baseline: gemma4_31b without scan must init cleanly under fsdp=32."""
+    config = dataclasses.replace(self._CONFIG_31B, use_scan_layers=False)
+    try:
+      self._eval_model(config)
+    except Exception as e:  # pylint: disable=broad-except
+      self.fail(f'Non-scan 31b init raised: {e}')
 
-    state = nnx.state(model)
-    # sub_layers[0] is the first sub-layer; its params should have shape
-    # (num_groups, *per_layer_weight_shape).
-    sl0 = state['scan_groups']['sub_layers'][0]
-    q_w = sl0['attn']['q_einsum']['w']
-    self.assertEqual(
-        q_w.shape[0],
-        num_groups,
-        msg=f'Expected leading scan axis {num_groups}, got shape {q_w.shape}',
+  def test_scan_31b_init_under_production_mesh(self):
+    """Model init must not raise under the production mesh (fsdp=32, tp=1).
+
+    Without the Phase-1 fix (original config inside vmap), this raises::
+
+        ValueError: spec P(None, 'tp') requires rank ≥ 2 but value has rank 1
+
+    because with_scan_axis() prepends None to rms_norm_weight='(tp,)' and the
+    RMSNorm scale (rank 1) is validated inside the vmap body.
+    """
+    config = dataclasses.replace(
+        self._CONFIG_31B,
+        use_scan_layers=True,
+        # gemma4_31b has frac_shared_layers=0 and per_layer_input_dim=0;
+        # use_scan_layers is compatible.
     )
+    try:
+      self._eval_model(config)
+    except Exception as e:  # pylint: disable=broad-except
+      self.fail(f'Scan 31b init raised under fsdp=32 mesh: {e}')
+
+  def test_optimizer_init_31b_under_production_mesh(self):
+    """Optimizer init must not raise under the production mesh.
+
+    Without the Phase-2 fix (post-vmap out_sharding patching), this raises::
+
+        IndivisibleError: spec P(None, 'tp', 'fsdp', None) implies axis 2
+        is partitioned 32 times, but dimension size is 16
+        (full shape: (10, 2, 16, 5376, 256))
+
+    Exactly the original GKE crash.
+    """
+    config = dataclasses.replace(self._CONFIG_31B, use_scan_layers=True)
+    with use_abstract_mesh(self._MESH):
+      model = nnx.eval_shape(
+          lambda: model_lib.Gemma4(config, rngs=nnx.Rngs(0))
+      )
+    try:
+      with use_abstract_mesh(self._MESH):
+        nnx.eval_shape(
+            lambda: nnx.Optimizer(model, optax.adam(1e-4), wrt=nnx.Param)
+        )
+    except Exception as e:  # pylint: disable=broad-except
+      self.fail(f'nnx.Optimizer(31b scan) raised under fsdp=32 mesh: {e}')
 
   def test_scan_sharding_annotations_match_param_rank(self):
-    """Each scan param's stored tuple sharding rank must equal its actual ndim.
-
-    This is the key invariant violated by the bug: without the fix, the
-    kv_einsum weight (rank 5 after vmap) would carry a rank-4 sharding tuple.
-
-    Note: some params carry a real JAX Sharding object (not a tuple) if they
-    were initialised outside the tuple-annotation path.  We skip those — the
-    check only applies to the tuple-style ``sharding=(axis, ...)`` annotations
-    used by ``nnx.Param`` inside the model.
-    """
+    """After Phase-2 patching, every tuple out_sharding rank must equal ndim."""
     config = _make_config(num_layers=6, use_scan_layers=True)
     model = model_lib.Gemma4(config, rngs=nnx.Rngs(0))
 
@@ -384,47 +415,37 @@ class ScanShardingSpecTest(absltest.TestCase):
     for path, var in nnx.iter_graph(model):
       if not isinstance(var, nnx.Param):
         continue
-      sharding = getattr(var, 'sharding', None)
-      # Only check tuple-style annotations, not real JAX Sharding objects.
-      if not isinstance(sharding, tuple):
+      spec = var.get_metadata('out_sharding', None)
+      if not isinstance(spec, tuple):
         continue
-      value = var.value
+      value = var.get_value()
       if not hasattr(value, 'ndim'):
         continue
-      if len(sharding) != value.ndim:
+      if len(spec) != value.ndim:
         path_str = '.'.join(str(p) for p in path)
         mismatches.append(
-            f'{path_str}: sharding rank {len(sharding)} != ndim {value.ndim}'
-            f' (shape={value.shape}, sharding={sharding})'
+            f'{path_str}: spec rank {len(spec)} != ndim {value.ndim}'
+            f' (shape={value.shape}, spec={spec})'
         )
 
     self.assertEmpty(
         mismatches,
-        msg='Sharding rank mismatches found (scan axis bug):\n'
-        + '\n'.join(mismatches),
+        msg='out_sharding rank mismatches after vmap:\n' + '\n'.join(mismatches),
     )
 
-  def test_optimizer_init_on_scan_model_does_not_raise(self):
-    """nnx.Optimizer init on a scan model must not raise IndivisibleError.
-
-    This directly reproduces the GKE failure: PeftTrainer calls
-    ``nnx.Optimizer(model, optimizer, wrt=nnx.Param)`` which calls
-    ``with_sharding_constraint`` on each param.  With the bug, the 4-axis
-    weight spec is applied to a 5-dim tensor, crashing on single-device too
-    when the sharding has any non-None axis that doesn't divide the dim.
-
-    On a CPU/single-device test, sharding constraints are no-ops so this
-    won't reproduce the exact DMA error — but the shape mismatch in the
-    *spec rank* check fires first.  We verify it doesn't raise.
-    """
-    config = _make_config(num_layers=6, use_scan_layers=True)
-    model = model_lib.Gemma4(config, rngs=nnx.Rngs(0))
-    optimizer = optax.adam(1e-4)
-    # This must not raise.
+  def test_non_scan_31b_optimizes_under_production_mesh(self):
+    """The for-loop 31b model must init and optimize cleanly under fsdp=32."""
+    config = dataclasses.replace(self._CONFIG_31B, use_scan_layers=False)
     try:
-      nnx.Optimizer(model, optimizer, wrt=nnx.Param)
+      with use_abstract_mesh(self._MESH):
+        model = nnx.eval_shape(
+            lambda: model_lib.Gemma4(config, rngs=nnx.Rngs(0))
+        )
+        nnx.eval_shape(
+            lambda: nnx.Optimizer(model, optax.adam(1e-4), wrt=nnx.Param)
+        )
     except Exception as e:  # pylint: disable=broad-except
-      self.fail(f'nnx.Optimizer init raised on scan model: {e}')
+      self.fail(f'Non-scan 31b optimizer raised under fsdp=32 mesh: {e}')
 
 
 if __name__ == '__main__':
