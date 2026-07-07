@@ -429,7 +429,7 @@ class CreateModelTest(absltest.TestCase):
         mock.patch.object(params.nnx, 'eval_shape', autospec=True)
     )
     self.mock_ckptr_cls = self.enter_context(
-        mock.patch.object(params.ocp, 'StandardCheckpointer', autospec=True)
+        mock.patch.object(params.ocp, 'PyTreeCheckpointer', autospec=True)
     )
 
     self.fake_model = mock.create_autospec(object, instance=True)
@@ -442,6 +442,7 @@ class CreateModelTest(absltest.TestCase):
     self.config = mock.create_autospec(
         params.model_lib.ModelConfig, instance=True
     )
+    self.config.use_scan_layers = False
     self.checkpoint_path = '/fake/checkpoint'
 
   def test_create_model_restores_checkpoint(self):
@@ -464,7 +465,7 @@ class CreateModelTest(absltest.TestCase):
     params.create_model_from_checkpoint(
         self.checkpoint_path, self.config, mesh=None
     )
-    self.mock_update.assert_called_once()
+    self.mock_update.assert_called()
 
   def test_create_model_returns_model_instance(self):
     result = params.create_model_from_checkpoint(
