@@ -300,12 +300,28 @@ def create_model_from_checkpoint(
 
   # ── Phase 6: Cast dtype and apply target shardings ─────────────────────
   if mesh is not None:
-    shardings = nnx.to_pure_dict(nnx.get_named_sharding(model_state, mesh))
-    typed = jax.tree_util.tree_map_with_path(
-        lambda p, x, s: jnp.asarray(x, device=s, dtype=dtype),
-        pruned,
-        shardings,
-    )
+    with jax.set_mesh(mesh):
+      shardings = nnx.to_pure_dict(nnx.get_named_sharding(model_state, mesh))
+      if model_config.use_scan_layers:
+        flat_shardings = flax.traverse_util.flatten_dict(shardings)
+        new_flat = {}
+        for path, sharding in flat_shardings.items():
+          if (
+              len(path) >= 2
+              and path[0] == 'scan_groups'
+              and path[1] == 'sub_layers'
+          ):
+            new_spec = jax.sharding.PartitionSpec(None, *sharding.spec)
+            new_flat[path] = jax.sharding.NamedSharding(mesh, new_spec)
+          else:
+            new_flat[path] = sharding
+        shardings = flax.traverse_util.unflatten_dict(new_flat)
+
+      typed = jax.tree_util.tree_map_with_path(
+          lambda p, x, s: jnp.asarray(x, device=s, dtype=dtype),
+          pruned,
+          shardings,
+      )
   else:
     typed = jax.tree_util.tree_map(
         lambda x: jnp.asarray(x, dtype=dtype),

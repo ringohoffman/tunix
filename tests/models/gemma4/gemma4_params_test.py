@@ -23,6 +23,33 @@ import jax
 import numpy as np
 from tunix.models.gemma4 import params
 
+
+class _MockDevice:
+
+  def __init__(self, device_id: int):
+    self.id = device_id
+    self.platform = 'CPU'
+    self.device_kind = 'CPU'
+    self.client = mock.MagicMock()
+    self.client.platform = 'CPU'
+    self.client.platform_version = '1.0'
+    self.process_index = 0
+
+  def default_memory(self):
+    mock_memory = mock.MagicMock()
+    mock_memory.kind = 'device'
+    return mock_memory
+
+  def __lt__(self, other):
+    return self.id < getattr(other, 'id', 0)
+
+  def __hash__(self):
+    return hash(self.id)
+
+  def __eq__(self, other):
+    return self.id == getattr(other, 'id', None)
+
+
 # Small array dimensions used across all fixtures.
 _V, _D, _H, _KV, _N, _F, _PLE = 5, 3, 2, 1, 4, 6, 5
 
@@ -640,7 +667,7 @@ class BuildShardedRestoreTargetTest(absltest.TestCase):
         use_scan_layers=True,
     )
 
-    mock_devices = [mock.MagicMock(spec=jax.Device) for _ in range(32)]
+    mock_devices = [_MockDevice(i) for i in range(32)]
     mesh = jax.sharding.Mesh(
         np.array(mock_devices).reshape(32, 1), ('fsdp', 'tp')
     )
@@ -668,6 +695,73 @@ class BuildShardedRestoreTargetTest(absltest.TestCase):
     # This should succeed without IndivisibleError.
     shard_shape = sharding.shard_shape(global_shape)
     self.assertEqual(shard_shape, (2, 16, 168, 256))
+
+  def test_create_model_from_checkpoint_with_scan_layers(self):
+    config = params.model_lib.ModelConfig(
+        num_layers=6,
+        num_embed=256000,
+        embed_dim=5376,
+        hidden_dim=16384,
+        num_heads=32,
+        head_dim=256,
+        num_kv_heads=16,
+        attention_pattern=(
+            params.model_lib.AttentionType.LOCAL_SLIDING,
+            params.model_lib.AttentionType.LOCAL_SLIDING,
+            params.model_lib.AttentionType.LOCAL_SLIDING,
+            params.model_lib.AttentionType.LOCAL_SLIDING,
+            params.model_lib.AttentionType.LOCAL_SLIDING,
+            params.model_lib.AttentionType.GLOBAL,
+        ),
+        use_scan_layers=True,
+    )
+
+    devices = np.array(jax.devices()[:1]).reshape(1, 1)
+    mesh = jax.sharding.Mesh(devices, ('fsdp', 'tp'))
+
+    fake_upstream = {}
+    for i in range(6):
+      is_global = i % 6 == 5
+      h_dim = 512 if is_global else 256
+      fake_upstream[f'layer_{i}'] = {
+          'attn': {
+              'kv_einsum': {'w': np.zeros((2, 16, 5376, h_dim))},
+              'q_einsum': {'w': np.zeros((32, 5376, h_dim))},
+              'attn_vec_einsum': {'w': np.zeros((32, h_dim, 5376))},
+              'query_norm': {'scale': np.zeros((h_dim,))},
+              'key_norm': {'scale': np.zeros((h_dim,))},
+          },
+          'mlp': {
+              'gating_einsum': {'w': np.zeros((2, 16384, 5376))},
+              'linear': {'w': np.zeros((16384, 5376))},
+          },
+          'pre_attention_norm': {'scale': np.zeros((5376,))},
+          'post_attention_norm': {'scale': np.zeros((5376,))},
+          'pre_ffw_norm': {'scale': np.zeros((5376,))},
+          'post_ffw_norm': {'scale': np.zeros((5376,))},
+          'skip_scale': np.zeros((1,)),
+      }
+    fake_upstream['embedder'] = {'input_embedding': np.zeros((256000, 5376))}
+    fake_upstream['final_norm'] = {'scale': np.zeros((5376,))}
+
+    mock_meta = mock.MagicMock()
+    mock_meta.item_metadata.tree = fake_upstream
+    self.mock_ckptr.metadata.return_value = mock_meta
+    self.mock_ckptr.restore.return_value = fake_upstream
+
+    # This should load successfully without IndivisibleError or other exceptions.
+    model = params.create_model_from_checkpoint(
+        '/fake/checkpoint', config, mesh=mesh
+    )
+    self.assertIsInstance(model, params.model_lib.Gemma4)
+
+    # Verify that the stacked parameters have the correct 5D sharding spec
+    # (i.e. prepended with None for the scan group axis)
+    state = nnx.state(model)
+    self.assertEqual(
+        state.scan_groups.sub_layers[0].attn.kv_einsum.w.sharding.spec,
+        jax.sharding.PartitionSpec(None, None, 'tp', 'fsdp', None),
+    )
 
 
 if __name__ == '__main__':
