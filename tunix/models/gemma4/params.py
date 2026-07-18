@@ -150,12 +150,24 @@ class _ShapeTracer:
     return jax.sharding.PartitionSpec(*s)
 
 
+def _get_checkpointer(checkpoint_path: str) -> Any:
+  """Get checkpointer instance (StandardCheckpointer vs PyTreeCheckpointer)."""
+  std_ckptr = ocp.StandardCheckpointer()
+  try:
+    meta = std_ckptr.metadata(checkpoint_path)
+    if meta and getattr(meta, "item_metadata", None) is not None:
+      return std_ckptr
+  except Exception:
+    pass
+  return ocp.PyTreeCheckpointer()
+
+
 def _build_sharded_restore_target(
     checkpoint_path: str,
     model_state: Any,
     mesh: jax.sharding.Mesh,
     model_config: model_lib.ModelConfig,
-) -> tuple[dict[str, Any], ocp.PyTreeCheckpointer]:
+) -> tuple[dict[str, Any], Any]:
   """Build a sharded restore target for direct-to-device DMA loading.
 
   Traces map_from_upstream_checkpoint with _ShapeTracer objects to determine
@@ -174,7 +186,7 @@ def _build_sharded_restore_target(
     with computed shardings, and the checkpointer instance (reused for
     the subsequent restore call).
   """
-  ckptr = ocp.PyTreeCheckpointer()
+  ckptr = _get_checkpointer(checkpoint_path)
   meta = ckptr.metadata(checkpoint_path)
   flat_upstream = flax.traverse_util.flatten_dict(meta.item_metadata.tree)
 
@@ -291,7 +303,7 @@ def create_model_from_checkpoint(
         partial_restore=True,
     )
   else:
-    raw_params = ocp.PyTreeCheckpointer().restore(checkpoint_path)
+    raw_params = _get_checkpointer(checkpoint_path).restore(checkpoint_path)
 
   # ── Phase 3: Map upstream keys → downstream layout ──────────────────────
   mapped = map_from_upstream_checkpoint(raw_params)
@@ -533,8 +545,21 @@ def map_from_upstream_checkpoint(params: Mapping[str, Any]) -> dict[str, Any]:
         )
     )
 
-    if parts and parts[0] == 'transformer':
+    if parts and parts[-1] == 'value':
+      parts = parts[:-1]
+
+    if parts and parts[0] in ('transformer', 'decoder'):
       parts = parts[1:]
+
+    if parts and parts[0] in ('token_embedder', 'embedder'):
+      parts[0] = 'embedder'
+    if parts and parts[0] in ('decoder_norm', 'final_norm'):
+      parts[0] = 'final_norm'
+
+    if parts and (parts[0].startswith('layers_') or parts[0].startswith('layer_')):
+      raw_num = parts[0].removeprefix('layers_').removeprefix('layer_')
+      if raw_num.isdigit():
+        parts[0] = f'layer_{raw_num}'
 
     if not parts:
       logging.warning('Skipping empty key path: %r', key_path)
@@ -549,6 +574,8 @@ def map_from_upstream_checkpoint(params: Mapping[str, Any]) -> dict[str, Any]:
         new_params[('embedder', 'per_layer_input_embedding')] = value
       elif param_name in ('per_layer_embeddings', 'per_layer_input_embedding'):
         new_params[('embedder', 'per_layer_input_embedding')] = value
+      elif param_name in ('embedding', 'input_embedding'):
+        new_params[('embedder', 'input_embedding')] = value
       elif len(module_path) > 1:
         # Sub-modules of the embedder (e.g., mm_input_projection).
         new_params[tuple(module_path + [param_name])] = value
@@ -580,6 +607,37 @@ def map_from_upstream_checkpoint(params: Mapping[str, Any]) -> dict[str, Any]:
     if len(module_path) == 1:
       new_params[(*layer_idx, param_name)] = value
       continue
+
+    # Normalize Linen/Tunix layer submodule names
+    norm_submodules = {
+        'pre_self_attention_norm': 'pre_attention_norm',
+        'post_self_attention_norm': 'post_attention_norm',
+        'self_attention': 'attn',
+    }
+    module_path = [norm_submodules.get(p, p) for p in module_path]
+    if 'attn' in module_path:
+      a_idx = module_path.index('attn')
+      if a_idx + 1 < len(module_path):
+        sub = module_path[a_idx + 1]
+        attn_sub_map = {
+            'query': 'q_einsum',
+            'key': 'k_einsum',
+            'value': 'v_einsum',
+            'out': 'attn_vec_einsum',
+        }
+        if sub in attn_sub_map:
+          module_path[a_idx + 1] = attn_sub_map[sub]
+    if 'mlp' in module_path:
+      m_idx = module_path.index('mlp')
+      if m_idx + 1 < len(module_path):
+        sub = module_path[m_idx + 1]
+        mlp_sub_map = {
+            'wi_0': 'gate_proj',
+            'wi_1': 'up_proj',
+            'wo': 'down_proj',
+        }
+        if sub in mlp_sub_map:
+          module_path[m_idx + 1] = mlp_sub_map[sub]
 
     # MLP gating_einsum -> split into gate_proj and up_proj.
     if module_path[1:] == ['mlp', 'gating_einsum']:

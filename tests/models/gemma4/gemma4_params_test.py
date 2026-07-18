@@ -763,6 +763,42 @@ class BuildShardedRestoreTargetTest(absltest.TestCase):
         jax.sharding.PartitionSpec(None, None, 'tp', 'fsdp', None),
     )
 
+  def test_map_from_upstream_checkpoint_fine_tuned_layout(self):
+    """Verifies key remapping for fine-tuned Tunix/Linen checkpoint formats."""
+    fine_tuned_raw = {
+        'token_embedder': {'embedding': {'value': np.zeros((10, 8))}},
+        'decoder': {
+            'decoder_norm': {'scale': {'value': np.zeros((8,))}},
+            'layers_0': {
+                'pre_self_attention_norm': {'scale': {'value': np.zeros((8,))}},
+                'self_attention': {
+                    'query': {'kernel': {'value': np.zeros((8, 8))}},
+                    'key': {'kernel': {'value': np.zeros((8, 8))}},
+                    'value': {'kernel': {'value': np.zeros((8, 8))}},
+                    'out': {'kernel': {'value': np.zeros((8, 8))}},
+                },
+                'mlp': {
+                    'wi_0': {'kernel': {'value': np.zeros((8, 16))}},
+                    'wi_1': {'kernel': {'value': np.zeros((8, 16))}},
+                    'wo': {'kernel': {'value': np.zeros((16, 8))}},
+                },
+            },
+        },
+    }
+    mapped = params.map_from_upstream_checkpoint(fine_tuned_raw)
+    flat_mapped = flatten_dict(mapped)
+
+    self.assertIn(('embedder', 'input_embedding'), flat_mapped)
+    self.assertIn(('final_norm', 'scale'), flat_mapped)
+    self.assertIn(('layers', 0, 'pre_attention_norm', 'scale'), flat_mapped)
+    self.assertIn(('layers', 0, 'attn', 'q_einsum', 'kernel'), flat_mapped)
+    self.assertIn(('layers', 0, 'attn', 'k_einsum', 'kernel'), flat_mapped)
+    self.assertIn(('layers', 0, 'attn', 'v_einsum', 'kernel'), flat_mapped)
+    self.assertIn(('layers', 0, 'attn', 'attn_vec_einsum', 'kernel'), flat_mapped)
+    self.assertIn(('layers', 0, 'mlp', 'gate_proj', 'kernel'), flat_mapped)
+    self.assertIn(('layers', 0, 'mlp', 'up_proj', 'kernel'), flat_mapped)
+    self.assertIn(('layers', 0, 'mlp', 'down_proj', 'kernel'), flat_mapped)
+
 
 if __name__ == '__main__':
   absltest.main()
