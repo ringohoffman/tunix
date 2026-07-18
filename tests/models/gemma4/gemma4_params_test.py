@@ -711,7 +711,7 @@ class BuildShardedRestoreTargetTest(absltest.TestCase):
             params.model_lib.AttentionType.LOCAL_SLIDING,
             params.model_lib.AttentionType.LOCAL_SLIDING,
             params.model_lib.AttentionType.LOCAL_SLIDING,
-            params.model_lib.AttentionType.GLOBAL,
+            params.model_lib.AttentionType.LOCAL_SLIDING,
         ),
         use_scan_layers=True,
     )
@@ -721,16 +721,16 @@ class BuildShardedRestoreTargetTest(absltest.TestCase):
 
     fake_upstream = {}
     for i in range(6):
-      is_global = i % 6 == 5
-      h_dim = 512 if is_global else 256
+      h_dim = 256
+      attn_dict: dict[str, Any] = {
+          'kv_einsum': {'w': np.zeros((2, 16, 5376, h_dim))},
+          'q_einsum': {'w': np.zeros((32, 5376, h_dim))},
+          'attn_vec_einsum': {'w': np.zeros((32, h_dim, 5376))},
+          'query_norm': {'scale': np.zeros((h_dim,))},
+          'key_norm': {'scale': np.zeros((h_dim,))},
+      }
       fake_upstream[f'layer_{i}'] = {
-          'attn': {
-              'kv_einsum': {'w': np.zeros((2, 16, 5376, h_dim))},
-              'q_einsum': {'w': np.zeros((32, 5376, h_dim))},
-              'attn_vec_einsum': {'w': np.zeros((32, h_dim, 5376))},
-              'query_norm': {'scale': np.zeros((h_dim,))},
-              'key_norm': {'scale': np.zeros((h_dim,))},
-          },
+          'attn': attn_dict,
           'mlp': {
               'gating_einsum': {'w': np.zeros((2, 16384, 5376))},
               'linear': {'w': np.zeros((16384, 5376))},
@@ -791,13 +791,132 @@ class BuildShardedRestoreTargetTest(absltest.TestCase):
     self.assertIn(('embedder', 'input_embedding'), flat_mapped)
     self.assertIn(('final_norm', 'scale'), flat_mapped)
     self.assertIn(('layers', 0, 'pre_attention_norm', 'scale'), flat_mapped)
-    self.assertIn(('layers', 0, 'attn', 'q_einsum', 'kernel'), flat_mapped)
-    self.assertIn(('layers', 0, 'attn', 'k_einsum', 'kernel'), flat_mapped)
-    self.assertIn(('layers', 0, 'attn', 'v_einsum', 'kernel'), flat_mapped)
-    self.assertIn(('layers', 0, 'attn', 'attn_vec_einsum', 'kernel'), flat_mapped)
+    self.assertIn(('layers', 0, 'attn', 'q_einsum', 'w'), flat_mapped)
+    self.assertIn(('layers', 0, 'attn', 'k_einsum', 'w'), flat_mapped)
+    self.assertIn(('layers', 0, 'attn', 'v_einsum', 'w'), flat_mapped)
+    self.assertIn(('layers', 0, 'attn', 'attn_vec_einsum', 'w'), flat_mapped)
     self.assertIn(('layers', 0, 'mlp', 'gate_proj', 'kernel'), flat_mapped)
     self.assertIn(('layers', 0, 'mlp', 'up_proj', 'kernel'), flat_mapped)
     self.assertIn(('layers', 0, 'mlp', 'down_proj', 'kernel'), flat_mapped)
+
+  def test_create_model_from_fine_tuned_checkpoint_with_scan_layers(self):
+    """Full pipeline: Linen fine-tuned checkpoint → scan-layer model.
+
+    Exercises the exact checkpoint format produced by the Linen-based trainer
+    (the yg-balance-v2-sft checkpoint), with:
+    - Linen key names (decoder/layers_N/self_attention/query/kernel/value)
+    - kernel→w transpose for 3D einsum tensors
+    - k_eq_v_global=True (GLOBAL layers have only 'key', no 'value')
+    - Attention pattern adapter (separate k/v → kv_einsum for LOCAL_SLIDING)
+    - Scan layer stacking across 2 groups of 6 sub-layers
+    """
+    _E, _H, _KV, _HD = 64, 4, 2, 16  # embed, heads, kv_heads, head_dim
+    _GKV, _GHD = 1, 32  # global kv_heads, global head_dim
+    _F = 128  # hidden_dim
+
+    config = params.model_lib.ModelConfig(
+        num_layers=12,
+        num_embed=128,
+        embed_dim=_E,
+        hidden_dim=_F,
+        num_heads=_H,
+        head_dim=_HD,
+        num_kv_heads=_KV,
+        num_global_kv_heads=_GKV,
+        global_key_size=_GHD,
+        sliding_window_size=16,
+        k_eq_v_global=True,
+        frac_shared_layers=0.0,
+        per_layer_input_dim=0,
+        use_scan_layers=True,
+        attention_pattern=(
+            params.model_lib.AttentionType.LOCAL_SLIDING,
+            params.model_lib.AttentionType.LOCAL_SLIDING,
+            params.model_lib.AttentionType.LOCAL_SLIDING,
+            params.model_lib.AttentionType.LOCAL_SLIDING,
+            params.model_lib.AttentionType.LOCAL_SLIDING,
+            params.model_lib.AttentionType.GLOBAL,
+        ),
+    )
+
+    devices = np.array(jax.devices()[:1]).reshape(1, 1)
+    mesh = jax.sharding.Mesh(devices, ('fsdp', 'tp'))
+
+    # Build a fake checkpoint in Linen format (genuinely nested)
+    fine_tuned_raw = {
+        'token_embedder': {'embedding': {'value': np.ones((_E * 2, _E))}},
+        'decoder': {
+            'decoder_norm': {'scale': {'value': np.ones((_E,))}},
+        },
+    }
+    for i in range(12):
+        is_global = (i % 6 == 5)
+        if is_global:
+            kv_heads = _GKV
+            head_dim = _GHD
+            # k_eq_v_global: only 'key', no 'value'
+            attn_dict = {
+                'query': {'kernel': {'value': np.ones((_E, _H, head_dim))}},
+                'key': {'kernel': {'value': np.ones((_E, kv_heads, head_dim))}},
+                'out': {'kernel': {'value': np.ones((_H, head_dim, _E))}},
+                'query_norm': {'scale': {'value': np.ones((head_dim,))}},
+                'key_norm': {'scale': {'value': np.ones((head_dim,))}},
+            }
+        else:
+            kv_heads = _KV
+            head_dim = _HD
+            # LOCAL_SLIDING: separate 'key' and 'value'
+            attn_dict = {
+                'query': {'kernel': {'value': np.ones((_E, _H, head_dim))}},
+                'key': {'kernel': {'value': np.ones((_E, kv_heads, head_dim))}},
+                'value': {'kernel': {'value': np.ones((_E, kv_heads, head_dim))}},
+                'out': {'kernel': {'value': np.ones((_H, head_dim, _E))}},
+                'query_norm': {'scale': {'value': np.ones((head_dim,))}},
+                'key_norm': {'scale': {'value': np.ones((head_dim,))}},
+            }
+        fine_tuned_raw['decoder'][f'layers_{i}'] = {
+            'self_attention': attn_dict,
+            'mlp': {
+                'wi_0': {'kernel': {'value': np.ones((_E, _F))}},
+                'wi_1': {'kernel': {'value': np.ones((_E, _F))}},
+                'wo': {'kernel': {'value': np.ones((_F, _E))}},
+            },
+            'pre_self_attention_norm': {'scale': {'value': np.ones((_E,))}},
+            'post_self_attention_norm': {'scale': {'value': np.ones((_E,))}},
+            'pre_ffw_norm': {'scale': {'value': np.ones((_E,))}},
+            'post_ffw_norm': {'scale': {'value': np.ones((_E,))}},
+            'layer_scalar': {'value': np.ones((1,))},
+        }
+
+    mock_meta = mock.MagicMock()
+    mock_meta.item_metadata.tree = fine_tuned_raw
+    self.mock_ckptr.metadata.return_value = mock_meta
+    self.mock_ckptr.restore.return_value = fine_tuned_raw
+
+    model = params.create_model_from_checkpoint(
+        '/fake/checkpoint', config, mesh=mesh
+    )
+    self.assertIsInstance(model, params.model_lib.Gemma4)
+
+    # Verify scan group structure exists
+    self.assertTrue(hasattr(model, 'scan_groups'))
+    self.assertEqual(model.num_scan_groups, 2)  # 12 layers / 6 pattern
+
+    # Verify stacked parameter shapes have the scan group axis prepended
+    state = nnx.state(model)
+    flat_state = flatten_dict(nnx.to_pure_dict(state))
+
+    # LOCAL_SLIDING sub_layer (index 0): should have kv_einsum
+    kv_key = ('scan_groups', 'sub_layers', 0, 'attn', 'kv_einsum', 'w')
+    self.assertIn(kv_key, flat_state)
+    # Shape: (num_groups=2, 2, kv_heads, embed, head_dim)
+    self.assertEqual(flat_state[kv_key].shape, (2, 2, _KV, _E, _HD))
+
+    # GLOBAL sub_layer (index 5): should have k_einsum (k_eq_v_global)
+    k_key = ('scan_groups', 'sub_layers', 5, 'attn', 'k_einsum', 'w')
+    self.assertIn(k_key, flat_state)
+    # Shape: (num_groups=2, global_kv_heads, embed, global_head_dim)
+    self.assertEqual(flat_state[k_key].shape, (2, _GKV, _E, _GHD))
 
 
 if __name__ == '__main__':

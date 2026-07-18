@@ -104,7 +104,7 @@ class _ShapeTracer:
   upstream PartitionSpec that produces it after the recorded transforms.
   """
 
-  __slots__ = ('key', 'shape', '_transposed', '_slice_idx')
+  __slots__ = ('key', 'shape', '_transposed', '_slice_idx', 'perm')
 
   def __init__(
       self,
@@ -112,11 +112,13 @@ class _ShapeTracer:
       shape: tuple[int, ...],
       transposed: bool = False,
       slice_idx: int | None = None,
+      perm: tuple[int, ...] | None = None,
   ) -> None:
     self.key = key
     self.shape = shape
     self._transposed = transposed
     self._slice_idx = slice_idx
+    self.perm = perm
 
   @property
   def T(self) -> _ShapeTracer:
@@ -125,6 +127,17 @@ class _ShapeTracer:
         self.shape[::-1],
         not self._transposed,
         self._slice_idx,
+        self.perm,
+    )
+
+  def transpose(self, axes: tuple[int, ...]) -> _ShapeTracer:
+    new_shape = tuple(self.shape[i] for i in axes)
+    return _ShapeTracer(
+        self.key,
+        new_shape,
+        self._transposed,
+        self._slice_idx,
+        axes,
     )
 
   def __getitem__(self, idx: int | slice) -> _ShapeTracer:
@@ -134,6 +147,7 @@ class _ShapeTracer:
           self.shape[1:],
           self._transposed,
           idx,
+          self.perm,
       )
     return self
 
@@ -143,23 +157,16 @@ class _ShapeTracer:
   ) -> jax.sharding.PartitionSpec:
     """Given a downstream PartitionSpec, compute the upstream one."""
     s = tuple(spec)
-    if self._transposed:
+    if self.perm is not None:
+      inv_perm = [0] * len(self.perm)
+      for i, p_idx in enumerate(self.perm):
+        inv_perm[p_idx] = i
+      s = tuple(s[i] if i < len(s) else None for i in inv_perm)
+    elif self._transposed:
       s = s[::-1]
     if self._slice_idx is not None:
       s = (None,) + s
     return jax.sharding.PartitionSpec(*s)
-
-
-def _get_checkpointer(checkpoint_path: str) -> Any:
-  """Get checkpointer instance (StandardCheckpointer vs PyTreeCheckpointer)."""
-  std_ckptr = ocp.StandardCheckpointer()
-  try:
-    meta = std_ckptr.metadata(checkpoint_path)
-    if meta and getattr(meta, "item_metadata", None) is not None:
-      return std_ckptr
-  except Exception:
-    pass
-  return ocp.PyTreeCheckpointer()
 
 
 def _build_sharded_restore_target(
@@ -167,7 +174,7 @@ def _build_sharded_restore_target(
     model_state: Any,
     mesh: jax.sharding.Mesh,
     model_config: model_lib.ModelConfig,
-) -> tuple[dict[str, Any], Any]:
+) -> tuple[dict[str, Any], ocp.PyTreeCheckpointer]:
   """Build a sharded restore target for direct-to-device DMA loading.
 
   Traces map_from_upstream_checkpoint with _ShapeTracer objects to determine
@@ -186,7 +193,7 @@ def _build_sharded_restore_target(
     with computed shardings, and the checkpointer instance (reused for
     the subsequent restore call).
   """
-  ckptr = _get_checkpointer(checkpoint_path)
+  ckptr = ocp.PyTreeCheckpointer()
   meta = ckptr.metadata(checkpoint_path)
   flat_upstream = flax.traverse_util.flatten_dict(meta.item_metadata.tree)
 
@@ -195,7 +202,7 @@ def _build_sharded_restore_target(
       {k: _ShapeTracer(k, v.shape) for k, v in flat_upstream.items()}
   )
   flat_traced = flax.traverse_util.flatten_dict(
-      map_from_upstream_checkpoint(mock_upstream)
+      map_from_upstream_checkpoint(mock_upstream, model_config=model_config)
   )
 
   # Get downstream shardings from the abstract model.
@@ -247,12 +254,27 @@ def _build_sharded_restore_target(
       sharding = flat_shardings[downstream_key]
 
     upstream_spec = tracer.invert_spec(sharding.spec)
-    orig = flat_upstream[tracer.key]
-    upstream_target[tracer.key] = jax.ShapeDtypeStruct(
-        shape=orig.shape,
-        dtype=orig.dtype,
-        sharding=jax.sharding.NamedSharding(mesh, upstream_spec),
-    )
+    if tracer.key and isinstance(tracer.key[0], tuple):
+      # Dual-key tuple (e.g. kv_einsum stacked from separate k_einsum and v_einsum keys)
+      single_spec = (
+          jax.sharding.PartitionSpec(*upstream_spec[1:])
+          if len(upstream_spec) > 3 and upstream_spec[0] is None
+          else upstream_spec
+      )
+      for single_key in tracer.key:
+        orig = flat_upstream[single_key]
+        upstream_target[single_key] = jax.ShapeDtypeStruct(
+            shape=orig.shape,
+            dtype=orig.dtype,
+            sharding=jax.sharding.NamedSharding(mesh, single_spec),
+        )
+    else:
+      orig = flat_upstream[tracer.key]
+      upstream_target[tracer.key] = jax.ShapeDtypeStruct(
+          shape=orig.shape,
+          dtype=orig.dtype,
+          sharding=jax.sharding.NamedSharding(mesh, upstream_spec),
+      )
 
   return flax.traverse_util.unflatten_dict(upstream_target), ckptr
 
@@ -303,10 +325,10 @@ def create_model_from_checkpoint(
         partial_restore=True,
     )
   else:
-    raw_params = _get_checkpointer(checkpoint_path).restore(checkpoint_path)
+    raw_params = ocp.PyTreeCheckpointer().restore(checkpoint_path)
 
   # ── Phase 3: Map upstream keys → downstream layout ──────────────────────
-  mapped = map_from_upstream_checkpoint(raw_params)
+  mapped = map_from_upstream_checkpoint(raw_params, model_config=model_config)
 
   # ── Phase 4: Stack layers for scan (if enabled) ────────────────────────
   if model_config.use_scan_layers:
@@ -510,7 +532,10 @@ def create_tokenizer(
   return spm_processor
 
 
-def map_from_upstream_checkpoint(params: Mapping[str, Any]) -> dict[str, Any]:
+def map_from_upstream_checkpoint(
+    params: Mapping[str, Any],
+    model_config: model_lib.ModelConfig | None = None,
+) -> dict[str, Any]:
   """Map from upstream Orbax NESTED checkpoint to Tunix NNX layout.
 
   Handles both key formats produced by Orbax checkpoints:
@@ -536,7 +561,10 @@ def map_from_upstream_checkpoint(params: Mapping[str, Any]) -> dict[str, Any]:
   """
   new_params: dict[tuple[str | int, ...], Any] = {}
 
-  for key_path, value in flax.traverse_util.flatten_dict(params).items():
+  flat_params = flax.traverse_util.flatten_dict(params)
+  raw_key_strings = set('/'.join(str(s) for s in k) for k in flat_params.keys())
+
+  for key_path, value in flat_params.items():
     # Normalize semi-flat or nested key_path to a flat list of components.
     parts = list(
         itertools.chain.from_iterable(
@@ -603,9 +631,10 @@ def map_from_upstream_checkpoint(params: Mapping[str, Any]) -> dict[str, Any]:
 
     layer_idx = ('layers', int(module_path[0].removeprefix('layer_')))
 
-    # Bare leaf on the layer itself (e.g., skip_scale).
+    # Bare leaf on the layer itself (e.g., skip_scale / layer_scalar).
     if len(module_path) == 1:
-      new_params[(*layer_idx, param_name)] = value
+      leaf_name = 'skip_scale' if param_name in ('layer_scalar', 'skip_scale') else param_name
+      new_params[(*layer_idx, leaf_name)] = value
       continue
 
     # Normalize Linen/Tunix layer submodule names
@@ -619,14 +648,25 @@ def map_from_upstream_checkpoint(params: Mapping[str, Any]) -> dict[str, Any]:
       a_idx = module_path.index('attn')
       if a_idx + 1 < len(module_path):
         sub = module_path[a_idx + 1]
-        attn_sub_map = {
-            'query': 'q_einsum',
-            'key': 'k_einsum',
-            'value': 'v_einsum',
-            'out': 'attn_vec_einsum',
-        }
-        if sub in attn_sub_map:
-          module_path[a_idx + 1] = attn_sub_map[sub]
+        if sub == 'query':
+          module_path[a_idx + 1] = 'q_einsum'
+        elif sub == 'out':
+          module_path[a_idx + 1] = 'attn_vec_einsum'
+        elif sub == 'key':
+          orig_key_str = '/'.join(str(s) for s in key_path)
+          prefix = orig_key_str.rsplit('self_attention', 1)[0]
+          has_val = any(
+              k.startswith(prefix)
+              and ('/self_attention/value/' in k or '/attn/value/' in k)
+              for k in raw_key_strings
+          )
+          module_path[a_idx + 1] = 'k_einsum' if has_val else 'kv_einsum'
+        elif sub == 'value':
+          module_path[a_idx + 1] = 'v_einsum'
+
+    if param_name == 'kernel' and module_path and (module_path[-1].endswith('_einsum') or module_path[-1] == 'attn'):
+      param_name = 'w'
+
     if 'mlp' in module_path:
       m_idx = module_path.index('mlp')
       if m_idx + 1 < len(module_path):
@@ -669,5 +709,50 @@ def map_from_upstream_checkpoint(params: Mapping[str, Any]) -> dict[str, Any]:
 
     # Everything else: direct mapping.
     new_params[(*layer_idx, *module_path[1:], param_name)] = value
+
+  # Transpose 3D einsum kernels from Linen layout (embed_dim, num_heads, head_dim) -> (num_heads, embed_dim, head_dim)
+  for k, v in list(new_params.items()):
+    if len(k) >= 4 and k[2] == 'attn' and k[-1] == 'w':
+      if (
+          len(v.shape) == 3
+          and model_config
+          and hasattr(model_config, 'embed_dim')
+          and model_config.embed_dim > 0
+          and v.shape[0] == model_config.embed_dim
+      ):
+        new_params[k] = v.transpose((1, 0, 2))
+
+  # Adapt kv_einsum <-> (k_einsum, v_einsum) based on model_config attention pattern
+  if (
+      model_config
+      and hasattr(model_config, 'num_layers')
+      and hasattr(model_config, 'attention_pattern')
+      and len(model_config.attention_pattern) > 0
+  ):
+    pattern_len = len(model_config.attention_pattern)
+    for i in range(model_config.num_layers):
+      is_global = (
+          model_config.attention_pattern[i % pattern_len]
+          == model_lib.AttentionType.GLOBAL
+      )
+      layer_key = ('layers', i, 'attn')
+      if is_global:
+        kv_w_key = (*layer_key, 'kv_einsum', 'w')
+        if kv_w_key in new_params:
+          kv_tr = new_params.pop(kv_w_key)
+          new_params[(*layer_key, 'k_einsum', 'w')] = kv_tr
+          new_params[(*layer_key, 'v_einsum', 'w')] = kv_tr
+      else:
+        k_w_key = (*layer_key, 'k_einsum', 'w')
+        v_w_key = (*layer_key, 'v_einsum', 'w')
+        if k_w_key in new_params and v_w_key in new_params:
+          k_tr = new_params.pop(k_w_key)
+          v_tr = new_params.pop(v_w_key)
+          if hasattr(k_tr, 'key'):
+            new_params[(*layer_key, 'kv_einsum', 'w')] = _ShapeTracer(
+                (k_tr.key, v_tr.key), (2, *k_tr.shape), k_tr._transposed, k_tr._slice_idx, k_tr.perm
+            )
+          else:
+            new_params[(*layer_key, 'kv_einsum', 'w')] = jnp.stack([k_tr, v_tr], axis=0)
 
   return flax.traverse_util.unflatten_dict(new_params)
