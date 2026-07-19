@@ -380,16 +380,19 @@ class PeftTrainer:
       return
     optimizer_state = nnx.state(self.optimizer, nnx.optimizer.OptState)
 
-    # ── Diagnostic: log total optimizer state size before sharding ──
-    total_bytes_before = sum(
+    # ── Diagnostic: log optimizer state size and sharding status ──
+    total_bytes = sum(
         leaf.nbytes
         for leaf in jax.tree.leaves(optimizer_state)
         if hasattr(leaf, 'nbytes')
     )
+    global_total_gb = total_bytes / (1024**3)
+    fsdp_size = mesh.shape.get('fsdp', 1)
     logging.info(
-        '_shard_optimizer: total optimizer state = %.2f GB (pre-sharding), '
-        'using jax.device_put (not with_sharding_constraint)',
-        total_bytes_before / (1024**3),
+        '_shard_optimizer: global optimizer state = %.2f GB across mesh=%s '
+        'using jax.device_put',
+        global_total_gb,
+        dict(mesh.shape),
     )
 
     optimizer_pspecs = nnx.get_partition_spec(optimizer_state)
@@ -409,17 +412,13 @@ class PeftTrainer:
     )
     nnx.update(self.optimizer, optimizer_sharded_state)
 
-    # ── Diagnostic: log total optimizer state size after sharding ──
-    total_bytes_after = sum(
-        leaf.nbytes
-        for leaf in jax.tree.leaves(optimizer_sharded_state)
-        if hasattr(leaf, 'nbytes')
-    )
+    per_chip_gb = global_total_gb / fsdp_size if fsdp_size > 0 else global_total_gb
     logging.info(
-        '_shard_optimizer: total optimizer state = %.2f GB (post-sharding), '
-        'mesh=%s',
-        total_bytes_after / (1024**3),
-        dict(mesh.shape),
+        '_shard_optimizer: SHARDED successfully -> %.2f GB per device '
+        '(%.2f GB global total divided across FSDP=%d chips)',
+        per_chip_gb,
+        global_total_gb,
+        fsdp_size,
     )
 
   def jit_train_and_eval_step(
