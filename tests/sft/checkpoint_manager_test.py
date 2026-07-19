@@ -281,6 +281,34 @@ class CheckpointManagerTest(parameterized.TestCase):
         new_optimizer.opt_state.hyperparams['learning_rate'].value, 1e-3
     )
 
+  def test_restore_optimizer_from_path(self):
+    cp_path = f'{self.temp_path}/{self.id()}'
+    ckpt_manager = checkpoint_manager.CheckpointManager(cp_path)
+    model, _ = create_sharded_model(TestModel, nnx.Rngs(0), self.mesh)
+    optimizer = nnx.Optimizer(
+        model,
+        optax.inject_hyperparams(optax.adamw)(learning_rate=1e-3),
+        wrt=nnx.Param,
+    )
+    ckpt_manager.save(1, model, optimizer=optimizer)
+    ckpt_manager._checkpoint_manager.wait_until_finished()
+
+    fresh_optimizer = nnx.Optimizer(
+        model,
+        optax.inject_hyperparams(optax.adamw)(learning_rate=1e-5),
+        wrt=nnx.Param,
+    )
+    step_path = f'{cp_path}/1'
+    restored = checkpoint_manager.CheckpointManager.restore_optimizer_from_path(
+        fresh_optimizer, step_path
+    )
+    self.assertTrue(restored)
+    jax.tree.map_with_path(
+        assert_close,
+        nnx.state(fresh_optimizer, nnx.optimizer.OptState),
+        nnx.state(optimizer, nnx.optimizer.OptState),
+    )
+
   def test_restore_without_optimizer(self):
     cp_path = f'{self.temp_path}/{self.id()}'
     ckpt_manager = checkpoint_manager.CheckpointManager(cp_path)

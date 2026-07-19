@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 import itertools
+import os
 import time
 from typing import Any
 
@@ -194,8 +195,26 @@ def _build_sharded_restore_target(
     the subsequent restore call).
   """
   ckptr = ocp.PyTreeCheckpointer()
-  meta = ckptr.metadata(checkpoint_path)
-  flat_upstream = flax.traverse_util.flatten_dict(meta.item_metadata.tree)
+  step_parent = os.path.dirname(checkpoint_path.rstrip('/'))
+  step_name = os.path.basename(step_parent)
+  is_step_dir = (
+      step_name.isdigit()
+      and os.path.basename(checkpoint_path.rstrip('/')) == 'model_params'
+  )
+  if is_step_dir:
+    ckpt_root = os.path.dirname(step_parent)
+    step_num = int(step_name)
+    mgr = ocp.CheckpointManager(
+        ckpt_root,
+        item_handlers={'model_params': ocp.PyTreeCheckpointHandler()},
+    )
+    meta = mgr.metadata(step_num)
+    item_tree = meta.item_metadata['model_params'].tree
+    mgr.close()
+  else:
+    meta = ckptr.metadata(checkpoint_path)
+    item_tree = meta.item_metadata.tree
+  flat_upstream = flax.traverse_util.flatten_dict(item_tree)
 
   # Trace through the key mapper with abstract _ShapeTracer values.
   mock_upstream = flax.traverse_util.unflatten_dict(
@@ -304,6 +323,15 @@ def create_model_from_checkpoint(
   """
   t0 = time.monotonic()
 
+  # ── Phase 0: Resolve subpath (handles step dir or model_params subpath) ──
+  clean_path = checkpoint_path.rstrip('/')
+  if clean_path.endswith('/model_params'):
+    resolved_path = clean_path
+  elif (epath.Path(clean_path) / 'model_params').exists():
+    resolved_path = str(epath.Path(clean_path) / 'model_params')
+  else:
+    resolved_path = clean_path
+
   # ── Phase 1: Abstract model (no memory allocated) ──────────────────────
   with nnx.use_eager_sharding(True), jax.set_mesh(mesh):
     abs_model = nnx.eval_shape(
@@ -314,18 +342,41 @@ def create_model_from_checkpoint(
   # ── Phase 2: Restore checkpoint ────────────────────────────────────────
   if mesh is not None:
     target, ckptr = _build_sharded_restore_target(
-        checkpoint_path,
+        resolved_path,
         model_state,
         mesh,
         model_config,
     )
+    step_parent = os.path.dirname(resolved_path.rstrip('/'))
+    step_name = os.path.basename(step_parent)
+    is_step_dir = (
+        step_name.isdigit()
+        and os.path.basename(resolved_path.rstrip('/')) == 'model_params'
+    )
+    if is_step_dir:
+      from tunix.sft import checkpoint_manager as tunix_ckpt_mgr
+
+      ckpt_root = os.path.dirname(step_parent)
+      step_num = int(step_name)
+      with jax.set_mesh(mesh):
+        real_model = model_lib.Gemma4(model_config, rngs=nnx.Rngs(0))
+        mgr = tunix_ckpt_mgr.CheckpointManager(ckpt_root)
+        mgr.maybe_restore(real_model, step=step_num)
+        mgr.close()
+      logging.info(
+          'Restored Tunix model from step %d in %.2fs',
+          step_num,
+          time.monotonic() - t0,
+      )
+      return real_model
+
     raw_params = ckptr.restore(
-        checkpoint_path,
+        resolved_path,
         target=target,
         partial_restore=True,
     )
   else:
-    raw_params = ocp.PyTreeCheckpointer().restore(checkpoint_path)
+    raw_params = ocp.PyTreeCheckpointer().restore(resolved_path)
 
   # ── Phase 3: Map upstream keys → downstream layout ──────────────────────
   mapped = map_from_upstream_checkpoint(raw_params, model_config=model_config)
@@ -512,6 +563,20 @@ def _prune_to_model_keys(
     )
 
   filtered = {k: v for k, v in flat_params.items() if k in flat_model}
+
+  # Guard: if we matched almost nothing, the checkpoint is likely in the wrong
+  # format (e.g. a tunix CheckpointManager checkpoint passed to
+  # create_model_from_checkpoint, which expects upstream key layout).
+  if flat_model and not filtered:
+    raise ValueError(
+        f'Checkpoint has 0 keys matching the model '
+        f'(checkpoint has {len(flat_params)} keys, model expects '
+        f'{len(flat_model)} keys). This usually means the checkpoint is not '
+        f'in upstream format — tunix CheckpointManager checkpoints should be '
+        f'loaded via CheckpointManager.maybe_restore() instead of '
+        f'create_model_from_checkpoint().'
+    )
+
   return flax.traverse_util.unflatten_dict(filtered)
 
 
@@ -563,6 +628,15 @@ def map_from_upstream_checkpoint(
 
   flat_params = flax.traverse_util.flatten_dict(params)
   raw_key_strings = set('/'.join(str(s) for s in k) for k in flat_params.keys())
+
+  # Pass through keys that are already in NNX layout (e.g. from Tunix CheckpointManager)
+  if any(
+      isinstance(k, tuple)
+      and len(k) >= 2
+      and k[0] in ('layers', 'embedder', 'final_norm', 'scan_groups')
+      for k in flat_params.keys()
+  ):
+    return dict(params)
 
   for key_path, value in flat_params.items():
     # Normalize semi-flat or nested key_path to a flat list of components.
