@@ -264,28 +264,48 @@ class ScanEquivalenceTest(absltest.TestCase):
           )
 
 
-class ScanFallbackTest(absltest.TestCase):
-  """Test that the scan model falls back to for-loop for inference."""
+class ScanGenerationTest(absltest.TestCase):
+  """Numerical equivalence tests for generation/inference with KV cache."""
 
-  def test_cache_forces_loop(self):
-    """When cache is provided, scan model must use the for-loop path."""
-    # This test verifies that scan models can still be used for inference
-    # by falling back to the for-loop path when cache is provided.
-    # Since scan models don't have self.layers, this should raise an error
-    # (for now — inference support is a future enhancement).
-    config = _make_config(num_layers=6, use_scan_layers=True)
-    model = model_lib.Gemma4(config, rngs=nnx.Rngs(0))
+  def test_scan_generation_prefill_and_decode_equivalence(self):
+    """The scan model with cache must produce identical output to loop model."""
+    loop_config = _make_config(num_layers=12, use_scan_layers=False)
+    scan_config = _make_config(num_layers=12, use_scan_layers=True)
 
-    tokens = jax.random.randint(
-        jax.random.PRNGKey(0), (1, 1), 0, config.num_embed
+    loop_model = model_lib.Gemma4(loop_config, rngs=nnx.Rngs(0))
+    scan_model = model_lib.Gemma4(scan_config, rngs=nnx.Rngs(1))
+    _copy_weights_loop_to_scan(loop_model, scan_model)
+
+    loop_cache = loop_model.init_cache(batch_size=2, max_seq_len=16, dtype=jnp.float32)
+    scan_cache = scan_model.init_cache(batch_size=2, max_seq_len=16, dtype=jnp.float32)
+
+    tokens, positions, attn_mask = _make_inputs(loop_config, batch_size=2, seq_len=8)
+
+    loop_out = loop_model(tokens, positions=positions, cache=loop_cache, attention_mask=attn_mask)
+    scan_out = scan_model(tokens, positions=positions, cache=scan_cache, attention_mask=attn_mask)
+
+    # Compare prefill logits
+    max_diff = float(jnp.max(jnp.abs(loop_out.logits - scan_out.logits)))
+    self.assertLess(
+        max_diff,
+        1e-5,
+        msg=f'Generation prefill logits diverged. Max diff: {max_diff}',
     )
-    positions = jnp.zeros((1, 1), dtype=jnp.int32)
-    attn_mask = jnp.ones((1, 1, 1), dtype=jnp.bool_)
 
-    # scan model with cache should fail since self.layers doesn't exist
-    with self.assertRaises(AttributeError):
-      cache = {}  # empty cache to trigger the loop path
-      model(tokens, positions=positions, cache=cache, attention_mask=attn_mask)
+    # Compare single-step decode
+    tok_decode = jax.random.randint(jax.random.PRNGKey(1), (2, 1), 0, loop_config.num_embed)
+    pos_decode = jnp.full((2, 1), 8)
+    mask_decode = jnp.ones((2, 1, 16), dtype=jnp.bool_)
+
+    loop_dec_out = loop_model(tok_decode, positions=pos_decode, cache=loop_out.cache, attention_mask=mask_decode)
+    scan_dec_out = scan_model(tok_decode, positions=pos_decode, cache=scan_out.cache, attention_mask=mask_decode)
+
+    max_diff_dec = float(jnp.max(jnp.abs(loop_dec_out.logits - scan_dec_out.logits)))
+    self.assertLess(
+        max_diff_dec,
+        1e-5,
+        msg=f'Generation decode logits diverged. Max diff: {max_diff_dec}',
+    )
 
 
 class ScanShardingSpecTest(absltest.TestCase):

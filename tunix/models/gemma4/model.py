@@ -1774,8 +1774,24 @@ class Gemma4(BackendMappingMixin, nnx.Module):
       segment_ids: jaxtyping.Array | None,
   ) -> jaxtyping.Array:
     """Original for-loop forward pass over layers."""
-    for i, layer in enumerate(self.layers):
+    num_layers = self.config.num_layers
+    if self.config.use_scan_layers:
+      pattern_len = len(self.scan_pattern)
+      sub_layer_splits = [
+          nnx.split(sub_layer) for sub_layer in self.scan_groups.sub_layers
+      ]
+
+    for i in range(num_layers):
       layer_name = f"layer_{i}"
+
+      if self.config.use_scan_layers:
+        group_idx = i // pattern_len
+        sub_idx = i % pattern_len
+        graphdef, state = sub_layer_splits[sub_idx]
+        layer_state = jax.tree.map(lambda leaf: leaf[group_idx], state)
+        layer = nnx.merge(graphdef, layer_state)
+      else:
+        layer = self.layers[i]
 
       shared_idx = self.kv_cache_sharing_patterns[i]
       is_shared = shared_idx != i
@@ -1837,10 +1853,18 @@ class Gemma4(BackendMappingMixin, nnx.Module):
 
   def init_cache(self, batch_size, max_seq_len, dtype):
     cache = {}
-    for i, layer in enumerate(self.layers):
-      if self.kv_cache_sharing_patterns[i] != i:
-        continue  # Skip shared layers.
-      cache[f"layer_{i}"] = layer.init_cache(batch_size, max_seq_len, dtype)
+    if self.config.use_scan_layers:
+      pattern_len = len(self.scan_pattern)
+      for i in range(self.config.num_layers):
+        if self.kv_cache_sharing_patterns[i] != i:
+          continue  # Skip shared layers.
+        sub_layer = self.scan_groups.sub_layers[i % pattern_len]
+        cache[f"layer_{i}"] = sub_layer.init_cache(batch_size, max_seq_len, dtype)
+    else:
+      for i, layer in enumerate(self.layers):
+        if self.kv_cache_sharing_patterns[i] != i:
+          continue  # Skip shared layers.
+        cache[f"layer_{i}"] = layer.init_cache(batch_size, max_seq_len, dtype)
     return cache
 
   def get_model_input(self):
