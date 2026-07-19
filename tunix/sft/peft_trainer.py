@@ -381,8 +381,18 @@ class PeftTrainer:
     optimizer_state = nnx.state(self.optimizer, nnx.optimizer.OptState)
     optimizer_pspecs = nnx.get_partition_spec(optimizer_state)
 
-    optimizer_sharded_state = jax.lax.with_sharding_constraint(
-        optimizer_state, optimizer_pspecs
+    def _to_sharding(spec: Any) -> shd.Sharding:
+      if isinstance(spec, shd.Sharding):
+        return spec
+      if isinstance(spec, shd.PartitionSpec):
+        return shd.NamedSharding(mesh, spec)
+      if isinstance(spec, tuple):
+        return shd.NamedSharding(mesh, shd.PartitionSpec(*spec))
+      return shd.NamedSharding(mesh, shd.PartitionSpec())
+
+    optimizer_shardings = jax.tree.map(_to_sharding, optimizer_pspecs)
+    optimizer_sharded_state = jax.device_put(
+        optimizer_state, optimizer_shardings
     )
     nnx.update(self.optimizer, optimizer_sharded_state)
 
