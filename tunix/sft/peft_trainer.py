@@ -380,7 +380,6 @@ class PeftTrainer:
       return
     optimizer_state = nnx.state(self.optimizer, nnx.optimizer.OptState)
 
-    # ── Diagnostic: log optimizer state size and sharding status ──
     total_bytes = sum(
         leaf.nbytes
         for leaf in jax.tree.leaves(optimizer_state)
