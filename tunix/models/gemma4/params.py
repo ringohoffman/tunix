@@ -299,24 +299,16 @@ def _build_sharded_restore_target(
           sharding=jax.sharding.NamedSharding(mesh, upstream_spec),
       )
 
-  has_meta_file = os.path.exists(
-      os.path.join(checkpoint_path, '_CHECKPOINT_METADATA')
-  )
-
-  def _normalize_keys(d: Any) -> Any:
+  def _stringify_keys(d: Any) -> Any:
     if isinstance(d, dict):
-      new_d = {}
-      for k, v in d.items():
-        if isinstance(k, (int, str)) and str(k).isdigit():
-          new_k = str(k) if has_meta_file else int(k)
-        else:
-          new_k = k
-        new_d[new_k] = _normalize_keys(v)
-      return new_d
+      return {
+          str(k) if isinstance(k, int) else k: _stringify_keys(v)
+          for k, v in d.items()
+      }
     return d
 
   unflattened = flax.traverse_util.unflatten_dict(upstream_target)
-  return _normalize_keys(unflattened), ckptr
+  return _stringify_keys(unflattened), ckptr
 
 
 def create_model_from_checkpoint(
@@ -368,31 +360,35 @@ def create_model_from_checkpoint(
       and os.path.basename(resolved_path.rstrip('/')) == 'model_params'
   )
   if is_step_dir:
-    from tunix.sft import checkpoint_manager as tunix_ckpt_mgr
+    ckptr_meta = ocp.PyTreeCheckpointer().metadata(resolved_path)
+    top_keys = list(ckptr_meta.item_metadata.tree.keys()) if ckptr_meta.item_metadata else []
+    is_native_tunix = 'token_embedder' not in top_keys and 'decoder' not in top_keys
+    if is_native_tunix:
+      from tunix.sft import checkpoint_manager as tunix_ckpt_mgr
 
-    ckpt_root = os.path.dirname(step_parent)
-    step_num = int(step_name)
-    with jax.set_mesh(mesh):
-      def _bind_mesh(x: Any) -> Any:
-        if isinstance(x, jax.ShapeDtypeStruct) and isinstance(
-            getattr(x, 'sharding', None), jax.sharding.NamedSharding
-        ):
-          concrete_sharding = jax.sharding.NamedSharding(mesh, x.sharding.spec)
-          return jax.ShapeDtypeStruct(
-              x.shape, x.dtype, sharding=concrete_sharding
-          )
-        return x
+      ckpt_root = os.path.dirname(step_parent)
+      step_num = int(step_name)
+      with jax.set_mesh(mesh):
+        def _bind_mesh(x: Any) -> Any:
+          if isinstance(x, jax.ShapeDtypeStruct) and isinstance(
+              getattr(x, 'sharding', None), jax.sharding.NamedSharding
+          ):
+            concrete_sharding = jax.sharding.NamedSharding(mesh, x.sharding.spec)
+            return jax.ShapeDtypeStruct(
+                x.shape, x.dtype, sharding=concrete_sharding
+            )
+          return x
 
-      nnx.update(abs_model, jax.tree.map(_bind_mesh, nnx.state(abs_model)))
-      mgr = tunix_ckpt_mgr.CheckpointManager(ckpt_root)
-      mgr.maybe_restore(abs_model, step=step_num)
-      mgr.close()
-    logging.info(
-        'Restored Tunix model from step %d in %.2fs',
-        step_num,
-        time.monotonic() - t0,
-    )
-    return abs_model
+        nnx.update(abs_model, jax.tree.map(_bind_mesh, nnx.state(abs_model)))
+        mgr = tunix_ckpt_mgr.CheckpointManager(ckpt_root)
+        mgr.maybe_restore(abs_model, step=step_num)
+        mgr.close()
+      logging.info(
+          'Restored native Tunix model from step %d via CheckpointManager in %.2fs',
+          step_num,
+          time.monotonic() - t0,
+      )
+      return abs_model
 
   if mesh is not None:
     target, ckptr = _build_sharded_restore_target(
