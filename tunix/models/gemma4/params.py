@@ -359,16 +359,26 @@ def create_model_from_checkpoint(
       ckpt_root = os.path.dirname(step_parent)
       step_num = int(step_name)
       with jax.set_mesh(mesh):
-        real_model = model_lib.Gemma4(model_config, rngs=nnx.Rngs(0))
+        def _bind_mesh(x: Any) -> Any:
+          if isinstance(x, jax.ShapeDtypeStruct) and isinstance(
+              getattr(x, 'sharding', None), jax.sharding.NamedSharding
+          ):
+            concrete_sharding = jax.sharding.NamedSharding(mesh, x.sharding.spec)
+            return jax.ShapeDtypeStruct(
+                x.shape, x.dtype, sharding=concrete_sharding
+            )
+          return x
+
+        nnx.update(abs_model, jax.tree.map(_bind_mesh, nnx.state(abs_model)))
         mgr = tunix_ckpt_mgr.CheckpointManager(ckpt_root)
-        mgr.maybe_restore(real_model, step=step_num)
+        mgr.maybe_restore(abs_model, step=step_num)
         mgr.close()
       logging.info(
           'Restored Tunix model from step %d in %.2fs',
           step_num,
           time.monotonic() - t0,
       )
-      return real_model
+      return abs_model
 
     raw_params = ckptr.restore(
         resolved_path,
