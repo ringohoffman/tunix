@@ -195,25 +195,8 @@ def _build_sharded_restore_target(
     the subsequent restore call).
   """
   ckptr = ocp.PyTreeCheckpointer()
-  step_parent = os.path.dirname(checkpoint_path.rstrip('/'))
-  step_name = os.path.basename(step_parent)
-  is_step_dir = (
-      step_name.isdigit()
-      and os.path.basename(checkpoint_path.rstrip('/')) == 'model_params'
-  )
-  if is_step_dir:
-    ckpt_root = os.path.dirname(step_parent)
-    step_num = int(step_name)
-    mgr = ocp.CheckpointManager(
-        ckpt_root,
-        item_handlers={'model_params': ocp.PyTreeCheckpointHandler()},
-    )
-    meta = mgr.metadata(step_num)
-    item_tree = meta.item_metadata['model_params'].tree
-    mgr.close()
-  else:
-    meta = ckptr.metadata(checkpoint_path)
-    item_tree = meta.item_metadata.tree
+  meta = ckptr.metadata(checkpoint_path)
+  item_tree = meta.item_metadata.tree
   flat_upstream = flax.traverse_util.flatten_dict(item_tree)
 
   # Trace through the key mapper with abstract _ShapeTracer values.
@@ -235,15 +218,25 @@ def _build_sharded_restore_target(
   # Invert traced operations to compute upstream PartitionSpecs.
   upstream_target: dict[tuple[str, ...], jax.ShapeDtypeStruct] = {}
   for downstream_key, tracer in flat_traced.items():
+    norm_downstream_key = (
+        (downstream_key[0], int(downstream_key[1])) + downstream_key[2:]
+        if (
+            len(downstream_key) >= 2
+            and downstream_key[0] == 'layers'
+            and isinstance(downstream_key[1], str)
+            and downstream_key[1].isdigit()
+        )
+        else downstream_key
+    )
     # If using scan layers, map flat downstream key to scan group key.
     if (
         pattern_len > 0
-        and len(downstream_key) >= 2
-        and downstream_key[0] == 'layers'
-        and isinstance(downstream_key[1], int)
+        and len(norm_downstream_key) >= 2
+        and norm_downstream_key[0] == 'layers'
+        and isinstance(norm_downstream_key[1], int)
     ):
-      layer_idx = downstream_key[1]
-      param_path = downstream_key[2:]
+      layer_idx = norm_downstream_key[1]
+      param_path = norm_downstream_key[2:]
       sub_layer_idx = layer_idx % pattern_len
       scan_key = ('scan_groups', 'sub_layers', sub_layer_idx) + param_path
       if scan_key not in flat_shardings:
@@ -264,13 +257,22 @@ def _build_sharded_restore_target(
             jax.sharding.PartitionSpec(*spec_axes[1:]),
         )
     else:
-      if downstream_key not in flat_shardings:
+      if norm_downstream_key not in flat_shardings:
         logging.info(
             'Skipping sharded restore target for pruned key: %s',
-            '/'.join(str(p) for p in downstream_key),
+            '/'.join(str(p) for p in norm_downstream_key),
         )
         continue
-      sharding = flat_shardings[downstream_key]
+      sharding = flat_shardings[norm_downstream_key]
+
+    def _find_orig_key(key: Any) -> Any:
+      if isinstance(key, tuple):
+        str_k = tuple(str(x) if isinstance(x, int) else x for x in key)
+        if str_k in flat_upstream:
+          return str_k
+      if key in flat_upstream:
+        return key
+      return key
 
     upstream_spec = tracer.invert_spec(sharding.spec)
     if tracer.key and isinstance(tracer.key[0], tuple):
@@ -281,21 +283,40 @@ def _build_sharded_restore_target(
           else upstream_spec
       )
       for single_key in tracer.key:
-        orig = flat_upstream[single_key]
-        upstream_target[single_key] = jax.ShapeDtypeStruct(
+        matched_key = _find_orig_key(single_key)
+        orig = flat_upstream[matched_key]
+        upstream_target[matched_key] = jax.ShapeDtypeStruct(
             shape=orig.shape,
             dtype=orig.dtype,
             sharding=jax.sharding.NamedSharding(mesh, single_spec),
         )
     else:
-      orig = flat_upstream[tracer.key]
-      upstream_target[tracer.key] = jax.ShapeDtypeStruct(
+      matched_key = _find_orig_key(tracer.key)
+      orig = flat_upstream[matched_key]
+      upstream_target[matched_key] = jax.ShapeDtypeStruct(
           shape=orig.shape,
           dtype=orig.dtype,
           sharding=jax.sharding.NamedSharding(mesh, upstream_spec),
       )
 
-  return flax.traverse_util.unflatten_dict(upstream_target), ckptr
+  has_meta_file = os.path.exists(
+      os.path.join(checkpoint_path, '_CHECKPOINT_METADATA')
+  )
+
+  def _normalize_keys(d: Any) -> Any:
+    if isinstance(d, dict):
+      new_d = {}
+      for k, v in d.items():
+        if isinstance(k, (int, str)) and str(k).isdigit():
+          new_k = str(k) if has_meta_file else int(k)
+        else:
+          new_k = k
+        new_d[new_k] = _normalize_keys(v)
+      return new_d
+    return d
+
+  unflattened = flax.traverse_util.unflatten_dict(upstream_target)
+  return _normalize_keys(unflattened), ckptr
 
 
 def create_model_from_checkpoint(
@@ -340,6 +361,39 @@ def create_model_from_checkpoint(
   model_state = nnx.state(abs_model)
 
   # ── Phase 2: Restore checkpoint ────────────────────────────────────────
+  step_parent = os.path.dirname(resolved_path.rstrip('/'))
+  step_name = os.path.basename(step_parent)
+  is_step_dir = (
+      step_name.isdigit()
+      and os.path.basename(resolved_path.rstrip('/')) == 'model_params'
+  )
+  if is_step_dir:
+    from tunix.sft import checkpoint_manager as tunix_ckpt_mgr
+
+    ckpt_root = os.path.dirname(step_parent)
+    step_num = int(step_name)
+    with jax.set_mesh(mesh):
+      def _bind_mesh(x: Any) -> Any:
+        if isinstance(x, jax.ShapeDtypeStruct) and isinstance(
+            getattr(x, 'sharding', None), jax.sharding.NamedSharding
+        ):
+          concrete_sharding = jax.sharding.NamedSharding(mesh, x.sharding.spec)
+          return jax.ShapeDtypeStruct(
+              x.shape, x.dtype, sharding=concrete_sharding
+          )
+        return x
+
+      nnx.update(abs_model, jax.tree.map(_bind_mesh, nnx.state(abs_model)))
+      mgr = tunix_ckpt_mgr.CheckpointManager(ckpt_root)
+      mgr.maybe_restore(abs_model, step=step_num)
+      mgr.close()
+    logging.info(
+        'Restored Tunix model from step %d in %.2fs',
+        step_num,
+        time.monotonic() - t0,
+    )
+    return abs_model
+
   if mesh is not None:
     target, ckptr = _build_sharded_restore_target(
         resolved_path,
@@ -347,39 +401,6 @@ def create_model_from_checkpoint(
         mesh,
         model_config,
     )
-    step_parent = os.path.dirname(resolved_path.rstrip('/'))
-    step_name = os.path.basename(step_parent)
-    is_step_dir = (
-        step_name.isdigit()
-        and os.path.basename(resolved_path.rstrip('/')) == 'model_params'
-    )
-    if is_step_dir:
-      from tunix.sft import checkpoint_manager as tunix_ckpt_mgr
-
-      ckpt_root = os.path.dirname(step_parent)
-      step_num = int(step_name)
-      with jax.set_mesh(mesh):
-        def _bind_mesh(x: Any) -> Any:
-          if isinstance(x, jax.ShapeDtypeStruct) and isinstance(
-              getattr(x, 'sharding', None), jax.sharding.NamedSharding
-          ):
-            concrete_sharding = jax.sharding.NamedSharding(mesh, x.sharding.spec)
-            return jax.ShapeDtypeStruct(
-                x.shape, x.dtype, sharding=concrete_sharding
-            )
-          return x
-
-        nnx.update(abs_model, jax.tree.map(_bind_mesh, nnx.state(abs_model)))
-        mgr = tunix_ckpt_mgr.CheckpointManager(ckpt_root)
-        mgr.maybe_restore(abs_model, step=step_num)
-        mgr.close()
-      logging.info(
-          'Restored Tunix model from step %d in %.2fs',
-          step_num,
-          time.monotonic() - t0,
-      )
-      return abs_model
-
     raw_params = ckptr.restore(
         resolved_path,
         target=target,
@@ -403,17 +424,22 @@ def create_model_from_checkpoint(
   pruned = _prune_to_model_keys(mapped, model_state)
   _validate_param_shapes(pruned, model_state)
 
-  # ── Phase 6: Cast dtype and apply target shardings ─────────────────────
+  # ── Phase 6: Fill missing keys and cast dtype with target shardings ────
+  pure_state = nnx.to_pure_dict(model_state)
+
   if mesh is not None:
     with jax.set_mesh(mesh):
       shardings = nnx.to_pure_dict(nnx.get_named_sharding(model_state, mesh))
-      # Model state already contains the correct scan-axis prepended sharding
-      # (from _init_scan_layers Phase 2).
-      pass
-
+      # Align pruned structure with pure_state by filling missing leaves
+      flat_pure = flax.traverse_util.flatten_dict(pure_state)
+      flat_pruned = flax.traverse_util.flatten_dict(pruned)
+      for k, v in flat_pure.items():
+        if k not in flat_pruned:
+          flat_pruned[k] = jnp.zeros(v.shape, dtype=dtype)
+      complete_params = flax.traverse_util.unflatten_dict(flat_pruned)
       typed = jax.tree_util.tree_map_with_path(
           lambda p, x, s: jnp.asarray(x, device=s, dtype=dtype),
-          pruned,
+          complete_params,
           shardings,
       )
   else:
@@ -506,9 +532,9 @@ def _validate_param_shapes(
 
   missing_keys = model_keys - mapped_keys
   if missing_keys:
-    raise ValueError(
-        'Checkpoint is missing keys expected by the model:'
-        f' {sorted(str(k) for k in missing_keys)}'
+    logging.warning(
+        'Checkpoint is missing keys expected by the model (will be zero-initialized): %s',
+        sorted(str(k) for k in missing_keys),
     )
 
   # Should not fire after _prune_to_model_keys; kept as defensive guard.
