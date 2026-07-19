@@ -1203,7 +1203,9 @@ class Attention(nnx.Module):
           segment_ids=segment_ids,
       )
 
-  def init_cache(self, batch_size, max_seq_len, dtype):
+  def init_cache(
+      self, batch_size: int, max_seq_len: int, dtype: jnp.dtype
+  ) -> LayerCache:
     cache_len = max_seq_len
     if (
         self.config.use_sliding_window_kv_cache
@@ -1482,7 +1484,9 @@ class DecoderLayer(nnx.Module):
           segment_ids=segment_ids,
       )
 
-  def init_cache(self, batch_size, max_seq_len, dtype):
+  def init_cache(
+      self, batch_size: int, max_seq_len: int, dtype: jnp.dtype
+  ) -> LayerCache:
     return self.attn.init_cache(batch_size, max_seq_len, dtype)
 
 
@@ -1851,7 +1855,9 @@ class Gemma4(BackendMappingMixin, nnx.Module):
     x = scan_body(x, self.scan_groups, positions, attention_mask, segment_ids)
     return x
 
-  def init_cache(self, batch_size, max_seq_len, dtype):
+  def init_cache(
+      self, batch_size: int, max_seq_len: int, dtype: jnp.dtype
+  ) -> Cache:
     cache = {}
     if self.config.use_scan_layers:
       pattern_len = len(self.scan_pattern)
