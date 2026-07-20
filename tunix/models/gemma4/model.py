@@ -21,7 +21,6 @@ import enum
 from collections.abc import Callable
 from functools import partial
 import itertools
-import logging
 from typing import Any, Literal, Tuple
 import flax
 from flax import nnx
@@ -77,7 +76,7 @@ Cache = dict[str, LayerCache]
 TransientKVs = dict[str, tuple[jaxtyping.Array, jaxtyping.Array]]
 
 
-@dataclasses.dataclass
+@flax.struct.dataclass
 class GemmaOutput:
   """Output of the Gemma4 model.
 
@@ -1883,12 +1882,6 @@ class Gemma4(BackendMappingMixin, nnx.Module):
     # projections are collected as scan outputs and written into the cache
     # buffers post-hoc.
     if cache is not None and is_prefill:
-      logging.info(
-          "[Gemma4._forward_scan] Using scan-based prefill path"
-          " (num_layers=%d, frac_shared_layers=%s)",
-          num_layers,
-          self.config.frac_shared_layers,
-      )
       pattern_len = len(self.scan_pattern)
       num_scan_groups = num_layers // pattern_len
       seq_len = x.shape[1]
@@ -1902,77 +1895,113 @@ class Gemma4(BackendMappingMixin, nnx.Module):
         )
         scan_per_layer_inputs = jnp.transpose(reshaped, (2, 0, 1, 3, 4))
 
+      # Stack initial layer caches across groups for each pattern sub-layer.
+      scan_cache_list: list[dict[str, jaxtyping.Array]] = []
+      for sub_idx in range(pattern_len):
+        group_layer_indices = [
+            g * pattern_len + sub_idx for g in range(num_scan_groups)
+        ]
+        proto_i = next(
+            (
+                i
+                for i in group_layer_indices
+                if self.kv_cache_sharing_patterns[i] == i
+            ),
+            None,
+        )
+        if proto_i is not None:
+          proto_cache = cache[f"layer_{proto_i}"]
+          k_shape = proto_cache["k"].shape
+          v_shape = proto_cache["v"].shape
+          end_idx_shape = proto_cache["end_index"].shape
+          k_dtype = proto_cache["k"].dtype
+          v_dtype = proto_cache["v"].dtype
+          end_idx_dtype = proto_cache["end_index"].dtype
+        else:
+          proto_cache = None
+
+        ks: list[jaxtyping.Array] = []
+        vs: list[jaxtyping.Array] = []
+        end_indices: list[jaxtyping.Array] = []
+        for i in group_layer_indices:
+          if self.kv_cache_sharing_patterns[i] == i:
+            c = cache[f"layer_{i}"]
+            ks.append(c["k"])
+            vs.append(c["v"])
+            end_indices.append(c["end_index"])
+          else:
+            ks.append(jnp.zeros(k_shape, dtype=k_dtype))
+            vs.append(jnp.zeros(v_shape, dtype=v_dtype))
+            end_indices.append(jnp.zeros(end_idx_shape, dtype=end_idx_dtype))
+
+        scan_cache_list.append({
+            "k": jnp.stack(ks, axis=0),
+            "v": jnp.stack(vs, axis=0),
+            "end_index": jnp.stack(end_indices, axis=0),
+        })
+
+      scan_cache = tuple(scan_cache_list)
+
       @nnx.scan(
           in_axes=(
               nnx.Carry,
+              0,
               0,
               None,
               None,
               0 if scan_per_layer_inputs is not None else None,
               None,
           ),
-          out_axes=(nnx.Carry, tuple(
-              (0, 0) for _ in range(len(self.scan_pattern))
-          )),
+          out_axes=(
+              nnx.Carry,
+              tuple(
+                  {"k": 0, "v": 0, "end_index": 0} for _ in range(pattern_len)
+              ),
+          ),
       )
       def scan_prefill_body(
           x,
           group,
+          group_cache,
           positions,
           attn_mask,
           group_per_layer_inputs,
           segment_ids,
       ):
-        x, kvs = group(
+        new_group_cache: dict[int, LayerCache] = {}
+        x = group(
             x,
             positions,
             attn_mask,
+            cache=group_cache,
             per_layer_inputs=group_per_layer_inputs,
+            new_cache=new_group_cache,
             segment_ids=segment_ids,
-            collect_kvs=True,
         )
-        return x, kvs
+        return x, tuple(new_group_cache[sub] for sub in range(pattern_len))
 
-      x, all_kvs = scan_prefill_body(
+      x, updated_scan_cache = scan_prefill_body(
           x,
           self.scan_groups,
+          scan_cache,
           positions,
           attention_mask,
           scan_per_layer_inputs,
           segment_ids,
       )
-      # all_kvs: tuple of (k, v) per sub-layer, each stacked to
-      #   (num_scan_groups, B, T, kv_heads, head_dim)
 
-      # Populate cache post-hoc from collected KV projections.
+      # Unstack updated scan cache back into new_cache dict.
       for i in range(num_layers):
-        layer_name = f"layer_{i}"
         if self.kv_cache_sharing_patterns[i] != i:
           continue  # Shared layers have no cache entry.
 
         group_idx = i // pattern_len
         sub_idx = i % pattern_len
-        key_proj = all_kvs[sub_idx][0][group_idx]
-        value_proj = all_kvs[sub_idx][1][group_idx]
-
-        layer_cache = cache[layer_name]
-        cache_len = layer_cache["v"].shape[1]
-
-        # Unified sliding-window / full-cache fill.  When
-        # cache_len >= seq_len the modular arithmetic reduces to a
-        # plain prefix write.
-        valid_len = min(seq_len, cache_len)
-        latest_indices = (
-            jnp.arange(seq_len - valid_len, seq_len) % cache_len
-        )
-        new_cache[layer_name] = {
-            "v": layer_cache["v"]
-            .at[:, latest_indices, ...]
-            .set(value_proj[:, -valid_len:, ...]),
-            "k": layer_cache["k"]
-            .at[:, latest_indices, ...]
-            .set(key_proj[:, -valid_len:, ...]),
-            "end_index": layer_cache["end_index"] + seq_len,
+        c = updated_scan_cache[sub_idx]
+        new_cache[f"layer_{i}"] = {
+            "k": c["k"][group_idx],
+            "v": c["v"][group_idx],
+            "end_index": c["end_index"][group_idx],
         }
       return x
 
