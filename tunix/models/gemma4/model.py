@@ -45,7 +45,7 @@ from tunix.generate.mappings import BackendMappingMixin
 from tunix.models.gemma4 import moe
 from tunix.utils import compat
 from tunix.utils import env_utils
-from tunix.utils.sharding_utils import shard
+from tunix.utils.sharding_utils import get_current_mesh, shard
 
 # JAX checkpoint policy type — matches nnx.remat's policy parameter.
 CheckpointPolicy = Callable[..., bool]
@@ -963,7 +963,7 @@ class Attention(nnx.Module):
       key_proj = key_proj.transpose(0, 2, 1, 3)
       value_proj = value_proj.transpose(0, 2, 1, 3)
 
-      mesh = pxla.thread_resources.env.physical_mesh
+      mesh = get_current_mesh()
       if self.attn_type == AttentionType.LOCAL_SLIDING:
         mask = mask_lib.LocalMask(
             (seq_len, seq_len),

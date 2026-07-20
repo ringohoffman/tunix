@@ -1057,6 +1057,30 @@ class ScanShardingSpecTest(absltest.TestCase):
     except Exception as e:  # pylint: disable=broad-except
       self.fail(f'Non-scan 31b optimizer raised under fsdp=32 mesh: {e}')
 
+  def test_init_cache_stacked_cache_sharding_under_mesh(self):
+    """StackedCache tensors must be partitioned by batch axis (shd_b) under mesh."""
+    config = _make_config(num_layers=12, use_scan_layers=True)
+    with use_abstract_mesh(self._MESH):
+      model = model_lib.Gemma4(config, rngs=nnx.Rngs(0))
+      stacked_cache = model.init_cache(
+          batch_size=32, max_seq_len=64, dtype=jnp.float32
+      )
+      self.assertIsInstance(stacked_cache, tuple)
+      for sub_cache in stacked_cache:
+        if sub_cache is None:
+          continue
+        k_sharding = getattr(sub_cache['k'], 'sharding', None)
+        v_sharding = getattr(sub_cache['v'], 'sharding', None)
+        self.assertIsNotNone(
+            k_sharding, msg="Stacked cache 'k' missing sharding spec"
+        )
+        self.assertIsNotNone(
+            v_sharding, msg="Stacked cache 'v' missing sharding spec"
+        )
+        if isinstance(k_sharding, jax.sharding.NamedSharding):
+          self.assertEqual(k_sharding.spec[0], None)
+          self.assertEqual(k_sharding.spec[1], 'fsdp')
+
 
 def _unstack_cache(
     stacked_cache: model_lib.StackedCache,
