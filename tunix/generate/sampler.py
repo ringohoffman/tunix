@@ -25,6 +25,7 @@ import time
 
 from absl import logging
 import flax
+import flax.typing
 from flax import nnx
 from flax.nnx import filterlib
 from flax.nnx import graph
@@ -233,10 +234,14 @@ class Sampler(base_sampler.BaseSampler):
         eos_tokens if eos_tokens is not None else [self.tokenizer.eos_id()]
     )
     self._transformer_graphdef: graph.NodeDef = nnx.graphdef(transformer)
-    self._transformer_state: list[statelib.State] = nnx.variables(transformer)
-    self._flattened_transformer_state: list[statelib.State] = jax.tree.leaves(
-        self._transformer_state,
-        is_leaf=lambda x: isinstance(x, nnx.Variable),
+    self._transformer_state: nnx.State[
+      flax.typing.PathParts, nnx.Variable[jax.Array]
+    ] = nnx.variables(transformer)
+    self._flattened_transformer_state: list[
+      nnx.Variable[jax.Array]
+    ] = jax.tree.leaves(
+      self._transformer_state,
+      is_leaf=lambda x: isinstance(x, nnx.Variable),
     )
     # We separate out state and graph def so that the state can be passed as an
     # argument to _decode_fn, resulting in it not being treated as a static
