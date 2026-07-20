@@ -21,6 +21,7 @@ import enum
 from collections.abc import Callable
 from functools import partial
 import itertools
+import logging
 from typing import Any, Literal, Tuple
 import flax
 from flax import nnx
@@ -1881,11 +1882,13 @@ class Gemma4(BackendMappingMixin, nnx.Module):
     # for 42 layers with inline shard_map + splash attention).  KV
     # projections are collected as scan outputs and written into the cache
     # buffers post-hoc.
-    if (
-        cache is not None
-        and is_prefill
-        and self.config.frac_shared_layers == 0
-    ):
+    if cache is not None and is_prefill:
+      logging.info(
+          "[Gemma4._forward_scan] Using scan-based prefill path"
+          " (num_layers=%d, frac_shared_layers=%s)",
+          num_layers,
+          self.config.frac_shared_layers,
+      )
       pattern_len = len(self.scan_pattern)
       num_scan_groups = num_layers // pattern_len
       seq_len = x.shape[1]
