@@ -755,64 +755,54 @@ class ScanGenerationEquivalenceTest(absltest.TestCase):
     )
 
   def test_generation_with_shared_kv_layers(self):
-    """Verify scan prefill + decode is internally consistent with KV sharing.
+    """Verify scan prefill + decode numerically matches the unrolled loop.
 
-    When ``frac_shared_layers > 0``, the scan prefill path intentionally
-    differs from the unrolled loop path: the loop path forwards origin
-    layer KVs via ``kv_shared_cache`` to shared layers during prefill,
-    while the scan path lets each layer compute its own KVs (matching
-    training behavior).  This makes a direct logit comparison invalid.
-
-    Instead we verify:
-      1. The scan model produces finite prefill output.
-      2. Cache entries are correctly populated for origin layers.
-      3. A decode step after prefill produces finite, valid logits.
+    With ``frac_shared_layers > 0``, origin layer KV caches are forwarded
+    to shared layers via the carry-based ``kv_override`` mechanism in the
+    scan path, which should produce numerically identical results to the
+    loop path's ``kv_shared_cache`` forwarding.
     """
-    _, scan_model, config = _make_paired_models(
+    loop_model, scan_model, config = _make_paired_models(
         num_layers=12, frac_shared_layers=0.5
     )
 
+    loop_cache = loop_model.init_cache(
+        batch_size=2, max_seq_len=16, dtype=jnp.float32
+    )
     scan_cache = scan_model.init_cache(
         batch_size=2, max_seq_len=16, dtype=jnp.float32
     )
 
     tokens, positions, attn_mask = _make_inputs(config, batch_size=2, seq_len=8)
 
+    # --- Prefill ---
+    loop_out = loop_model(
+        tokens, positions=positions, cache=loop_cache, attention_mask=attn_mask
+    )
     scan_out = scan_model(
         tokens, positions=positions, cache=scan_cache, attention_mask=attn_mask
     )
 
-    # 1. Prefill logits are finite.
-    self.assertTrue(
-        jnp.all(jnp.isfinite(scan_out.logits)),
-        msg='Scan prefill with shared KV layers produced non-finite logits.',
+    _assert_close(
+        self,
+        loop_out.logits,
+        scan_out.logits,
+        msg='Shared-KV prefill logits mismatch.',
     )
 
-    # 2. Cache entries exist for origin (non-shared) layers.
-    unstacked_cache = (
-        _unstack_cache(
-            scan_out.cache,
-            config.num_layers,
-            len(_PATTERN),
-            scan_model.kv_cache_sharing_patterns,
-        )
-        if isinstance(scan_out.cache, tuple)
-        else scan_out.cache
-    )
-    for i in range(config.num_layers):
-      layer_name = f'layer_{i}'
-      if scan_model.kv_cache_sharing_patterns[i] == i:
-        self.assertIn(
-            layer_name, unstacked_cache, msg=f'Missing cache for {layer_name}'
-        )
-
-    # 3. Decode step after prefill produces finite logits.
+    # --- Decode step ---
     tok_decode = jax.random.randint(
         jax.random.PRNGKey(1), (2, 1), 0, config.num_embed
     )
     pos_decode = jnp.full((2, 1), 8)
     mask_decode = jnp.ones((2, 1, 16), dtype=jnp.bool_)
 
+    loop_dec = loop_model(
+        tok_decode,
+        positions=pos_decode,
+        cache=loop_out.cache,
+        attention_mask=mask_decode,
+    )
     scan_dec = scan_model(
         tok_decode,
         positions=pos_decode,
@@ -820,12 +810,11 @@ class ScanGenerationEquivalenceTest(absltest.TestCase):
         attention_mask=mask_decode,
     )
 
-    self.assertTrue(
-        jnp.all(jnp.isfinite(scan_dec.logits)),
-        msg=(
-            'Decode after scan prefill with shared KV layers produced'
-            ' non-finite logits.'
-        ),
+    _assert_close(
+        self,
+        loop_dec.logits,
+        scan_dec.logits,
+        msg='Shared-KV decode logits mismatch.',
     )
 
   def test_generation_with_per_layer_inputs(self):

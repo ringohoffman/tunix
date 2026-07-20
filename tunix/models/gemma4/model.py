@@ -19,7 +19,8 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator
 import dataclasses
 import enum
-from functools import partial
+import functools
+import inspect
 import itertools
 from typing import Any, Literal, Self, Tuple, overload
 from typing_extensions import Unpack
@@ -52,10 +53,8 @@ CheckpointPolicy = Callable[..., bool]
 
 env_utils.setup_sharding_environment()
 
-import inspect as _inspect
-
 _REMAT_SUPPORTS_GRAPH_UPDATES = (
-    "graph_updates" in _inspect.signature(nnx.remat).parameters
+    "graph_updates" in inspect.signature(nnx.remat).parameters
 )
 
 
@@ -896,6 +895,8 @@ class Attention(nnx.Module):
       cache: LayerCache | None,
       attn_mask: jaxtyping.Array,
       kv_shared_cache: LayerCache | None = None,
+      kv_override: LayerCache | None = None,
+      use_kv_override: jaxtyping.Array | None = None,
       segment_ids: jaxtyping.Array | None = None,
   ) -> tuple[
       LayerCache | None,
@@ -995,6 +996,32 @@ class Attention(nnx.Module):
           "k": key_proj,
       }
 
+    # KV override for scan-based cache sharing.  When use_kv_override is
+    # True (shared layer), swap K/V with the origin's cache for attention
+    # and suppress the cache write so the shared layer's output cache
+    # contains the origin's cache rather than its own wasted projections.
+    if kv_override is not None and use_kv_override is not None:
+      if seq_len > 1:  # prefill: key_proj is raw [B, seq_len, H, D]
+        key_proj = jnp.where(
+            use_kv_override, kv_override["k"][:, :seq_len], key_proj
+        )
+        value_proj = jnp.where(
+            use_kv_override, kv_override["v"][:, :seq_len], value_proj
+        )
+      else:  # decode: key_proj is full cache [B, cache_len, H, D]
+        key_proj = jnp.where(use_kv_override, kv_override["k"], key_proj)
+        value_proj = jnp.where(use_kv_override, kv_override["v"], value_proj)
+      if cache is not None:
+        new_cache = {
+            "k": jnp.where(use_kv_override, kv_override["k"], new_cache["k"]),
+            "v": jnp.where(use_kv_override, kv_override["v"], new_cache["v"]),
+            "end_index": jnp.where(
+                use_kv_override,
+                kv_override["end_index"],
+                new_cache["end_index"],
+            ),
+        }
+
     b, _, qh, _ = query_proj.shape
     _, _, kh, _ = key_proj.shape
 
@@ -1066,7 +1093,7 @@ class Attention(nnx.Module):
         seg_spec = P(shd_b, shd_t)
         unsharded_seg_spec = P(shd_b, None)
 
-        @partial(
+        @functools.partial(
             shard_map,
             mesh=mesh,
             in_specs=(
@@ -1110,7 +1137,7 @@ class Attention(nnx.Module):
         )
       else:
 
-        @partial(
+        @functools.partial(
             shard_map,
             mesh=mesh,
             in_specs=(
@@ -1235,6 +1262,8 @@ class Attention(nnx.Module):
       cache,
       attn_mask,
       kv_shared_cache=None,
+      kv_override=None,
+      use_kv_override=None,
       segment_ids=None,
   ):
     remat_config = getattr(self.config, "remat_config", RematConfig.NONE)
@@ -1246,7 +1275,8 @@ class Attention(nnx.Module):
       # as the first argument. graph_updates=False prevents TraceContextError
       # when mutating params across jax transformation trace levels.
       return _compat_remat(self.block.__func__, graph_updates=False)(
-          self, x, segment_pos, cache, attn_mask, kv_shared_cache, segment_ids
+          self, x, segment_pos, cache, attn_mask, kv_shared_cache,
+          kv_override, use_kv_override, segment_ids
       )
     else:
       return self.block(
@@ -1255,6 +1285,8 @@ class Attention(nnx.Module):
           cache,
           attn_mask,
           kv_shared_cache=kv_shared_cache,
+          kv_override=kv_override,
+          use_kv_override=use_kv_override,
           segment_ids=segment_ids,
       )
 
@@ -1465,6 +1497,8 @@ class DecoderLayer(nnx.Module):
       attn_mask,
       per_layer_input=None,
       kv_shared_cache=None,
+      kv_override=None,
+      use_kv_override=None,
       segment_ids=None,
   ):
     x = checkpoint_name(x, "decoder_input")
@@ -1475,6 +1509,8 @@ class DecoderLayer(nnx.Module):
         cache,
         attn_mask,
         kv_shared_cache=kv_shared_cache,
+        kv_override=kv_override,
+        use_kv_override=use_kv_override,
         segment_ids=segment_ids,
     )
     attn = self.post_attention_norm(attn)
@@ -1511,6 +1547,8 @@ class DecoderLayer(nnx.Module):
       attn_mask,
       per_layer_input=None,
       kv_shared_cache=None,
+      kv_override=None,
+      use_kv_override=None,
       segment_ids=None,
   ):
     remat_config = getattr(self.config, "remat_config", RematConfig.NONE)
@@ -1526,6 +1564,8 @@ class DecoderLayer(nnx.Module):
           attn_mask,
           per_layer_input,
           kv_shared_cache,
+          kv_override,
+          use_kv_override,
           segment_ids,
       )
     else:
@@ -1536,6 +1576,8 @@ class DecoderLayer(nnx.Module):
           attn_mask,
           per_layer_input,
           kv_shared_cache,
+          kv_override=kv_override,
+          use_kv_override=use_kv_override,
           segment_ids=segment_ids,
       )
 
@@ -1580,6 +1622,9 @@ class ScanLayerGroup(nnx.Module):
       positions: jaxtyping.Array,
       attn_mask: jaxtyping.Array,
       cache: tuple | list | None = None,
+      origin_kv: tuple | None = None,
+      is_shared: jaxtyping.Array | None = None,
+      origin_sub_indices: list | None = None,
       per_layer_inputs: jaxtyping.Array | None = None,
       new_cache: dict | None = None,
       segment_ids: jaxtyping.Array | None = None,
@@ -1589,11 +1634,14 @@ class ScanLayerGroup(nnx.Module):
       layer_cache = (
           cache[sub_idx] if cache is not None and sub_idx < len(cache) else None
       )
-      kv_shared_cache = None
-      if cache is not None and layer_cache is None:
-        origin_sub_idx = sub_idx - 1 if sub_idx > 0 else 0
-        if origin_sub_idx < len(cache):
-          kv_shared_cache = cache[origin_sub_idx]
+
+      # Resolve KV override for scan-based cache sharing.
+      kv_override = None
+      use_kv_override = None
+      if origin_kv is not None and is_shared is not None:
+        origin_s = origin_sub_indices[sub_idx]
+        kv_override = origin_kv[origin_s]
+        use_kv_override = is_shared[sub_idx]
 
       pli = (
           per_layer_inputs[:, :, sub_idx, :]
@@ -1607,7 +1655,8 @@ class ScanLayerGroup(nnx.Module):
           layer_cache,
           attn_mask,
           per_layer_input=pli,
-          kv_shared_cache=kv_shared_cache,
+          kv_override=kv_override,
+          use_kv_override=use_kv_override,
           segment_ids=segment_ids,
       )
       if new_cache is not None and layer_cache is not None:
@@ -1997,6 +2046,68 @@ class Gemma4(BackendMappingMixin, nnx.Module):
 
         scan_cache = tuple(scan_cache_list)
 
+      # --- Compute sharing metadata for cross-group KV forwarding ---
+      # origin_sub_indices: for each sub-layer position, which sub-position
+      # holds its origin cache.  Constant across groups.
+      origin_sub_indices = list(range(pattern_len))
+      is_origin_sub = [False] * pattern_len
+      is_shared_per_group = np.zeros(
+          (num_scan_groups, pattern_len), dtype=np.bool_
+      )
+      is_origin_per_group = np.zeros(
+          (num_scan_groups, pattern_len), dtype=np.bool_
+      )
+      has_sharing = False
+      for g in range(num_scan_groups):
+        for s in range(pattern_len):
+          layer_idx = g * pattern_len + s
+          origin_idx = self.kv_cache_sharing_patterns[layer_idx]
+          if origin_idx != layer_idx:
+            has_sharing = True
+            is_shared_per_group[g, s] = True
+            origin_sub_indices[s] = origin_idx % pattern_len
+            origin_g = origin_idx // pattern_len
+            is_origin_per_group[origin_g, origin_idx % pattern_len] = True
+            is_origin_sub[origin_idx % pattern_len] = True
+
+      if has_sharing:
+        is_shared_jax = jnp.array(is_shared_per_group)
+        is_origin_jax = jnp.array(is_origin_per_group)
+
+        # Find which group contains the origin for each sub-layer.
+        origin_group_for_sub = [0] * pattern_len
+        for s in range(pattern_len):
+          if is_origin_sub[s]:
+            for g in range(num_scan_groups):
+              if is_origin_per_group[g, s]:
+                origin_group_for_sub[s] = g
+                break
+
+        # Initialize origin_kv carry from stacked cache.
+        origin_kv_init: tuple[LayerCache, ...] = tuple(
+            {
+                "k": scan_cache[s]["k"][origin_group_for_sub[s]],
+                "v": scan_cache[s]["v"][origin_group_for_sub[s]],
+                "end_index": scan_cache[s]["end_index"][
+                    origin_group_for_sub[s]
+                ],
+            }
+            if scan_cache[s] is not None
+            else {
+                "k": jnp.zeros_like(scan_cache[0]["k"][0]),
+                "v": jnp.zeros_like(scan_cache[0]["v"][0]),
+                "end_index": jnp.zeros_like(scan_cache[0]["end_index"][0]),
+            }
+            for s in range(pattern_len)
+        )
+        sharing_metadata = (is_shared_jax, is_origin_jax)
+        sharing_in_axis = (0, 0)
+        carry_init = (x, origin_kv_init)
+      else:
+        sharing_metadata = None
+        sharing_in_axis = None
+        carry_init = x
+
       @nnx.scan(
           in_axes=(
               nnx.Carry,
@@ -2004,6 +2115,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
               0,
               None,
               None,
+              sharing_in_axis,
               0 if scan_per_layer_inputs is not None else None,
               None,
           ),
@@ -2015,35 +2127,76 @@ class Gemma4(BackendMappingMixin, nnx.Module):
           ),
       )
       def scan_cache_body(
-          x: jaxtyping.Array,
+          carry,
           group: ScanLayerGroup,
           group_cache: tuple[dict[str, jaxtyping.Array], ...],
           positions: jaxtyping.Array,
           attn_mask: jaxtyping.Array,
+          sharing_meta,
           group_per_layer_inputs: jaxtyping.Array | None,
           segment_ids: jaxtyping.Array | None,
-      ) -> tuple[jaxtyping.Array, tuple[dict[str, jaxtyping.Array], ...]]:
+      ):
+        if has_sharing:
+          x, origin_kv = carry
+          is_shared_slice, is_origin_slice = sharing_meta
+        else:
+          x = carry
+          origin_kv = None
+          is_shared_slice = None
+
         new_group_cache: dict[int, LayerCache] = {}
         x = group(
             x,
             positions,
             attn_mask,
             cache=group_cache,
+            origin_kv=origin_kv,
+            is_shared=is_shared_slice,
+            origin_sub_indices=(
+                origin_sub_indices if has_sharing else None
+            ),
             per_layer_inputs=group_per_layer_inputs,
             new_cache=new_group_cache,
             segment_ids=segment_ids,
         )
-        return x, tuple(new_group_cache[sub] for sub in range(pattern_len))
 
-      x, updated_scan_cache = scan_cache_body(
-          x,
+        out_cache = tuple(
+            new_group_cache[sub] for sub in range(pattern_len)
+        )
+
+        if has_sharing:
+          # Update origin_kv carry: for sub-positions that are origins in
+          # this group, write their updated caches into the carry.
+          updated_origin_kv = tuple(
+              {
+                  key: jnp.where(
+                      is_origin_slice[s],
+                      new_group_cache[s][key],
+                      origin_kv[s][key],
+                  )
+                  for key in ("k", "v", "end_index")
+              }
+              for s in range(pattern_len)
+          )
+          return (x, updated_origin_kv), out_cache
+        else:
+          return x, out_cache
+
+      result = scan_cache_body(
+          carry_init,
           self.scan_groups,
           scan_cache,
           positions,
           attention_mask,
+          sharing_metadata,
           scan_per_layer_inputs,
           segment_ids,
       )
+
+      if has_sharing:
+        (x, _), updated_scan_cache = result
+      else:
+        x, updated_scan_cache = result
 
       if is_stacked_cache:
         out_cache = updated_scan_cache
