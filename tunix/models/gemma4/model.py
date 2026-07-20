@@ -1886,7 +1886,11 @@ class Gemma4(BackendMappingMixin, nnx.Module):
         reshaped = per_layer_inputs.reshape(
             (b, t, num_scan_groups, pattern_len, d)
         )
-        scan_per_layer_inputs = jnp.transpose(reshaped, (2, 0, 1, 3, 4))
+        shd_b, shd_t, _, _ = self.config.shd_config.act_btnh
+        scan_per_layer_inputs = shard(
+            jnp.transpose(reshaped, (2, 0, 1, 3, 4)),
+            (None, shd_b, shd_t, None, None),
+        )
 
       is_stacked_cache = isinstance(cache, (tuple, list))
       if is_stacked_cache:
@@ -1937,10 +1941,12 @@ class Gemma4(BackendMappingMixin, nnx.Module):
                     jnp.zeros(end_idx_shape, dtype=end_idx_dtype)
                 )
 
+            shd_btnh = (None, *self.config.shd_config.act_btnh)
+            shd_b = (None, *self.config.shd_config.act_btnh[:1])
             scan_cache_list.append({
-                "k": jnp.stack(ks, axis=0),
-                "v": jnp.stack(vs, axis=0),
-                "end_index": jnp.stack(end_indices, axis=0),
+                "k": shard(jnp.stack(ks, axis=0), shd_btnh),
+                "v": shard(jnp.stack(vs, axis=0), shd_btnh),
+                "end_index": shard(jnp.stack(end_indices, axis=0), shd_b),
             })
           else:
             scan_cache_list.append(None)
@@ -2036,7 +2042,11 @@ class Gemma4(BackendMappingMixin, nnx.Module):
       reshaped = per_layer_inputs.reshape(
           (b, t, num_scan_groups, pattern_len, d)
       )
-      scan_per_layer_inputs = jnp.transpose(reshaped, (2, 0, 1, 3, 4))
+      shd_b, shd_t, _, _ = self.config.shd_config.act_btnh
+      scan_per_layer_inputs = shard(
+          jnp.transpose(reshaped, (2, 0, 1, 3, 4)),
+          (None, shd_b, shd_t, None, None),
+      )
 
     @nnx.scan(
         in_axes=(
@@ -2100,18 +2110,32 @@ class Gemma4(BackendMappingMixin, nnx.Module):
         if proto_i is not None:
           sub_layer = self.scan_groups.sub_layers[sub_idx]
           proto_cache = sub_layer.init_cache(batch_size, max_seq_len, dtype)
+          shd_btnh = (None, *self.config.shd_config.act_btnh)
+          shd_b = (None, *self.config.shd_config.act_btnh[:1])
           scan_cache_list.append({
-              "k": jnp.zeros(
-                  (num_scan_groups, *proto_cache["k"].shape),
-                  dtype=proto_cache["k"].dtype,
+              "k": shard(
+                  jnp.zeros(
+                      (num_scan_groups, *proto_cache["k"].shape),
+                      dtype=proto_cache["k"].dtype,
+                  ),
+                  shd_btnh,
+                  eager=True,
               ),
-              "v": jnp.zeros(
-                  (num_scan_groups, *proto_cache["v"].shape),
-                  dtype=proto_cache["v"].dtype,
+              "v": shard(
+                  jnp.zeros(
+                      (num_scan_groups, *proto_cache["v"].shape),
+                      dtype=proto_cache["v"].dtype,
+                  ),
+                  shd_btnh,
+                  eager=True,
               ),
-              "end_index": jnp.zeros(
-                  (num_scan_groups, *proto_cache["end_index"].shape),
-                  dtype=proto_cache["end_index"].dtype,
+              "end_index": shard(
+                  jnp.zeros(
+                      (num_scan_groups, *proto_cache["end_index"].shape),
+                      dtype=proto_cache["end_index"].dtype,
+                  ),
+                  shd_b,
+                  eager=True,
               ),
           })
         else:
