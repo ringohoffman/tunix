@@ -2114,7 +2114,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
           shd_b = (None, *self.config.shd_config.act_btnh[:1])
           scan_cache_list.append({
               "k": shard(
-                  jnp.zeros(
+                  np.zeros(
                       (num_scan_groups, *proto_cache["k"].shape),
                       dtype=proto_cache["k"].dtype,
                   ),
@@ -2122,7 +2122,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
                   eager=True,
               ),
               "v": shard(
-                  jnp.zeros(
+                  np.zeros(
                       (num_scan_groups, *proto_cache["v"].shape),
                       dtype=proto_cache["v"].dtype,
                   ),
@@ -2130,7 +2130,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
                   eager=True,
               ),
               "end_index": shard(
-                  jnp.zeros(
+                  np.zeros(
                       (num_scan_groups, *proto_cache["end_index"].shape),
                       dtype=proto_cache["end_index"].dtype,
                   ),
