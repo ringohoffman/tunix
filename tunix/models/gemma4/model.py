@@ -73,6 +73,7 @@ def _compat_remat(
 
 LayerCache = dict[str, jaxtyping.Array]
 Cache = dict[str, LayerCache]
+TransientKVs = dict[str, tuple[jaxtyping.Array, jaxtyping.Array]]
 
 
 @dataclasses.dataclass
@@ -733,7 +734,7 @@ def create_kv_cache_sharing_patterns(
     attention_types: tuple[AttentionType, ...],
 ) -> list[int]:
   """Creates a list of layer indices for which KV cache is used."""
-  kv_cache_sharing_patterns = []
+  kv_cache_sharing_patterns: list[int] = []
   num_unshared_layers = int(num_layers - frac_shared_layers * num_layers)
   for i in range(num_layers):
     if i < num_unshared_layers:
@@ -1524,19 +1525,27 @@ class ScanLayerGroup(nnx.Module):
       x: jaxtyping.Array,
       positions: jaxtyping.Array,
       attn_mask: jaxtyping.Array,
+      cache: tuple | list | None = None,
+      per_layer_inputs: jaxtyping.Array | None = None,
+      new_cache: dict | None = None,
       segment_ids: jaxtyping.Array | None = None,
   ) -> jaxtyping.Array:
-    """Run one pattern-group of layers. Training-only (no cache)."""
-    for layer in self.sub_layers:
-      _, x, _ = layer(
+    """Run one pattern-group of layers with full scan compatibility."""
+    for sub_idx, layer in enumerate(self.sub_layers):
+      layer_cache = cache[sub_idx] if cache is not None and sub_idx < len(cache) else None
+      pli = per_layer_inputs[:, :, sub_idx, :] if per_layer_inputs is not None else None
+
+      layer_cache, x, _ = layer(
           x,
           positions,
-          None,  # cache=None for training
+          layer_cache,
           attn_mask,
-          per_layer_input=None,
-          kv_shared_cache=None,
+          per_layer_input=pli,
           segment_ids=segment_ids,
       )
+      if new_cache is not None and layer_cache is not None:
+        new_cache[sub_idx] = layer_cache
+
     return x
 
 
@@ -1640,16 +1649,6 @@ class Gemma4(BackendMappingMixin, nnx.Module):
           f"use_scan_layers requires num_layers ({config.num_layers}) to be "
           f"divisible by the attention pattern length ({pattern_len})."
       )
-    if config.frac_shared_layers > 0:
-      raise ValueError(
-          "use_scan_layers is not compatible with KV cache sharing "
-          "(frac_shared_layers > 0)."
-      )
-    if config.per_layer_input_dim > 0:
-      raise ValueError(
-          "use_scan_layers is not yet compatible with per-layer inputs "
-          "(per_layer_input_dim > 0)."
-      )
     self.num_scan_groups = config.num_layers // pattern_len
     self.scan_pattern = pattern
 
@@ -1713,7 +1712,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
       positions = jnp.tile(jnp.arange(T)[None, :], (B, 1))
 
     return_cache = cache is not None
-    new_cache = {}
+    new_cache: Cache = {}
     x = self.embedder.encode(tokens)
 
     per_layer_inputs = None
@@ -1722,24 +1721,25 @@ class Gemma4(BackendMappingMixin, nnx.Module):
 
     # Stores the raw KV projections for the current forward pass. Used for
     # KV cache sharing during prefill.
-    transient_kvs = {}
+    transient_kvs: TransientKVs = {}
     is_prefill = tokens.shape[1] > 1
 
-    if self.config.use_scan_layers and cache is None:
-      x = self._forward_scan(x, positions, attention_mask, segment_ids)
-    else:
-      x = self._forward_loop(
-          x,
-          positions,
-          cache,
-          attention_mask,
-          per_layer_inputs,
-          new_cache,
-          transient_kvs,
-          is_prefill,
-          segment_ids,
-      )
-
+    forward_fn = (
+        self._forward_scan
+        if self.config.use_scan_layers
+        else self._forward_loop
+    )
+    x = forward_fn(
+        x,
+        positions,
+        cache=cache,
+        attention_mask=attention_mask,
+        per_layer_inputs=per_layer_inputs,
+        new_cache=new_cache,
+        transient_kvs=transient_kvs,
+        is_prefill=is_prefill,
+        segment_ids=segment_ids,
+    )
     x = self.final_norm(x)
 
     # Sparse gather: select specific hidden states before the expensive decode.
@@ -1772,28 +1772,31 @@ class Gemma4(BackendMappingMixin, nnx.Module):
       cache: Cache | None,
       attention_mask: jaxtyping.Array,
       per_layer_inputs: jaxtyping.Array | None,
-      new_cache: dict,
-      transient_kvs: dict,
+      new_cache: Cache,
+      transient_kvs: TransientKVs,
       is_prefill: bool,
       segment_ids: jaxtyping.Array | None,
   ) -> jaxtyping.Array:
-    """Original for-loop forward pass over layers."""
+    """For-loop forward pass over layers with full feature parity and pre-merged scan layers."""
     num_layers = self.config.num_layers
     if self.config.use_scan_layers:
       pattern_len = len(self.scan_pattern)
       sub_layer_splits = [
           nnx.split(sub_layer) for sub_layer in self.scan_groups.sub_layers
       ]
+      unrolled_layers: list[DecoderLayer] = []
+      for i in range(num_layers):
+        group_idx = i // pattern_len
+        sub_idx = i % pattern_len
+        graphdef, state = sub_layer_splits[sub_idx]
+        layer_state = jax.tree.map(lambda leaf: leaf[group_idx], state)
+        unrolled_layers.append(nnx.merge(graphdef, layer_state))
 
     for i in range(num_layers):
       layer_name = f"layer_{i}"
 
       if self.config.use_scan_layers:
-        group_idx = i // pattern_len
-        sub_idx = i % pattern_len
-        graphdef, state = sub_layer_splits[sub_idx]
-        layer_state = jax.tree.map(lambda leaf: leaf[group_idx], state)
-        layer = nnx.merge(graphdef, layer_state)
+        layer = unrolled_layers[i]
       else:
         layer = self.layers[i]
 
@@ -1833,32 +1836,128 @@ class Gemma4(BackendMappingMixin, nnx.Module):
       self,
       x: jaxtyping.Array,
       positions: jaxtyping.Array,
+      cache: Cache | None,
       attention_mask: jaxtyping.Array,
+      per_layer_inputs: jaxtyping.Array | None,
+      new_cache: Cache,
+      transient_kvs: TransientKVs,
+      is_prefill: bool,
       segment_ids: jaxtyping.Array | None,
   ) -> jaxtyping.Array:
-    """Scan-based forward pass. Training only (cache=None).
+    """Scan-based forward pass compiling into a single XLA while_loop in HLO (or unrolled for cache generation)."""
+    num_layers = self.config.num_layers
+    if cache is not None:
+      pattern_len = len(self.scan_pattern)
+      sub_layer_splits = [
+          nnx.split(sub_layer) for sub_layer in self.scan_groups.sub_layers
+      ]
+      unrolled_layers: list[DecoderLayer] = []
+      for i in range(num_layers):
+        group_idx = i // pattern_len
+        sub_idx = i % pattern_len
+        graphdef, state = sub_layer_splits[sub_idx]
+        layer_state = jax.tree.map(lambda leaf: leaf[group_idx], state)
+        unrolled_layers.append(nnx.merge(graphdef, layer_state))
 
-    Produces a while loop in HLO: the body is one pattern-group of layers,
-    executed num_scan_groups times. The schedule is perfectly tiled.
-    """
+      for i in range(num_layers):
+        layer_name = f"layer_{i}"
+        layer = unrolled_layers[i]
 
-    @nnx.scan(in_axes=(nnx.Carry, 0, None, None, None), out_axes=nnx.Carry)
+        shared_idx = self.kv_cache_sharing_patterns[i]
+        is_shared = shared_idx != i
+        if is_shared:
+          assert shared_idx in self.shared_layer_origins
+          layer_cache = None
+          shared_layer_name = f"layer_{shared_idx}"
+          if is_prefill:
+            shared_k, shared_v = transient_kvs[shared_layer_name]
+            kv_shared_cache = {"k": shared_k, "v": shared_v}
+          else:
+            kv_shared_cache = new_cache.get(shared_layer_name)
+        else:
+          layer_cache = cache[layer_name] if cache else None
+          kv_shared_cache = None
+
+        layer_cache, x, layers_kvs = layer(
+            x,
+            positions,
+            layer_cache,
+            attention_mask,
+            per_layer_input=per_layer_inputs[:, :, i, :]
+            if per_layer_inputs is not None
+            else None,
+            kv_shared_cache=kv_shared_cache,
+            segment_ids=segment_ids,
+        )
+        if is_prefill and i in self.shared_layer_origins:
+          transient_kvs[layer_name] = layers_kvs
+        if not is_shared:
+          new_cache[layer_name] = layer_cache
+      return x
+
+    # --- True scan path (training, cache=None) ---
+    # KV cache sharing (frac_shared_layers > 0) is not supported in the
+    # scan training path because ScanLayerGroup does not forward
+    # kv_shared_cache to sub-layers.  Inference with shared layers works
+    # via the unrolled cache path above.
+    if self.config.frac_shared_layers > 0:
+      raise ValueError(
+          "use_scan_layers with frac_shared_layers > 0 is not supported "
+          "for training (cache=None).  Use the for-loop path or provide "
+          "a cache to use the unrolled inference path."
+      )
+
+    pattern_len = len(self.scan_pattern)
+    num_scan_groups = self.config.num_layers // pattern_len
+
+    # Reshape per_layer_inputs: (B, T, N, D) -> (num_scan_groups, B, T, pattern_len, D)
+    scan_per_layer_inputs = None
+    if per_layer_inputs is not None:
+      b, t, _, d = per_layer_inputs.shape
+      reshaped = per_layer_inputs.reshape((b, t, num_scan_groups, pattern_len, d))
+      scan_per_layer_inputs = jnp.transpose(reshaped, (2, 0, 1, 3, 4))
+
+    @nnx.scan(
+        in_axes=(
+            nnx.Carry,
+            0,
+            None,
+            None,
+            0 if scan_per_layer_inputs is not None else None,
+            None,
+        ),
+        out_axes=nnx.Carry,
+    )
     def scan_body(
         x: jaxtyping.Array,
         group: ScanLayerGroup,
         positions: jaxtyping.Array,
         attn_mask: jaxtyping.Array,
+        group_per_layer_inputs: jaxtyping.Array | None,
         segment_ids: jaxtyping.Array | None,
     ) -> jaxtyping.Array:
-      return group(x, positions, attn_mask, segment_ids)
+      return group(
+          x,
+          positions,
+          attn_mask,
+          per_layer_inputs=group_per_layer_inputs,
+          segment_ids=segment_ids,
+      )
 
-    x = scan_body(x, self.scan_groups, positions, attention_mask, segment_ids)
+    x = scan_body(
+        x,
+        self.scan_groups,
+        positions,
+        attention_mask,
+        scan_per_layer_inputs,
+        segment_ids,
+    )
     return x
 
   def init_cache(
       self, batch_size: int, max_seq_len: int, dtype: jnp.dtype
   ) -> Cache:
-    cache = {}
+    cache: Cache = {}
     if self.config.use_scan_layers:
       pattern_len = len(self.scan_pattern)
       for i in range(self.config.num_layers):

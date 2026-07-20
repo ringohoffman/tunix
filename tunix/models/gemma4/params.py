@@ -88,7 +88,16 @@ def _stack_layers_for_scan(
 
   for target_path, slices in collector.items():
     sorted_slices = [slices[i] for i in range(num_groups)]
-    new_flat[target_path] = jnp.stack(sorted_slices, axis=0)
+    if isinstance(sorted_slices[0], _ShapeTracer):
+      new_flat[target_path] = _ShapeTracer(
+          tuple(s.key for s in sorted_slices),
+          (num_groups,) + sorted_slices[0].shape,
+          sorted_slices[0]._transposed,
+          sorted_slices[0]._slice_idx,
+          sorted_slices[0].perm,
+      )
+    else:
+      new_flat[target_path] = jnp.stack(sorted_slices, axis=0)
 
   return flax.traverse_util.unflatten_dict(new_flat)
 
@@ -218,33 +227,40 @@ def _build_sharded_restore_target(
   # Invert traced operations to compute upstream PartitionSpecs.
   upstream_target: dict[tuple[str, ...], jax.ShapeDtypeStruct] = {}
   for downstream_key, tracer in flat_traced.items():
-    norm_downstream_key = (
-        (downstream_key[0], int(downstream_key[1])) + downstream_key[2:]
-        if (
-            len(downstream_key) >= 2
-            and downstream_key[0] == 'layers'
-            and isinstance(downstream_key[1], str)
-            and downstream_key[1].isdigit()
-        )
-        else downstream_key
+    norm_downstream_key = tuple(
+        int(k) if isinstance(k, str) and k.isdigit() else k
+        for k in downstream_key
     )
     # If using scan layers, map flat downstream key to scan group key.
     if (
         pattern_len > 0
-        and len(norm_downstream_key) >= 2
-        and norm_downstream_key[0] == 'layers'
-        and isinstance(norm_downstream_key[1], int)
-    ):
-      layer_idx = norm_downstream_key[1]
-      param_path = norm_downstream_key[2:]
-      sub_layer_idx = layer_idx % pattern_len
-      scan_key = ('scan_groups', 'sub_layers', sub_layer_idx) + param_path
-      if scan_key not in flat_shardings:
-        logging.info(
-            'Skipping sharded restore target for pruned scan key: %s',
-            '/'.join(str(p) for p in scan_key),
+        and len(norm_downstream_key) >= 1
+        and (
+            norm_downstream_key[0].startswith('layer_')
+            or norm_downstream_key[0] in ('scan_groups', 'layers')
         )
-        continue
+    ):
+      if norm_downstream_key[0] == 'scan_groups':
+        scan_key = norm_downstream_key
+      elif norm_downstream_key[0].startswith('layer_'):
+        layer_idx = int(norm_downstream_key[0].split('_')[1])
+        param_path = norm_downstream_key[1:]
+        sub_layer_idx = layer_idx % pattern_len
+        scan_key = ('scan_groups', 'sub_layers', sub_layer_idx) + param_path
+      else:
+        layer_idx = norm_downstream_key[1]
+        param_path = norm_downstream_key[2:]
+        sub_layer_idx = layer_idx % pattern_len
+        scan_key = ('scan_groups', 'sub_layers', sub_layer_idx) + param_path
+      if scan_key not in flat_shardings:
+        if ('scan_groups',) + scan_key in flat_shardings:
+          scan_key = ('scan_groups',) + scan_key
+        else:
+          logging.info(
+              'Skipping sharded restore target for pruned scan key: %s',
+              '/'.join(str(p) for p in scan_key),
+          )
+          continue
       sharding = flat_shardings[scan_key]
       # The stacked param's spec has a leading None for the scan/vmap axis
       # (prepended by _init_scan_layers Phase 2).  The checkpoint stores
