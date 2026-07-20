@@ -40,6 +40,7 @@ from tunix.generate import utils
 import tunix.generate.beam_search as beam_search_lib
 import tunix.generate.tokenizer_adapter as tok_adapter
 from tunix.processors import image_processor as image_processor_lib
+from tunix.utils.sharding_utils import get_current_mesh
 
 LayerCache = dict[str, jaxtyping.Array]
 Cache = dict[str, LayerCache]
@@ -1011,7 +1012,7 @@ class Sampler(base_sampler.BaseSampler):
           f' cache size {self.cache_config.cache_size}.'
       )
 
-    mesh = jax.sharding.get_abstract_mesh()
+    mesh = get_current_mesh()
     mesh_ctx = (
         jax.set_mesh(mesh)
         if (isinstance(mesh, jax.sharding.Mesh) and not mesh.empty)

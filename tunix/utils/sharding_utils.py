@@ -14,7 +14,17 @@
 
 import jax
 from jax import numpy as jnp
+from jax.interpreters import pxla
 import jax.sharding as shd
+
+
+def get_current_mesh() -> shd.Mesh | shd.AbstractMesh | None:
+  """Returns the current active JAX sharding mesh if present."""
+  mesh = pxla.thread_resources.env.physical_mesh
+  if mesh is not None and not mesh.empty:
+    return mesh
+  abstract_mesh = shd.get_abstract_mesh()
+  return None if abstract_mesh.empty else abstract_mesh
 
 
 # TODO(abheesht17): Use this function for all models and unify with the fn in
@@ -31,10 +41,10 @@ def shard(x: jax.Array, s: tuple[str, ...], eager: bool = False) -> jax.Array:
   Returns:
     The sharded JAX array.
   """
-  mesh = shd.get_abstract_mesh()
-  if mesh.empty or jax.devices()[0].platform == 'cpu':
+  mesh = get_current_mesh()
+  if mesh is None or mesh.empty or jax.devices()[0].platform == 'cpu':
     return jnp.asarray(x)
   sharding = shd.NamedSharding(mesh, shd.PartitionSpec(*s))
-  if eager:
+  if eager and isinstance(mesh, shd.Mesh):
     return jax.device_put(x, sharding)
   return jax.lax.with_sharding_constraint(x, sharding)
