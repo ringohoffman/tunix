@@ -1529,13 +1529,32 @@ class ScanLayerGroup(nnx.Module):
       per_layer_inputs: jaxtyping.Array | None = None,
       new_cache: dict | None = None,
       segment_ids: jaxtyping.Array | None = None,
-  ) -> jaxtyping.Array:
-    """Run one pattern-group of layers with full scan compatibility."""
+      collect_kvs: bool = False,
+  ) -> (
+      jaxtyping.Array
+      | tuple[jaxtyping.Array, tuple[jaxtyping.Array, jaxtyping.Array]]
+  ):
+    """Run one pattern-group of layers with full scan compatibility.
+
+    Args:
+      collect_kvs: If True, collect KV projections from each sub-layer and
+        return them stacked alongside the hidden states.  Used by the
+        scan-based prefill path to populate the cache post-hoc.
+
+    Returns:
+      If collect_kvs is False: hidden states ``x``.
+      If collect_kvs is True: ``(x, kvs)`` where ``kvs`` is a tuple of
+        ``(k, v)`` pairs, one per sub-layer.  Each ``k`` / ``v`` has shape
+        ``(B, T, kv_heads, head_dim)`` (shapes may differ across sub-layers
+        when global and local attention use different head counts).
+    """
+    kvs_k: list[jaxtyping.Array] | None = [] if collect_kvs else None
+    kvs_v: list[jaxtyping.Array] | None = [] if collect_kvs else None
     for sub_idx, layer in enumerate(self.sub_layers):
       layer_cache = cache[sub_idx] if cache is not None and sub_idx < len(cache) else None
       pli = per_layer_inputs[:, :, sub_idx, :] if per_layer_inputs is not None else None
 
-      layer_cache, x, _ = layer(
+      layer_cache, x, kv = layer(
           x,
           positions,
           layer_cache,
@@ -1545,7 +1564,16 @@ class ScanLayerGroup(nnx.Module):
       )
       if new_cache is not None and layer_cache is not None:
         new_cache[sub_idx] = layer_cache
+      if collect_kvs:
+        k_proj, v_proj = kv
+        kvs_k.append(k_proj)
+        kvs_v.append(v_proj)
 
+    if collect_kvs:
+      # Return per-sub-layer KV tuples (NOT stacked), because sub-layers
+      # may have different KV shapes (e.g. global vs local heads).
+      # nnx.scan will stack each leaf independently across groups.
+      return x, tuple(zip(kvs_k, kvs_v))
     return x
 
 
@@ -1846,6 +1874,105 @@ class Gemma4(BackendMappingMixin, nnx.Module):
   ) -> jaxtyping.Array:
     """Scan-based forward pass compiling into a single XLA while_loop in HLO (or unrolled for cache generation)."""
     num_layers = self.config.num_layers
+
+    # When prefilling with scan layers, run through nnx.scan (compiles into
+    # a single while_loop HLO with O(1) graph size) instead of unrolling
+    # all N layers into a flat HLO graph that OOMs the IFRT proxy (~88 GB
+    # for 42 layers with inline shard_map + splash attention).  KV
+    # projections are collected as scan outputs and written into the cache
+    # buffers post-hoc.
+    if (
+        cache is not None
+        and is_prefill
+        and self.config.frac_shared_layers == 0
+    ):
+      pattern_len = len(self.scan_pattern)
+      num_scan_groups = num_layers // pattern_len
+      seq_len = x.shape[1]
+
+      # Reshape per_layer_inputs for scan: (B,T,N,D) -> (groups,B,T,pat,D)
+      scan_per_layer_inputs = None
+      if per_layer_inputs is not None:
+        b, t, _, d = per_layer_inputs.shape
+        reshaped = per_layer_inputs.reshape(
+            (b, t, num_scan_groups, pattern_len, d)
+        )
+        scan_per_layer_inputs = jnp.transpose(reshaped, (2, 0, 1, 3, 4))
+
+      @nnx.scan(
+          in_axes=(
+              nnx.Carry,
+              0,
+              None,
+              None,
+              0 if scan_per_layer_inputs is not None else None,
+              None,
+          ),
+          out_axes=(nnx.Carry, tuple(
+              (0, 0) for _ in range(len(self.scan_pattern))
+          )),
+      )
+      def scan_prefill_body(
+          x,
+          group,
+          positions,
+          attn_mask,
+          group_per_layer_inputs,
+          segment_ids,
+      ):
+        x, kvs = group(
+            x,
+            positions,
+            attn_mask,
+            per_layer_inputs=group_per_layer_inputs,
+            segment_ids=segment_ids,
+            collect_kvs=True,
+        )
+        return x, kvs
+
+      x, all_kvs = scan_prefill_body(
+          x,
+          self.scan_groups,
+          positions,
+          attention_mask,
+          scan_per_layer_inputs,
+          segment_ids,
+      )
+      # all_kvs: tuple of (k, v) per sub-layer, each stacked to
+      #   (num_scan_groups, B, T, kv_heads, head_dim)
+
+      # Populate cache post-hoc from collected KV projections.
+      for i in range(num_layers):
+        layer_name = f"layer_{i}"
+        if self.kv_cache_sharing_patterns[i] != i:
+          continue  # Shared layers have no cache entry.
+
+        group_idx = i // pattern_len
+        sub_idx = i % pattern_len
+        key_proj = all_kvs[sub_idx][0][group_idx]
+        value_proj = all_kvs[sub_idx][1][group_idx]
+
+        layer_cache = cache[layer_name]
+        cache_len = layer_cache["v"].shape[1]
+
+        # Unified sliding-window / full-cache fill.  When
+        # cache_len >= seq_len the modular arithmetic reduces to a
+        # plain prefix write.
+        valid_len = min(seq_len, cache_len)
+        latest_indices = (
+            jnp.arange(seq_len - valid_len, seq_len) % cache_len
+        )
+        new_cache[layer_name] = {
+            "v": layer_cache["v"]
+            .at[:, latest_indices, ...]
+            .set(value_proj[:, -valid_len:, ...]),
+            "k": layer_cache["k"]
+            .at[:, latest_indices, ...]
+            .set(key_proj[:, -valid_len:, ...]),
+            "end_index": layer_cache["end_index"] + seq_len,
+        }
+      return x
+
     if cache is not None:
       pattern_len = len(self.scan_pattern)
       sub_layer_splits = [
