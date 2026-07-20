@@ -1902,52 +1902,59 @@ class Gemma4(BackendMappingMixin, nnx.Module):
         )
         scan_per_layer_inputs = jnp.transpose(reshaped, (2, 0, 1, 3, 4))
 
-      # Stack initial layer caches across groups for each pattern sub-layer.
-      scan_cache_list: list[dict[str, jaxtyping.Array]] = []
-      for sub_idx in range(pattern_len):
-        group_layer_indices = [
-            g * pattern_len + sub_idx for g in range(num_scan_groups)
-        ]
-        proto_i = next(
-            (
-                i
-                for i in group_layer_indices
-                if self.kv_cache_sharing_patterns[i] == i
-            ),
-            None,
-        )
-        if proto_i is not None:
-          proto_cache = cache[f"layer_{proto_i}"]
-          k_shape = proto_cache["k"].shape
-          v_shape = proto_cache["v"].shape
-          end_idx_shape = proto_cache["end_index"].shape
-          k_dtype = proto_cache["k"].dtype
-          v_dtype = proto_cache["v"].dtype
-          end_idx_dtype = proto_cache["end_index"].dtype
-        else:
-          proto_cache = None
-
-        ks: list[jaxtyping.Array] = []
-        vs: list[jaxtyping.Array] = []
-        end_indices: list[jaxtyping.Array] = []
-        for i in group_layer_indices:
-          if self.kv_cache_sharing_patterns[i] == i:
-            c = cache[f"layer_{i}"]
-            ks.append(c["k"])
-            vs.append(c["v"])
-            end_indices.append(c["end_index"])
+      is_stacked_cache = isinstance(cache, (tuple, list))
+      if is_stacked_cache:
+        scan_cache = cache
+      else:
+        # Stack initial dict layer caches across groups for each sub-layer.
+        scan_cache_list: list[dict[str, jaxtyping.Array] | None] = []
+        for sub_idx in range(pattern_len):
+          group_layer_indices = [
+              g * pattern_len + sub_idx for g in range(num_scan_groups)
+          ]
+          proto_i = next(
+              (
+                  i
+                  for i in group_layer_indices
+                  if self.kv_cache_sharing_patterns[i] == i
+              ),
+              None,
+          )
+          if proto_i is not None and f"layer_{proto_i}" in cache:
+            proto_cache = cache[f"layer_{proto_i}"]
+            k_shape = proto_cache["k"].shape
+            v_shape = proto_cache["v"].shape
+            end_idx_shape = proto_cache["end_index"].shape
+            k_dtype = proto_cache["k"].dtype
+            v_dtype = proto_cache["v"].dtype
+            end_idx_dtype = proto_cache["end_index"].dtype
           else:
-            ks.append(jnp.zeros(k_shape, dtype=k_dtype))
-            vs.append(jnp.zeros(v_shape, dtype=v_dtype))
-            end_indices.append(jnp.zeros(end_idx_shape, dtype=end_idx_dtype))
+            proto_cache = None
 
-        scan_cache_list.append({
-            "k": jnp.stack(ks, axis=0),
-            "v": jnp.stack(vs, axis=0),
-            "end_index": jnp.stack(end_indices, axis=0),
-        })
+          if proto_cache is not None:
+            ks: list[jaxtyping.Array] = []
+            vs: list[jaxtyping.Array] = []
+            end_indices: list[jaxtyping.Array] = []
+            for i in group_layer_indices:
+              if self.kv_cache_sharing_patterns[i] == i and f"layer_{i}" in cache:
+                c = cache[f"layer_{i}"]
+                ks.append(c["k"])
+                vs.append(c["v"])
+                end_indices.append(c["end_index"])
+              else:
+                ks.append(jnp.zeros(k_shape, dtype=k_dtype))
+                vs.append(jnp.zeros(v_shape, dtype=v_dtype))
+                end_indices.append(jnp.zeros(end_idx_shape, dtype=end_idx_dtype))
 
-      scan_cache = tuple(scan_cache_list)
+            scan_cache_list.append({
+                "k": jnp.stack(ks, axis=0),
+                "v": jnp.stack(vs, axis=0),
+                "end_index": jnp.stack(end_indices, axis=0),
+            })
+          else:
+            scan_cache_list.append(None)
+
+        scan_cache = tuple(scan_cache_list)
 
       @nnx.scan(
           in_axes=(
@@ -1997,19 +2004,27 @@ class Gemma4(BackendMappingMixin, nnx.Module):
           segment_ids,
       )
 
-      # Unstack updated scan cache back into new_cache dict.
-      for i in range(num_layers):
-        if self.kv_cache_sharing_patterns[i] != i:
-          continue  # Shared layers have no cache entry.
+      if is_stacked_cache:
+        new_cache.clear()
+        if isinstance(new_cache, dict):
+          # Place updated stacked tuple in special key or update PyTree
+          new_cache.update({f"sub_{i}": updated_scan_cache[i] for i in range(len(updated_scan_cache))})
+        # If new_cache was passed as reference dict, return updated_scan_cache
+        new_cache = updated_scan_cache
+      else:
+        # Unstack updated scan cache back into new_cache dict.
+        for i in range(num_layers):
+          if self.kv_cache_sharing_patterns[i] != i:
+            continue  # Shared layers have no cache entry.
 
-        group_idx = i // pattern_len
-        sub_idx = i % pattern_len
-        c = updated_scan_cache[sub_idx]
-        new_cache[f"layer_{i}"] = {
-            "k": c["k"][group_idx],
-            "v": c["v"][group_idx],
-            "end_index": c["end_index"][group_idx],
-        }
+          group_idx = i // pattern_len
+          sub_idx = i % pattern_len
+          c = updated_scan_cache[sub_idx]
+          new_cache[f"layer_{i}"] = {
+              "k": c["k"][group_idx],
+              "v": c["v"][group_idx],
+              "end_index": c["end_index"][group_idx],
+          }
       return x
 
     # --- True scan path (training, cache=None) ---
