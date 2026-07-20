@@ -1039,8 +1039,13 @@ class Attention(nnx.Module):
             check_rep=False,
         )
         def sharded_splash_attn(
-            kernel, q_block, k_block, v_block, q_seg_block, kv_seg_block
-        ):
+            kernel: Any,
+            q_block: jaxtyping.Array,
+            k_block: jaxtyping.Array,
+            v_block: jaxtyping.Array,
+            q_seg_block: jaxtyping.Array | None,
+            kv_seg_block: jaxtyping.Array | None,
+        ) -> jaxtyping.Array:
           seg_ids = splash.SegmentIds(q=q_seg_block, kv=kv_seg_block)
           return jax.vmap(kernel)(
               q_block, k_block, v_block, segment_ids=seg_ids
@@ -1075,7 +1080,12 @@ class Attention(nnx.Module):
             out_specs=shd_spec,
             check_rep=False,
         )
-        def sharded_splash_attn(kernel, q_block, k_block, v_block):
+        def sharded_splash_attn(
+            kernel: Any,
+            q_block: jaxtyping.Array,
+            k_block: jaxtyping.Array,
+            v_block: jaxtyping.Array,
+        ) -> jaxtyping.Array:
           return jax.vmap(kernel)(q_block, k_block, v_block)
 
         qkv: jaxtyping.Array = sharded_splash_attn(
@@ -1875,13 +1885,10 @@ class Gemma4(BackendMappingMixin, nnx.Module):
     """Scan-based forward pass compiling into a single XLA while_loop in HLO (or unrolled for cache generation)."""
     num_layers = self.config.num_layers
 
-    # When prefilling with scan layers, run through nnx.scan (compiles into
-    # a single while_loop HLO with O(1) graph size) instead of unrolling
-    # all N layers into a flat HLO graph that OOMs the IFRT proxy (~88 GB
-    # for 42 layers with inline shard_map + splash attention).  KV
-    # projections are collected as scan outputs and written into the cache
-    # buffers post-hoc.
-    if cache is not None and is_prefill:
+    # When running cache inference (prefill or decode) with scan layers, run
+    # through nnx.scan (compiles into a single while_loop HLO with O(1) graph
+    # size) instead of unrolling all N layers into a flat HLO graph.
+    if cache is not None:
       pattern_len = len(self.scan_pattern)
       num_scan_groups = num_layers // pattern_len
       seq_len = x.shape[1]
@@ -1959,15 +1966,15 @@ class Gemma4(BackendMappingMixin, nnx.Module):
               ),
           ),
       )
-      def scan_prefill_body(
-          x,
-          group,
-          group_cache,
-          positions,
-          attn_mask,
-          group_per_layer_inputs,
-          segment_ids,
-      ):
+      def scan_cache_body(
+          x: jaxtyping.Array,
+          group: ScanLayerGroup,
+          group_cache: tuple[dict[str, jaxtyping.Array], ...],
+          positions: jaxtyping.Array,
+          attn_mask: jaxtyping.Array,
+          group_per_layer_inputs: jaxtyping.Array | None,
+          segment_ids: jaxtyping.Array | None,
+      ) -> tuple[jaxtyping.Array, tuple[dict[str, jaxtyping.Array], ...]]:
         new_group_cache: dict[int, LayerCache] = {}
         x = group(
             x,
@@ -1980,7 +1987,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
         )
         return x, tuple(new_group_cache[sub] for sub in range(pattern_len))
 
-      x, updated_scan_cache = scan_prefill_body(
+      x, updated_scan_cache = scan_cache_body(
           x,
           self.scan_groups,
           scan_cache,
@@ -2003,55 +2010,6 @@ class Gemma4(BackendMappingMixin, nnx.Module):
             "v": c["v"][group_idx],
             "end_index": c["end_index"][group_idx],
         }
-      return x
-
-    if cache is not None:
-      pattern_len = len(self.scan_pattern)
-      sub_layer_splits = [
-          nnx.split(sub_layer) for sub_layer in self.scan_groups.sub_layers
-      ]
-      unrolled_layers: list[DecoderLayer] = []
-      for i in range(num_layers):
-        group_idx = i // pattern_len
-        sub_idx = i % pattern_len
-        graphdef, state = sub_layer_splits[sub_idx]
-        layer_state = jax.tree.map(lambda leaf: leaf[group_idx], state)
-        unrolled_layers.append(nnx.merge(graphdef, layer_state))
-
-      for i in range(num_layers):
-        layer_name = f"layer_{i}"
-        layer = unrolled_layers[i]
-
-        shared_idx = self.kv_cache_sharing_patterns[i]
-        is_shared = shared_idx != i
-        if is_shared:
-          assert shared_idx in self.shared_layer_origins
-          layer_cache = None
-          shared_layer_name = f"layer_{shared_idx}"
-          if is_prefill:
-            shared_k, shared_v = transient_kvs[shared_layer_name]
-            kv_shared_cache = {"k": shared_k, "v": shared_v}
-          else:
-            kv_shared_cache = new_cache.get(shared_layer_name)
-        else:
-          layer_cache = cache[layer_name] if cache else None
-          kv_shared_cache = None
-
-        layer_cache, x, layers_kvs = layer(
-            x,
-            positions,
-            layer_cache,
-            attention_mask,
-            per_layer_input=per_layer_inputs[:, :, i, :]
-            if per_layer_inputs is not None
-            else None,
-            kv_shared_cache=kv_shared_cache,
-            segment_ids=segment_ids,
-        )
-        if is_prefill and i in self.shared_layer_origins:
-          transient_kvs[layer_name] = layers_kvs
-        if not is_shared:
-          new_cache[layer_name] = layer_cache
       return x
 
     # --- True scan path (training, cache=None) ---
