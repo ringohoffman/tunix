@@ -16,12 +16,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 import dataclasses
 import enum
 from functools import partial
 import itertools
-from typing import Any, Literal, Self, Tuple
+from typing import Any, Literal, Self, Tuple, overload
+from typing_extensions import Unpack
 
 import flax
 from flax import nnx
@@ -98,21 +99,47 @@ class GemmaOutput:
   cache: Cache | StackedCache | None = None
   hidden_states: jax.Array | None = None
 
-  def tree_flatten(self) -> tuple[tuple[Any, ...], Any]:
+  def tree_flatten(
+      self
+  ) -> tuple[
+    tuple[jax.Array, Cache | StackedCache | None, jax.Array | None],
+    None,
+  ]:
     children = (self.logits, self.cache, self.hidden_states)
     aux_data = None
     return (children, aux_data)
 
   @classmethod
-  def tree_unflatten(cls, aux_data: Any, children: tuple[Any, ...]) -> Self:
+  def tree_unflatten(
+    cls,
+    aux_data: None,
+    children: tuple[jax.Array, Cache | StackedCache | None, jax.Array | None],
+  ) -> Self:
     return cls(*children)
 
-  def __iter__(self):
+  def __iter__(
+      self
+  ) -> Iterator[Unpack[tuple[jax.Array, Cache | StackedCache | None]]]:
     """Yield (logits, cache) for backward-compatible tuple unpacking."""
     yield self.logits
     yield self.cache
 
-  def __getitem__(self, idx):
+  @overload
+  def __getitem__(
+    self,
+    idx: Literal[0],
+  ) -> jax.Array: ...
+  @overload
+  def __getitem__(
+    self,
+    idx: Literal[1],
+  ) -> Cache | StackedCache | None: ...
+  @overload
+  def __getitem__(
+    self,
+    idx: int,
+  ) -> jax.Array | Cache | StackedCache | None: ...
+  def __getitem__(self, idx: int) -> jax.Array | Cache | StackedCache | None:
     return (self.logits, self.cache)[idx]
 
 
