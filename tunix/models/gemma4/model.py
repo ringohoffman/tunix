@@ -16,16 +16,19 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import dataclasses
 import enum
-from collections.abc import Callable
 from functools import partial
 import itertools
 from typing import Any, Literal, Tuple
+
 import flax
 from flax import nnx
 import jax
+from jax import checkpoint_policies as cp
 from jax import numpy as jnp
+from jax.ad_checkpoint import checkpoint_name
 from jax.experimental.pallas.ops.tpu.splash_attention import (
     splash_attention_kernel as splash,
 )
@@ -43,9 +46,6 @@ from tunix.models.gemma4 import moe
 from tunix.utils import compat
 from tunix.utils import env_utils
 from tunix.utils.sharding_utils import shard
-
-from jax import checkpoint_policies as cp
-from jax.ad_checkpoint import checkpoint_name
 
 # JAX checkpoint policy type — matches nnx.remat's policy parameter.
 CheckpointPolicy = Callable[..., bool]
@@ -73,6 +73,7 @@ def _compat_remat(
 
 LayerCache = dict[str, jaxtyping.Array]
 Cache = dict[str, LayerCache]
+StackedCache = tuple[LayerCache | None, ...]
 TransientKVs = dict[str, tuple[jaxtyping.Array, jaxtyping.Array]]
 
 
@@ -94,7 +95,7 @@ class GemmaOutput:
   """
 
   logits: jaxtyping.Array
-  cache: Cache | None = None
+  cache: Cache | StackedCache | None = None
   hidden_states: jaxtyping.Array | None = None
 
   def __iter__(self):
@@ -280,6 +281,7 @@ class ShardingConfig:
     ``FeedForward``) while leaving activation specs unchanged (those are
     applied at runtime to tensors that are NOT stacked).
     """
+
     def _prepend(t: Tuple[str | None, ...]) -> Tuple[str | None, ...]:
       return (None,) + t
 
@@ -1516,7 +1518,7 @@ class ScanLayerGroup(nnx.Module):
       pattern: tuple[AttentionType, ...],
       *,
       rngs: nnx.Rngs,
-  ):
+  ) -> None:
     self.config = config
     self.pattern = pattern
     self.sub_layers = compat.ModuleList()
@@ -1539,30 +1541,23 @@ class ScanLayerGroup(nnx.Module):
       per_layer_inputs: jaxtyping.Array | None = None,
       new_cache: dict | None = None,
       segment_ids: jaxtyping.Array | None = None,
-      collect_kvs: bool = False,
-  ) -> (
-      jaxtyping.Array
-      | tuple[jaxtyping.Array, tuple[jaxtyping.Array, jaxtyping.Array]]
-  ):
-    """Run one pattern-group of layers with full scan compatibility.
-
-    Args:
-      collect_kvs: If True, collect KV projections from each sub-layer and
-        return them stacked alongside the hidden states.  Used by the
-        scan-based prefill path to populate the cache post-hoc.
-
-    Returns:
-      If collect_kvs is False: hidden states ``x``.
-      If collect_kvs is True: ``(x, kvs)`` where ``kvs`` is a tuple of
-        ``(k, v)`` pairs, one per sub-layer.  Each ``k`` / ``v`` has shape
-        ``(B, T, kv_heads, head_dim)`` (shapes may differ across sub-layers
-        when global and local attention use different head counts).
-    """
-    kvs_k: list[jaxtyping.Array] | None = [] if collect_kvs else None
-    kvs_v: list[jaxtyping.Array] | None = [] if collect_kvs else None
+  ) -> jaxtyping.Array:
+    """Run one pattern-group of layers with full scan compatibility."""
     for sub_idx, layer in enumerate(self.sub_layers):
-      layer_cache = cache[sub_idx] if cache is not None and sub_idx < len(cache) else None
-      pli = per_layer_inputs[:, :, sub_idx, :] if per_layer_inputs is not None else None
+      layer_cache = (
+          cache[sub_idx] if cache is not None and sub_idx < len(cache) else None
+      )
+      kv_shared_cache = None
+      if cache is not None and layer_cache is None:
+        origin_sub_idx = sub_idx - 1 if sub_idx > 0 else 0
+        if origin_sub_idx < len(cache):
+          kv_shared_cache = cache[origin_sub_idx]
+
+      pli = (
+          per_layer_inputs[:, :, sub_idx, :]
+          if per_layer_inputs is not None
+          else None
+      )
 
       layer_cache, x, kv = layer(
           x,
@@ -1570,20 +1565,12 @@ class ScanLayerGroup(nnx.Module):
           layer_cache,
           attn_mask,
           per_layer_input=pli,
+          kv_shared_cache=kv_shared_cache,
           segment_ids=segment_ids,
       )
       if new_cache is not None and layer_cache is not None:
         new_cache[sub_idx] = layer_cache
-      if collect_kvs:
-        k_proj, v_proj = kv
-        kvs_k.append(k_proj)
-        kvs_v.append(v_proj)
 
-    if collect_kvs:
-      # Return per-sub-layer KV tuples (NOT stacked), because sub-layers
-      # may have different KV shapes (e.g. global vs local heads).
-      # nnx.scan will stack each leaf independently across groups.
-      return x, tuple(zip(kvs_k, kvs_v))
     return x
 
 
@@ -1706,9 +1693,9 @@ class Gemma4(BackendMappingMixin, nnx.Module):
     for _, var in nnx.iter_graph(self.scan_groups):
       if not isinstance(var, nnx.Param):
         continue
-      spec = var.get_metadata('out_sharding', None)
+      spec = var.get_metadata("out_sharding", None)
       if isinstance(spec, tuple):
-        var.set_metadata('out_sharding', (None,) + spec)
+        var.set_metadata("out_sharding", (None,) + spec)
 
   def __call__(
       self,
@@ -1733,11 +1720,10 @@ class Gemma4(BackendMappingMixin, nnx.Module):
       decode_only_last_token: If ``True``, only decode the last sequence
         position. Kept for backward compatibility with the sampler.
       segment_ids: Accepted for RL pipeline compatibility; currently unused.
-      target_indices: Optional ``[B, K]`` array of sequence-axis indices.
-        When provided, only those hidden states are projected through the
-        embedder decode, producing logits of shape ``[B, K, V]`` instead of
-        ``[B, L, V]``. This is mutually exclusive with
-        ``decode_only_last_token``.
+      target_indices: Optional ``[B, K]`` array of sequence-axis indices. When
+        provided, only those hidden states are projected through the embedder
+        decode, producing logits of shape ``[B, K, V]`` instead of ``[B, L,
+        V]``. This is mutually exclusive with ``decode_only_last_token``.
       return_hidden_states: If ``True``, populate ``GemmaOutput.hidden_states``
         with the post-norm, pre-decode hidden states.
 
@@ -1767,7 +1753,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
         if self.config.use_scan_layers
         else self._forward_loop
     )
-    x = forward_fn(
+    x, out_cache = forward_fn(
         x,
         positions,
         cache=cache,
@@ -1799,7 +1785,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
 
     return GemmaOutput(
         logits=logits,
-        cache=new_cache if return_cache else None,
+        cache=out_cache if return_cache else None,
         hidden_states=hidden_states_out,
     )
 
@@ -1814,7 +1800,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
       transient_kvs: TransientKVs,
       is_prefill: bool,
       segment_ids: jaxtyping.Array | None,
-  ) -> jaxtyping.Array:
+  ) -> tuple[jaxtyping.Array, Cache]:
     """For-loop forward pass over layers with full feature parity and pre-merged scan layers."""
     num_layers = self.config.num_layers
     if self.config.use_scan_layers:
@@ -1868,20 +1854,20 @@ class Gemma4(BackendMappingMixin, nnx.Module):
         transient_kvs[layer_name] = layers_kvs
       if not is_shared:
         new_cache[layer_name] = layer_cache
-    return x
+    return x, new_cache
 
   def _forward_scan(
       self,
       x: jaxtyping.Array,
       positions: jaxtyping.Array,
-      cache: Cache | None,
+      cache: Cache | StackedCache | None,
       attention_mask: jaxtyping.Array,
       per_layer_inputs: jaxtyping.Array | None,
       new_cache: Cache,
       transient_kvs: TransientKVs,
       is_prefill: bool,
       segment_ids: jaxtyping.Array | None,
-  ) -> jaxtyping.Array:
+  ) -> tuple[jaxtyping.Array, Cache | StackedCache | None]:
     """Scan-based forward pass compiling into a single XLA while_loop in HLO (or unrolled for cache generation)."""
     num_layers = self.config.num_layers
 
@@ -1936,7 +1922,10 @@ class Gemma4(BackendMappingMixin, nnx.Module):
             vs: list[jaxtyping.Array] = []
             end_indices: list[jaxtyping.Array] = []
             for i in group_layer_indices:
-              if self.kv_cache_sharing_patterns[i] == i and f"layer_{i}" in cache:
+              if (
+                  self.kv_cache_sharing_patterns[i] == i
+                  and f"layer_{i}" in cache
+              ):
                 c = cache[f"layer_{i}"]
                 ks.append(c["k"])
                 vs.append(c["v"])
@@ -1944,7 +1933,9 @@ class Gemma4(BackendMappingMixin, nnx.Module):
               else:
                 ks.append(jnp.zeros(k_shape, dtype=k_dtype))
                 vs.append(jnp.zeros(v_shape, dtype=v_dtype))
-                end_indices.append(jnp.zeros(end_idx_shape, dtype=end_idx_dtype))
+                end_indices.append(
+                    jnp.zeros(end_idx_shape, dtype=end_idx_dtype)
+                )
 
             scan_cache_list.append({
                 "k": jnp.stack(ks, axis=0),
@@ -2005,12 +1996,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
       )
 
       if is_stacked_cache:
-        new_cache.clear()
-        if isinstance(new_cache, dict):
-          # Place updated stacked tuple in special key or update PyTree
-          new_cache.update({f"sub_{i}": updated_scan_cache[i] for i in range(len(updated_scan_cache))})
-        # If new_cache was passed as reference dict, return updated_scan_cache
-        new_cache = updated_scan_cache
+        out_cache = updated_scan_cache
       else:
         # Unstack updated scan cache back into new_cache dict.
         for i in range(num_layers):
@@ -2025,7 +2011,8 @@ class Gemma4(BackendMappingMixin, nnx.Module):
               "v": c["v"][group_idx],
               "end_index": c["end_index"][group_idx],
           }
-      return x
+        out_cache = new_cache
+      return x, out_cache
 
     # --- True scan path (training, cache=None) ---
     # KV cache sharing (frac_shared_layers > 0) is not supported in the
@@ -2046,7 +2033,9 @@ class Gemma4(BackendMappingMixin, nnx.Module):
     scan_per_layer_inputs = None
     if per_layer_inputs is not None:
       b, t, _, d = per_layer_inputs.shape
-      reshaped = per_layer_inputs.reshape((b, t, num_scan_groups, pattern_len, d))
+      reshaped = per_layer_inputs.reshape(
+          (b, t, num_scan_groups, pattern_len, d)
+      )
       scan_per_layer_inputs = jnp.transpose(reshaped, (2, 0, 1, 3, 4))
 
     @nnx.scan(
@@ -2084,24 +2073,56 @@ class Gemma4(BackendMappingMixin, nnx.Module):
         scan_per_layer_inputs,
         segment_ids,
     )
-    return x
+    return x, None
 
   def init_cache(
-      self, batch_size: int, max_seq_len: int, dtype: jnp.dtype
-  ) -> Cache:
-    cache: Cache = {}
+      self,
+      batch_size: int,
+      max_seq_len: int,
+      dtype: jnp.dtype,
+  ) -> Cache | StackedCache:
     if self.config.use_scan_layers:
       pattern_len = len(self.scan_pattern)
-      for i in range(self.config.num_layers):
-        if self.kv_cache_sharing_patterns[i] != i:
-          continue  # Skip shared layers.
-        sub_layer = self.scan_groups.sub_layers[i % pattern_len]
-        cache[f"layer_{i}"] = sub_layer.init_cache(batch_size, max_seq_len, dtype)
-    else:
-      for i, layer in enumerate(self.layers):
-        if self.kv_cache_sharing_patterns[i] != i:
-          continue  # Skip shared layers.
-        cache[f"layer_{i}"] = layer.init_cache(batch_size, max_seq_len, dtype)
+      num_scan_groups = self.config.num_layers // pattern_len
+      scan_cache_list: list[LayerCache | None] = []
+      for sub_idx in range(pattern_len):
+        group_layer_indices = [
+            g * pattern_len + sub_idx for g in range(num_scan_groups)
+        ]
+        proto_i = next(
+            (
+                i
+                for i in group_layer_indices
+                if self.kv_cache_sharing_patterns[i] == i
+            ),
+            None,
+        )
+        if proto_i is not None:
+          sub_layer = self.scan_groups.sub_layers[sub_idx]
+          proto_cache = sub_layer.init_cache(batch_size, max_seq_len, dtype)
+          scan_cache_list.append({
+              "k": jnp.zeros(
+                  (num_scan_groups, *proto_cache["k"].shape),
+                  dtype=proto_cache["k"].dtype,
+              ),
+              "v": jnp.zeros(
+                  (num_scan_groups, *proto_cache["v"].shape),
+                  dtype=proto_cache["v"].dtype,
+              ),
+              "end_index": jnp.zeros(
+                  (num_scan_groups, *proto_cache["end_index"].shape),
+                  dtype=proto_cache["end_index"].dtype,
+              ),
+          })
+        else:
+          scan_cache_list.append(None)
+      return tuple(scan_cache_list)
+
+    cache: Cache = {}
+    for i, layer in enumerate(self.layers):
+      if self.kv_cache_sharing_patterns[i] != i:
+        continue  # skip shared layers.
+      cache[f"layer_{i}"] = layer.init_cache(batch_size, max_seq_len, dtype)
     return cache
 
   def get_model_input(self):

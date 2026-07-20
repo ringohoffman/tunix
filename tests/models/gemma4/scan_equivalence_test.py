@@ -62,7 +62,6 @@ import numpy as np
 import optax
 from tunix.models.gemma4 import model as model_lib
 
-
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
@@ -118,9 +117,7 @@ def _make_inputs(
       jax.random.PRNGKey(42), (batch_size, seq_len), 0, config.num_embed
   )
   positions = jnp.tile(jnp.arange(seq_len)[None, :], (batch_size, 1))
-  attn_mask = jnp.tril(jnp.ones((seq_len, seq_len), dtype=jnp.bool_))[
-      None, ...
-  ]
+  attn_mask = jnp.tril(jnp.ones((seq_len, seq_len), dtype=jnp.bool_))[None, ...]
   return tokens, positions, attn_mask
 
 
@@ -134,7 +131,8 @@ def _copy_weights_loop_to_scan(
   The scan model stores layers as scan_groups.sub_layers[sub_idx] with a
   leading vmap axis of size num_groups.
 
-  Mapping: layers[group * pattern_len + sub] -> scan_groups.sub_layers[sub][group]
+  Mapping: layers[group * pattern_len + sub] ->
+  scan_groups.sub_layers[sub][group]
   """
   loop_gd, loop_state = nnx.split(loop_model)
   scan_gd, scan_state = nnx.split(scan_model)
@@ -560,9 +558,7 @@ class ScanGenerationEquivalenceTest(absltest.TestCase):
         batch_size=2, max_seq_len=16, dtype=jnp.float32
     )
 
-    tokens, positions, attn_mask = _make_inputs(
-        config, batch_size=2, seq_len=8
-    )
+    tokens, positions, attn_mask = _make_inputs(config, batch_size=2, seq_len=8)
 
     loop_out = loop_model(
         tokens, positions=positions, cache=loop_cache, attention_mask=attn_mask
@@ -676,9 +672,7 @@ class ScanGenerationEquivalenceTest(absltest.TestCase):
         batch_size=1, max_seq_len=16, dtype=jnp.float32
     )
 
-    tokens, positions, attn_mask = _make_inputs(
-        config, batch_size=1, seq_len=8
-    )
+    tokens, positions, attn_mask = _make_inputs(config, batch_size=1, seq_len=8)
 
     loop_out = loop_model(
         tokens, positions=positions, cache=loop_cache, attention_mask=attn_mask
@@ -705,9 +699,7 @@ class ScanGenerationEquivalenceTest(absltest.TestCase):
         batch_size=2, max_seq_len=16, dtype=jnp.float32
     )
 
-    tokens, positions, attn_mask = _make_inputs(
-        config, batch_size=2, seq_len=8
-    )
+    tokens, positions, attn_mask = _make_inputs(config, batch_size=2, seq_len=8)
 
     loop_out = loop_model(
         tokens, positions=positions, cache=loop_cache, attention_mask=attn_mask
@@ -734,9 +726,7 @@ class ScanGenerationEquivalenceTest(absltest.TestCase):
         batch_size=2, max_seq_len=16, dtype=jnp.float32
     )
 
-    tokens, positions, attn_mask = _make_inputs(
-        config, batch_size=2, seq_len=8
-    )
+    tokens, positions, attn_mask = _make_inputs(config, batch_size=2, seq_len=8)
     segment_ids = jnp.array(
         [[1, 1, 1, 1, 2, 2, 2, 2], [1, 1, 2, 2, 3, 3, 3, 3]],
         dtype=jnp.int32,
@@ -786,9 +776,7 @@ class ScanGenerationEquivalenceTest(absltest.TestCase):
         batch_size=2, max_seq_len=16, dtype=jnp.float32
     )
 
-    tokens, positions, attn_mask = _make_inputs(
-        config, batch_size=2, seq_len=8
-    )
+    tokens, positions, attn_mask = _make_inputs(config, batch_size=2, seq_len=8)
 
     scan_out = scan_model(
         tokens, positions=positions, cache=scan_cache, attention_mask=attn_mask
@@ -801,10 +789,22 @@ class ScanGenerationEquivalenceTest(absltest.TestCase):
     )
 
     # 2. Cache entries exist for origin (non-shared) layers.
+    unstacked_cache = (
+        _unstack_cache(
+            scan_out.cache,
+            config.num_layers,
+            len(_PATTERN),
+            scan_model.kv_cache_sharing_patterns,
+        )
+        if isinstance(scan_out.cache, tuple)
+        else scan_out.cache
+    )
     for i in range(config.num_layers):
       layer_name = f'layer_{i}'
       if scan_model.kv_cache_sharing_patterns[i] == i:
-        self.assertIn(layer_name, scan_out.cache, msg=f'Missing cache for {layer_name}')
+        self.assertIn(
+            layer_name, unstacked_cache, msg=f'Missing cache for {layer_name}'
+        )
 
     # 3. Decode step after prefill produces finite logits.
     tok_decode = jax.random.randint(
@@ -822,7 +822,10 @@ class ScanGenerationEquivalenceTest(absltest.TestCase):
 
     self.assertTrue(
         jnp.all(jnp.isfinite(scan_dec.logits)),
-        msg='Decode after scan prefill with shared KV layers produced non-finite logits.',
+        msg=(
+            'Decode after scan prefill with shared KV layers produced'
+            ' non-finite logits.'
+        ),
     )
 
   def test_generation_with_per_layer_inputs(self):
@@ -838,9 +841,7 @@ class ScanGenerationEquivalenceTest(absltest.TestCase):
         batch_size=2, max_seq_len=16, dtype=jnp.float32
     )
 
-    tokens, positions, attn_mask = _make_inputs(
-        config, batch_size=2, seq_len=8
-    )
+    tokens, positions, attn_mask = _make_inputs(config, batch_size=2, seq_len=8)
 
     loop_out = loop_model(
         tokens, positions=positions, cache=loop_cache, attention_mask=attn_mask
@@ -951,9 +952,7 @@ class ScanShardingSpecTest(absltest.TestCase):
     """Optimizer init must not raise under the production mesh."""
     config = dataclasses.replace(self._CONFIG_31B, use_scan_layers=True)
     with use_abstract_mesh(self._MESH):
-      model = nnx.eval_shape(
-          lambda: model_lib.Gemma4(config, rngs=nnx.Rngs(0))
-      )
+      model = nnx.eval_shape(lambda: model_lib.Gemma4(config, rngs=nnx.Rngs(0)))
     try:
       with use_abstract_mesh(self._MESH):
         nnx.eval_shape(
@@ -971,9 +970,7 @@ class ScanShardingSpecTest(absltest.TestCase):
 
     config = dataclasses.replace(self._CONFIG_31B, use_scan_layers=True)
     with use_abstract_mesh(self._MESH):
-      model = nnx.eval_shape(
-          lambda: model_lib.Gemma4(config, rngs=nnx.Rngs(0))
-      )
+      model = nnx.eval_shape(lambda: model_lib.Gemma4(config, rngs=nnx.Rngs(0)))
     model_state = nnx.state(model)
 
     # Real un-stacked checkpoint shapes (31B layout).
@@ -1042,7 +1039,8 @@ class ScanShardingSpecTest(absltest.TestCase):
 
     self.assertEmpty(
         mismatches,
-        msg='out_sharding rank mismatches after vmap:\n' + '\n'.join(mismatches),
+        msg='out_sharding rank mismatches after vmap:\n'
+        + '\n'.join(mismatches),
     )
 
   def test_non_scan_31b_optimizes_under_production_mesh(self):
@@ -1058,6 +1056,117 @@ class ScanShardingSpecTest(absltest.TestCase):
         )
     except Exception as e:  # pylint: disable=broad-except
       self.fail(f'Non-scan 31b optimizer raised under fsdp=32 mesh: {e}')
+
+
+def _unstack_cache(
+    stacked_cache: model_lib.StackedCache,
+    num_layers: int,
+    pattern_len: int = 6,
+    kv_cache_sharing_patterns: list[int] | None = None,
+) -> model_lib.Cache:
+  """Converts a stacked cache tuple into an unstacked per-layer cache dict."""
+  dict_cache: model_lib.Cache = {}
+  if kv_cache_sharing_patterns is None:
+    kv_cache_sharing_patterns = list(range(num_layers))
+
+  for i in range(num_layers):
+    if kv_cache_sharing_patterns[i] != i:
+      continue  # Shared layers have no individual cache entry.
+
+    group_idx = i // pattern_len
+    sub_idx = i % pattern_len
+    c = stacked_cache[sub_idx]
+    if c is not None:
+      dict_cache[f'layer_{i}'] = {
+          'k': c['k'][group_idx],
+          'v': c['v'][group_idx],
+          'end_index': c['end_index'][group_idx],
+      }
+  return dict_cache
+
+
+def _stack_cache(
+    cache: model_lib.Cache,
+    num_layers: int,
+    pattern_len: int = 6,
+    kv_cache_sharing_patterns: list[int] | None = None,
+) -> model_lib.StackedCache:
+  """Converts an unstacked per-layer cache dict into a stacked cache tuple."""
+  num_scan_groups = num_layers // pattern_len
+  if kv_cache_sharing_patterns is None:
+    kv_cache_sharing_patterns = list(range(num_layers))
+
+  scan_cache_list: list[model_lib.LayerCache | None] = []
+  for sub_idx in range(pattern_len):
+    group_layer_indices = [
+        g * pattern_len + sub_idx for g in range(num_scan_groups)
+    ]
+    proto_i = next(
+        (i for i in group_layer_indices if kv_cache_sharing_patterns[i] == i),
+        None,
+    )
+    if proto_i is not None and f'layer_{proto_i}' in cache:
+      proto_cache = cache[f'layer_{proto_i}']
+      k_shape = proto_cache['k'].shape
+      v_shape = proto_cache['v'].shape
+      end_idx_shape = proto_cache['end_index'].shape
+      k_dtype = proto_cache['k'].dtype
+      v_dtype = proto_cache['v'].dtype
+      end_idx_dtype = proto_cache['end_index'].dtype
+    else:
+      proto_cache = None
+
+    if proto_cache is not None:
+      ks = []
+      vs = []
+      end_indices = []
+      for i in group_layer_indices:
+        if kv_cache_sharing_patterns[i] == i and f'layer_{i}' in cache:
+          c = cache[f'layer_{i}']
+          ks.append(c['k'])
+          vs.append(c['v'])
+          end_indices.append(c['end_index'])
+        else:
+          ks.append(jnp.zeros(k_shape, dtype=k_dtype))
+          vs.append(jnp.zeros(v_shape, dtype=v_dtype))
+          end_indices.append(jnp.zeros(end_idx_shape, dtype=end_idx_dtype))
+
+      scan_cache_list.append({
+          'k': jnp.stack(ks, axis=0),
+          'v': jnp.stack(vs, axis=0),
+          'end_index': jnp.stack(end_indices, axis=0),
+      })
+    else:
+      scan_cache_list.append(None)
+
+  return tuple(scan_cache_list)
+
+
+class CacheConversionTest(absltest.TestCase):
+  """Tests for _stack_cache and _unstack_cache conversion utilities."""
+
+  def test_roundtrip_cache_conversion(self):
+    """Test converting dict cache -> stacked cache -> dict cache roundtrip."""
+    config = _make_config(num_layers=12, use_scan_layers=False)
+    model = model_lib.Gemma4(config, rngs=nnx.Rngs(0))
+    dict_cache = model.init_cache(
+        batch_size=2, max_seq_len=16, dtype=jnp.float32
+    )
+
+    stacked = _stack_cache(
+        dict_cache, config.num_layers, pattern_len=len(_PATTERN)
+    )
+    self.assertIsInstance(stacked, tuple)
+    self.assertEqual(len(stacked), len(_PATTERN))
+
+    unstacked = _unstack_cache(
+        stacked, config.num_layers, pattern_len=len(_PATTERN)
+    )
+    self.assertEqual(set(dict_cache.keys()), set(unstacked.keys()))
+
+    for key in dict_cache:
+      for k in ('k', 'v', 'end_index'):
+        np.testing.assert_allclose(dict_cache[key][k], unstacked[key][k])
 
 
 if __name__ == '__main__':
