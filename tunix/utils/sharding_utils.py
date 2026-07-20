@@ -29,7 +29,11 @@ def get_current_mesh() -> shd.Mesh | shd.AbstractMesh | None:
 
 # TODO(abheesht17): Use this function for all models and unify with the fn in
 # sft/sharding_utils.py.
-def shard(x: jax.Array, s: tuple[str, ...], eager: bool = False) -> jax.Array:
+def shard(
+    x: jax.Array,
+    s: tuple[str | None, ...],
+    eager: bool = False,
+) -> jax.Array:
   """Shards a JAX array.
 
   Args:
