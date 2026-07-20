@@ -1192,6 +1192,22 @@ class CacheConversionTest(absltest.TestCase):
       for k in ('k', 'v', 'end_index'):
         np.testing.assert_allclose(dict_cache[key][k], unstacked[key][k])
 
+  def test_gemma_output_pytree_node(self):
+    """Test that GemmaOutput is a valid JAX PyTree node (flatten/unflatten/map)."""
+    logits = jnp.ones((2, 3))
+    cache = {'layer_0': {'k': jnp.zeros((2, 4, 16)), 'v': jnp.zeros((2, 4, 16))}}
+    out = model_lib.GemmaOutput(logits=logits, cache=cache)
+
+    leaves, treedef = jax.tree_util.tree_flatten(out)
+    self.assertTrue(len(leaves) > 0)
+
+    reconstructed = jax.tree_util.tree_unflatten(treedef, leaves)
+    self.assertIsInstance(reconstructed, model_lib.GemmaOutput)
+    np.testing.assert_allclose(reconstructed.logits, logits)
+
+    doubled = jax.tree.map(lambda x: x * 2 if hasattr(x, 'shape') else x, out)
+    np.testing.assert_allclose(doubled.logits, logits * 2)
+
 
 if __name__ == '__main__':
   absltest.main()

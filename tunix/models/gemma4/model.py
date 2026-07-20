@@ -21,7 +21,7 @@ import dataclasses
 import enum
 from functools import partial
 import itertools
-from typing import Any, Literal, Tuple
+from typing import Any, Literal, Self, Tuple
 
 import flax
 from flax import nnx
@@ -77,7 +77,8 @@ StackedCache = tuple[LayerCache | None, ...]
 TransientKVs = dict[str, tuple[jaxtyping.Array, jaxtyping.Array]]
 
 
-@flax.struct.dataclass
+@jax.tree_util.register_pytree_node_class
+@dataclasses.dataclass
 class GemmaOutput:
   """Output of the Gemma4 model.
 
@@ -94,9 +95,18 @@ class GemmaOutput:
       out.logits, out.cache, out.hidden_states
   """
 
-  logits: jaxtyping.Array
+  logits: jax.Array
   cache: Cache | StackedCache | None = None
-  hidden_states: jaxtyping.Array | None = None
+  hidden_states: jax.Array | None = None
+
+  def tree_flatten(self) -> tuple[tuple[Any, ...], Any]:
+    children = (self.logits, self.cache, self.hidden_states)
+    aux_data = None
+    return (children, aux_data)
+
+  @classmethod
+  def tree_unflatten(cls, aux_data: Any, children: tuple[Any, ...]) -> Self:
+    return cls(*children)
 
   def __iter__(self):
     """Yield (logits, cache) for backward-compatible tuple unpacking."""
