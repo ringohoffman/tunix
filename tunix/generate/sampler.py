@@ -21,6 +21,7 @@ import dataclasses
 import inspect
 from typing import Any, Optional
 import warnings
+import time
 
 from absl import logging
 import flax
@@ -1008,6 +1009,8 @@ class Sampler(base_sampler.BaseSampler):
       seed = jax.random.PRNGKey(0)
     elif isinstance(seed, int):
       seed = jax.random.PRNGKey(seed)
+    logging.info('[Sampler] phase=init_sample_state START')
+    t0 = time.monotonic()
     sampling_state = self.init_sample_state(
         jnp.array(all_input_ids),
         include_logits=return_logits,
@@ -1020,16 +1023,23 @@ class Sampler(base_sampler.BaseSampler):
         beam_size=beam_size,
         include_logprobs=return_logprobs,
     )
+    logging.info('[Sampler] phase=init_sample_state DONE (%.3fs)', time.monotonic() - t0)
+    logging.info('[Sampler] phase=prefill START')
+    t0 = time.monotonic()
     sampling_state = self._compiled_prefill_fn(
         self._flattened_transformer_state,
         sampling_state,
         processed_images,
         echo=echo,
     )
+    logging.info('[Sampler] phase=prefill DONE (%.3fs)', time.monotonic() - t0)
 
+    logging.info('[Sampler] phase=decode START')
+    t0 = time.monotonic()
     sampling_state = self._compiled_decode_fn(
         self._flattened_transformer_state, sampling_state
     )
+    logging.info('[Sampler] phase=decode DONE (%.3fs)', time.monotonic() - t0)
     token_buffers = sampling_state.token_buffer
     logits_buffers = sampling_state.logits_buffer
 
