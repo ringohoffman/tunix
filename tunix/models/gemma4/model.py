@@ -36,7 +36,6 @@ from jax.experimental.pallas.ops.tpu.splash_attention import (
     splash_attention_mask as mask_lib,
 )
 from jax.experimental.shard_map import shard_map
-from jax.interpreters import pxla
 import jax.sharding as shd
 from jax.sharding import PartitionSpec as P
 import jaxtyping
@@ -45,7 +44,7 @@ from tunix.generate.mappings import BackendMappingMixin
 from tunix.models.gemma4 import moe
 from tunix.utils import compat
 from tunix.utils import env_utils
-from tunix.utils.sharding_utils import get_current_mesh, shard
+from tunix.utils import sharding_utils
 
 # JAX checkpoint policy type — matches nnx.remat's policy parameter.
 CheckpointPolicy = Callable[..., bool]
@@ -536,7 +535,7 @@ class Embedder(nnx.Module):
     x = self.input_embedding[(x,)]
     x *= jnp.sqrt(x.shape[-1]).astype(x.dtype)
     x = jnp.astype(x, self.config.dtype)
-    x = shard(x, self.config.shd_config.act_btd)
+    x = sharding_utils.shard(x, self.config.shd_config.act_btd)
     return x
 
   def encode_per_layer_input(
@@ -880,7 +879,9 @@ class Attention(nnx.Module):
     x = x.astype(self.config.dtype)
     seq_len = x.shape[1]
     query_proj = self.q_einsum(x)
-    query_proj = shard(query_proj, self.config.shd_config.act_btnh)
+    query_proj = sharding_utils.shard(
+        query_proj, self.config.shd_config.act_btnh
+    )
     query_proj = self._query_norm(query_proj)
     query_proj = apply_rope(
         query_proj,
@@ -901,8 +902,10 @@ class Attention(nnx.Module):
       else:
         key_proj, value_proj = self.kv_einsum(x)
 
-      key_proj = shard(key_proj, self.config.shd_config.act_btnh)
-      value_proj = shard(value_proj, self.config.shd_config.act_btnh)
+      key_proj = sharding_utils.shard(key_proj, self.config.shd_config.act_btnh)
+      value_proj = sharding_utils.shard(
+          value_proj, self.config.shd_config.act_btnh
+      )
 
       # Apply norms to computed KV
       value_var = jnp.mean(jnp.square(value_proj), axis=-1, keepdims=True)
@@ -973,7 +976,7 @@ class Attention(nnx.Module):
       key_proj = key_proj.transpose(0, 2, 1, 3)
       value_proj = value_proj.transpose(0, 2, 1, 3)
 
-      mesh = get_current_mesh()
+      mesh = shd.get_abstract_mesh()
       if self.attn_type == AttentionType.LOCAL_SLIDING:
         mask = mask_lib.LocalMask(
             (seq_len, seq_len),
@@ -1189,7 +1192,9 @@ class Attention(nnx.Module):
         encoded = jnp.einsum("BTNS,BSNH->BTNH", attn, value_proj)
 
     attn_output = self.attn_vec_einsum(encoded)
-    attn_output = shard(attn_output, self.config.shd_config.act_btd)
+    attn_output = sharding_utils.shard(
+        attn_output, self.config.shd_config.act_btd
+    )
     return new_cache, attn_output, (key_proj, value_proj)
 
   @property
@@ -1238,17 +1243,17 @@ class Attention(nnx.Module):
       cache_len = min(max_seq_len, self.config.sliding_window_size)
 
     cache_shape = (batch_size, cache_len, self.num_kv_heads, self.head_dim)
-    k = shard(
+    k = sharding_utils.shard(
         np.zeros(cache_shape, dtype),
         self.config.shd_config.act_btnh,
         eager=True,
     )
-    v = shard(
+    v = sharding_utils.shard(
         np.zeros(cache_shape, dtype),
         self.config.shd_config.act_btnh,
         eager=True,
     )
-    end_index = shard(
+    end_index = sharding_utils.shard(
         np.zeros((batch_size,), np.int32),
         self.config.shd_config.act_btnh[:1],
         eager=True,
@@ -1897,7 +1902,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
             (b, t, num_scan_groups, pattern_len, d)
         )
         shd_b, shd_t, _, _ = self.config.shd_config.act_btnh
-        scan_per_layer_inputs = shard(
+        scan_per_layer_inputs = sharding_utils.shard(
             jnp.transpose(reshaped, (2, 0, 1, 3, 4)),
             (None, shd_b, shd_t, None, None),
         )
@@ -1954,9 +1959,11 @@ class Gemma4(BackendMappingMixin, nnx.Module):
             shd_btnh = (None, *self.config.shd_config.act_btnh)
             shd_b = (None, *self.config.shd_config.act_btnh[:1])
             scan_cache_list.append({
-                "k": shard(jnp.stack(ks, axis=0), shd_btnh),
-                "v": shard(jnp.stack(vs, axis=0), shd_btnh),
-                "end_index": shard(jnp.stack(end_indices, axis=0), shd_b),
+                "k": sharding_utils.shard(jnp.stack(ks, axis=0), shd_btnh),
+                "v": sharding_utils.shard(jnp.stack(vs, axis=0), shd_btnh),
+                "end_index": sharding_utils.shard(
+                    jnp.stack(end_indices, axis=0), shd_b
+                ),
             })
           else:
             scan_cache_list.append(None)
@@ -2053,7 +2060,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
           (b, t, num_scan_groups, pattern_len, d)
       )
       shd_b, shd_t, _, _ = self.config.shd_config.act_btnh
-      scan_per_layer_inputs = shard(
+      scan_per_layer_inputs = sharding_utils.shard(
           jnp.transpose(reshaped, (2, 0, 1, 3, 4)),
           (None, shd_b, shd_t, None, None),
       )
@@ -2123,7 +2130,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
           shd_btnh = (None, *self.config.shd_config.act_btnh)
           shd_b = (None, *self.config.shd_config.act_btnh[:1])
           scan_cache_list.append({
-              "k": shard(
+              "k": sharding_utils.shard(
                   np.zeros(
                       (num_scan_groups, *proto_cache["k"].shape),
                       dtype=proto_cache["k"].dtype,
@@ -2131,7 +2138,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
                   shd_btnh,
                   eager=True,
               ),
-              "v": shard(
+              "v": sharding_utils.shard(
                   np.zeros(
                       (num_scan_groups, *proto_cache["v"].shape),
                       dtype=proto_cache["v"].dtype,
@@ -2139,7 +2146,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
                   shd_btnh,
                   eager=True,
               ),
-              "end_index": shard(
+              "end_index": sharding_utils.shard(
                   np.zeros(
                       (num_scan_groups, *proto_cache["end_index"].shape),
                       dtype=proto_cache["end_index"].dtype,
