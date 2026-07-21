@@ -1356,17 +1356,17 @@ class Attention(nnx.Module):
 
     cache_shape = (batch_size, cache_len, self.num_kv_heads, self.head_dim)
     k = sharding_utils.shard(
-        np.zeros(cache_shape, dtype),
+        jnp.zeros(cache_shape, dtype),
         self.config.shd_config.act_btnh,
         eager=True,
     )
     v = sharding_utils.shard(
-        np.zeros(cache_shape, dtype),
+        jnp.zeros(cache_shape, dtype),
         self.config.shd_config.act_btnh,
         eager=True,
     )
     end_index = sharding_utils.shard(
-        np.zeros((batch_size,), np.int32),
+        jnp.zeros((batch_size,), jnp.int32),
         self.config.shd_config.act_btnh[:1],
         eager=True,
     )
@@ -2391,7 +2391,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
           shd_b = (None, *self.config.shd_config.act_btnh[:1])
           scan_cache_list.append({
               "k": sharding_utils.shard(
-                  np.zeros(
+                  jnp.zeros(
                       (num_scan_groups, *proto_cache["k"].shape),
                       dtype=proto_cache["k"].dtype,
                   ),
@@ -2399,7 +2399,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
                   eager=True,
               ),
               "v": sharding_utils.shard(
-                  np.zeros(
+                  jnp.zeros(
                       (num_scan_groups, *proto_cache["v"].shape),
                       dtype=proto_cache["v"].dtype,
                   ),
@@ -2407,7 +2407,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
                   eager=True,
               ),
               "end_index": sharding_utils.shard(
-                  np.zeros(
+                  jnp.zeros(
                       (num_scan_groups, *proto_cache["end_index"].shape),
                       dtype=proto_cache["end_index"].dtype,
                   ),
