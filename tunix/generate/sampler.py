@@ -1072,9 +1072,19 @@ class Sampler(base_sampler.BaseSampler):
           expected_mesh=self.data_sharding.mesh,
           label='KV cache',
       )
+      sharding_utils.validate_shardings(
+          self._flattened_transformer_state,
+          expected_mesh=self.data_sharding.mesh,
+          label='Transformer parameters',
+      )
+      sharding_utils.validate_shardings(
+          sampling_state,
+          expected_mesh=self.data_sharding.mesh,
+          label='Sampling state',
+      )
     except ValueError as e:
       logging.error(
-          'KV cache sharding validation FAILED — this will cause a '
+          'Sharding validation FAILED — this will cause a '
           'JIT compilation cache miss and likely proxy OOM: %s', e,
       )
       raise
