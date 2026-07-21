@@ -2397,7 +2397,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
       cache[f"layer_{i}"] = layer.init_cache(batch_size, max_seq_len, dtype)
     return cache
 
-  def get_model_input(self):
+  def get_model_input(self) -> GemmaInput:
     """Returns a dummy model input for the transformer.
 
     This dummy input has a batch size compatible with FSDP sharding on a

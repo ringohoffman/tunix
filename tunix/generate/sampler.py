@@ -20,19 +20,20 @@ from collections.abc import Iterable, Sequence
 import contextlib
 import dataclasses
 import inspect
-from typing import Any, Optional
-import warnings
 import time
+from typing import Any, Literal, TypeGuard, TypedDict, overload
+import warnings
 
 from absl import logging
 import flax
-import flax.typing
 from flax import nnx
 from flax.nnx import filterlib
 from flax.nnx import graph
 from flax.nnx import statelib
+import flax.typing
 import jax
 import jax.numpy as jnp
+import jax.typing
 import jaxtyping
 import numpy as np
 from tunix.generate import base_sampler
@@ -44,6 +45,19 @@ from tunix.utils.sharding_utils import get_current_mesh
 
 LayerCache = dict[str, jaxtyping.Array]
 Cache = dict[str, LayerCache]
+
+
+def is_variable(x: Any) -> TypeGuard[nnx.Variable[jax.Array]]:
+  """TypeGuard for nnx.Variable leaves in jax.tree flattening."""
+  return isinstance(x, nnx.Variable)
+
+
+class SamplingParameters(TypedDict, total=False):
+  """Sampling parameters for top_p or beam search."""
+
+  beam_size: int
+  top_p: float
+  top_k: int | None
 
 
 @flax.struct.dataclass
@@ -92,9 +106,7 @@ class _SamplingState:
   # Sampling parameters.
   # For top_p, it contains "top_p" and "top_k".
   # For beam search, it contains "beam_size"
-  sampling_parameters: dict[str, float | int] = flax.struct.field(
-      pytree_node=False
-  )
+  sampling_parameters: SamplingParameters = flax.struct.field(pytree_node=False)
 
   # Only present when sampling_mode is "beam_search".
   beam_search_sampling_state: (
@@ -178,6 +190,8 @@ def _init_cache(
     num_kv_heads: int,
     head_dim: int,
     dtype: jnp.dtype,
+    batch_sharding: jax.sharding.NamedSharding,
+    data_sharding: jax.sharding.NamedSharding,
 ) -> Cache:
   """Create KV cache for the transformer.
 
@@ -188,25 +202,42 @@ def _init_cache(
     num_kv_heads: The number of KV attention heads.
     head_dim: The dimension of the KV attention head.
     dtype: The data type of the cache.
+    batch_sharding: NamedSharding for 1D batch-sliced arrays of shape [B].
+    data_sharding: NamedSharding for 4D KV cache tensors of shape [B, S, H, D].
 
   Returns:
     The KV cache for one attention block.
   """
 
   shape = (batch_size, cache_size, num_kv_heads, head_dim)
-  # Jax array is immutable, so updates to each layer creates new arrays.
   return {
       f'layer_{i}': {
-          'k': jnp.zeros(shape, dtype=dtype),
-          'v': jnp.zeros(shape, dtype=dtype),
-          'end_index': jnp.zeros((batch_size,), dtype=jnp.int32)
+          'k': jax.device_put(jnp.zeros(shape, dtype=dtype), data_sharding),
+          'v': jax.device_put(jnp.zeros(shape, dtype=dtype), data_sharding),
+          'end_index': jax.device_put(
+              jnp.zeros((batch_size,), dtype=jnp.int32), batch_sharding
+          ),
       }
       for i in range(n_layers)
   }
 
 
 class Sampler(base_sampler.BaseSampler):
-  """Sampler for transformer model."""
+  """Sampler for transformer model.
+
+  Args:
+    transformer: An instance of the transformer model.
+    tokenizer: A tokenizer for the given model.
+    cache_config: Configuration for the KV cache.
+    image_processor: Optional image processor for vision-language models.
+    eos_tokens: End-of-sequence token IDs. Defaults to tokenizer's eos_id.
+    data_sharding: Explicit `NamedSharding` for input batch arrays (e.g.
+      `NamedSharding(mesh, PartitionSpec("fsdp", None))`). If `None`, the
+      sharding is automatically derived from the active `jax.set_mesh()` context
+      and model `shd_config`. Every generation call on this sampler instance
+      will use `self.data_sharding` to ensure JIT static signature invariance
+      and prevent Pathways proxy compilation cache misses.
+  """
 
   def __init__(
       self,
@@ -215,18 +246,8 @@ class Sampler(base_sampler.BaseSampler):
       cache_config: CacheConfig,
       image_processor: image_processor_lib.ImageProcessor | None = None,
       eos_tokens: Sequence[int] | None = None,
-  ):
-    """Initializes the sampler.
-
-    Args:
-      transformer: an instance of the transformer.
-      tokenizer: a tokenizer for the given model.
-      cache_config: configuration for the KV cache.
-      image_processor: The image processor.
-      eos_tokens: End-of-sequence token IDs.  Defaults to the tokenizer's
-        eos_id.  Can be overridden per-call in __call__/generate/
-        generate_from_tokens.
-    """
+      data_sharding: jax.sharding.NamedSharding | None = None,
+  ) -> None:
     self.tokenizer = tokenizer
     if not isinstance(tokenizer, tok_adapter.TokenizerAdapter):
       self.tokenizer = tok_adapter.TokenizerAdapter(tokenizer)
@@ -235,15 +256,43 @@ class Sampler(base_sampler.BaseSampler):
     self.eos_ids = jnp.array(
         eos_tokens if eos_tokens is not None else [self.tokenizer.eos_id()]
     )
+
+    if data_sharding is None:
+      mesh = get_current_mesh()
+      if mesh is not None and not mesh.empty:
+        shd_config = getattr(
+            getattr(transformer, 'config', None), 'shd_config', None
+        )
+        batch_axis = (
+            shd_config.act_btd[0]
+            if shd_config is not None and hasattr(shd_config, 'act_btd')
+            else ('fsdp' if 'fsdp' in mesh.shape else None)
+        )
+        data_sharding = jax.sharding.NamedSharding(
+            mesh, jax.sharding.PartitionSpec(batch_axis, None)
+        )
+      else:
+        active_mesh = jax.sharding.Mesh(np.array(jax.devices()[:1]), ('dev',))
+        data_sharding = jax.sharding.NamedSharding(
+            active_mesh, jax.sharding.PartitionSpec()
+        )
+    self.data_sharding = data_sharding
+    batch_axis = data_sharding.spec[0] if len(data_sharding.spec) > 0 else None
+    self.batch_sharding = jax.sharding.NamedSharding(
+        data_sharding.mesh,
+        jax.sharding.PartitionSpec(batch_axis),
+    )
+    self.logits_sharding = jax.sharding.NamedSharding(
+        data_sharding.mesh,
+        jax.sharding.PartitionSpec(batch_axis, None, None),
+    )
+
     self._transformer_graphdef: graph.NodeDef = nnx.graphdef(transformer)
     self._transformer_state: nnx.State[
-      flax.typing.PathParts, nnx.Variable[jax.Array]
+        flax.typing.PathParts, nnx.Variable[jax.Array]
     ] = nnx.variables(transformer)
-    self._flattened_transformer_state: list[
-      nnx.Variable[jax.Array]
-    ] = jax.tree.leaves(
-      self._transformer_state,
-      is_leaf=lambda x: isinstance(x, nnx.Variable),
+    self._flattened_transformer_state: list[nnx.Variable[jax.Array]] = (
+        jax.tree.leaves(self._transformer_state, is_leaf=is_variable)
     )
     # We separate out state and graph def so that the state can be passed as an
     # argument to _decode_fn, resulting in it not being treated as a static
@@ -290,7 +339,7 @@ class Sampler(base_sampler.BaseSampler):
       jax.tree_util.tree_map(
           lambda x: param_types.add(type(x)),
           tree,
-          is_leaf=lambda x: isinstance(x, nnx.Variable),
+          is_leaf=is_variable,
       )
       return param_types
 
@@ -369,7 +418,7 @@ class Sampler(base_sampler.BaseSampler):
 
     self._flattened_transformer_state = jax.tree.leaves(
         self._transformer_state,
-        is_leaf=lambda x: isinstance(x, nnx.Variable),
+        is_leaf=is_variable,
     )
 
   @property
@@ -387,32 +436,32 @@ class Sampler(base_sampler.BaseSampler):
       include_logits: bool,
       forbidden_token_ids: tuple[int, ...] | None,
       temperature: float,
-      top_p: Optional[float],
-      top_k: Optional[int],
+      top_p: float | None,
+      top_k: int | None,
       seed: jax.Array,
-      beam_size: Optional[int],
+      beam_size: int | None,
       include_logprobs: bool = False,
   ) -> _SamplingState:
     """Initializes the sampling state given input prompts."""
-    batch_size = all_input_ids.shape[0]
-    num_input_tokens = all_input_ids.shape[1]
+    batch_size, num_input_tokens, *_ = all_input_ids.shape
 
     token_buffer = jnp.full(
-        (
-            batch_size,
-            total_sampling_steps,
-        ),
+        (batch_size, total_sampling_steps),
         self.tokenizer.pad_id(),
         dtype=jnp.int32,
     )
-    input_mask = jnp.ones_like(token_buffer, dtype=jnp.bool_)
     token_buffer = token_buffer.at[:, :num_input_tokens].set(all_input_ids)
-    input_mask = input_mask.at[:, :num_input_tokens].set(
-        all_input_ids != self.tokenizer.pad_id()
-    )
-    positions = utils.build_positions_from_mask(input_mask)
+    token_buffer = jax.device_put(token_buffer, self.data_sharding)
 
-    done = jnp.zeros((batch_size,), dtype=jnp.bool_)
+    positions = jax.device_put(
+        utils.build_positions_from_mask(
+            token_buffer != self.tokenizer.pad_id()
+        ),
+        self.data_sharding,
+    )
+    done = jax.device_put(
+        jnp.zeros((batch_size,), dtype=jnp.bool_), self.batch_sharding
+    )
 
     if hasattr(self.transformer, 'init_cache'):
       cache = self.transformer.init_cache(
@@ -431,24 +480,31 @@ class Sampler(base_sampler.BaseSampler):
           num_kv_heads=self.cache_config.num_kv_heads,
           head_dim=self.cache_config.head_dim,
           dtype=self.dtype,
+          batch_sharding=self.batch_sharding,
+          data_sharding=self.data_sharding,
       )
 
-    if include_logits:
-      logits_buffer = jnp.zeros(
-          (batch_size, total_sampling_steps, self.transformer.num_embed),
-          dtype=jnp.float32,
-      )
-    else:
-      logits_buffer = None
+    logits_buffer = (
+        jax.device_put(
+            jnp.zeros(
+                (batch_size, total_sampling_steps, self.transformer.num_embed),
+                dtype=jnp.float32,
+            ),
+            self.logits_sharding,
+        )
+        if include_logits
+        else None
+    )
 
-    if include_logprobs:
-      logprobs_buffer = jnp.zeros(
-          (batch_size, total_sampling_steps),
-          dtype=jnp.float32,
-      )
-    else:
-      logprobs_buffer = None
-    sampling_parameters = {}
+    logprobs_buffer = (
+        jax.device_put(
+            jnp.zeros((batch_size, total_sampling_steps), dtype=jnp.float32),
+            self.data_sharding,
+        )
+        if include_logprobs
+        else None
+    )
+    sampling_parameters: SamplingParameters = {}
     sampling_mode = [None]
 
     if beam_size is not None:
@@ -617,10 +673,7 @@ class Sampler(base_sampler.BaseSampler):
     # Merge once at the JIT boundary, outside any traced control flow.
     transformer = nnx.merge(self._transformer_graphdef, params)
     kwargs = {} if images is None else {'images': images}
-    decode_only_last_token = (
-        self._supports_decode_only_last_token
-        and not echo
-    )
+    decode_only_last_token = self._supports_decode_only_last_token and not echo
     if decode_only_last_token:
       kwargs['decode_only_last_token'] = True
     logits, cache = transformer(
@@ -732,10 +785,10 @@ class Sampler(base_sampler.BaseSampler):
     """Performs a single sampling step.
 
     Args:
-      transformer: An already-merged NNX module. Must NOT be re-merged
-        from (graphdef, state) inside this function, because it is called
-        inside an nnx.while_loop body where NNX handles the graph state
-        serialization automatically.
+      transformer: An already-merged NNX module. Must NOT be re-merged from
+        (graphdef, state) inside this function, because it is called inside an
+        nnx.while_loop body where NNX handles the graph state serialization
+        automatically.
       sampler_state: The current sampling state.
 
     Returns:
@@ -793,9 +846,9 @@ class Sampler(base_sampler.BaseSampler):
       eos_tokens: Sequence[int] | None = None,
       forbidden_tokens: Iterable[int] | None = None,
       temperature: float = 0.0,
-      top_p: Optional[float] = None,
-      top_k: Optional[int] = None,
-      beam_size: Optional[int] = None,
+      top_p: float | None = None,
+      top_k: int | None = None,
+      beam_size: int | None = None,
       seed: int | None = None,
       pad_output: bool = False,
       images: (
@@ -894,9 +947,9 @@ class Sampler(base_sampler.BaseSampler):
       eos_tokens: Sequence[int] | None = None,
       forbidden_tokens: Iterable[int] | None = None,
       temperature: float = 0.0,
-      top_p: Optional[float] = None,
-      top_k: Optional[int] = None,
-      beam_size: Optional[int] = None,
+      top_p: float | None = None,
+      top_k: int | None = None,
+      beam_size: int | None = None,
       seed: int | None = None,
       echo: bool = False,
       return_logits: bool = False,
@@ -916,8 +969,8 @@ class Sampler(base_sampler.BaseSampler):
     accelerator is busy decoding the previous batch.
 
     Args:
-      input_ids: Left-padded token IDs of shape [B, prompt_len]. Padding
-        should use the tokenizer's pad_id.
+      input_ids: Left-padded token IDs of shape [B, prompt_len]. Padding should
+        use the tokenizer's pad_id.
       max_generation_steps: Maximum number of tokens to generate.
       eos_tokens: End-of-sequence tokens. Defaults to tokenizer's eos_id.
       forbidden_tokens: Token IDs that are disallowed during generation.
@@ -974,9 +1027,9 @@ class Sampler(base_sampler.BaseSampler):
       return_logprobs: bool = False,
       forbidden_token_ids: tuple[int, ...] | None = None,
       temperature: float = 0.0,
-      top_p: Optional[float] = None,
-      top_k: Optional[int] = None,
-      beam_size: Optional[int] = None,
+      top_p: float | None = None,
+      top_k: int | None = None,
+      beam_size: int | None = None,
       seed: int | jax.Array | None = None,
       pad_output: bool = False,
       processed_images: jnp.ndarray | None = None,
@@ -1033,7 +1086,10 @@ class Sampler(base_sampler.BaseSampler):
           beam_size=beam_size,
           include_logprobs=return_logprobs,
       )
-      logging.info('[Sampler] phase=init_sample_state DONE (%.3fs)', time.monotonic() - t0)
+      logging.info(
+          '[Sampler] phase=init_sample_state DONE (%.3fs)',
+          time.monotonic() - t0,
+      )
       logging.info('[Sampler] phase=prefill START')
       t0 = time.monotonic()
       sampling_state = self._compiled_prefill_fn(
@@ -1042,7 +1098,9 @@ class Sampler(base_sampler.BaseSampler):
           processed_images,
           echo=echo,
       )
-      logging.info('[Sampler] phase=prefill DONE (%.3fs)', time.monotonic() - t0)
+      logging.info(
+          '[Sampler] phase=prefill DONE (%.3fs)', time.monotonic() - t0
+      )
 
       logging.info('[Sampler] phase=decode START')
       t0 = time.monotonic()
