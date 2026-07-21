@@ -41,7 +41,7 @@ from tunix.generate import utils
 import tunix.generate.beam_search as beam_search_lib
 import tunix.generate.tokenizer_adapter as tok_adapter
 from tunix.processors import image_processor as image_processor_lib
-from tunix.utils.sharding_utils import get_current_mesh
+from tunix.utils import sharding_utils
 
 LayerCache = dict[str, jaxtyping.Array]
 Cache = dict[str, LayerCache]
@@ -252,7 +252,7 @@ class Sampler(base_sampler.BaseSampler):
     )
 
     if data_sharding is None:
-      mesh = get_current_mesh()
+      mesh = sharding_utils.get_current_mesh()
       if mesh is not None and not mesh.empty:
         shd_config = getattr(
             getattr(transformer, 'config', None), 'shd_config', None
@@ -1046,10 +1046,15 @@ class Sampler(base_sampler.BaseSampler):
           f' cache size {self.cache_config.cache_size}.'
       )
 
-    mesh = get_current_mesh()
+    mesh = sharding_utils.get_current_mesh()
+    # Activate the mesh context for both concrete Mesh and AbstractMesh.
+    # On Pathways, only AbstractMesh may be available via jax.set_mesh().
+    # The old code checked `isinstance(mesh, jax.sharding.Mesh)` which
+    # excluded AbstractMesh → no mesh context during generation → cache
+    # arrays created without sharding → JIT cache miss → proxy OOM.
     mesh_ctx = (
         jax.set_mesh(mesh)
-        if (isinstance(mesh, jax.sharding.Mesh) and not mesh.empty)
+        if (mesh is not None and not mesh.empty)
         else contextlib.nullcontext()
     )
     with mesh_ctx:
@@ -1071,6 +1076,26 @@ class Sampler(base_sampler.BaseSampler):
           '[Sampler] phase=init_sample_state DONE (%.3fs)',
           time.monotonic() - t0,
       )
+
+      # Validate shardings before dispatch to catch cache misses early.
+      # On Pathways, a sharding mismatch causes the proxy to recompile
+      # (costing ~90 GB proxy RAM for a 31B model) and crash.
+      sharding_utils.log_sharding_summary(
+          sampling_state.cache, label='KV cache (before prefill)'
+      )
+      try:
+        sharding_utils.validate_shardings(
+            sampling_state.cache,
+            expected_mesh=self.data_sharding.mesh,
+            label='KV cache',
+        )
+      except ValueError as e:
+        logging.error(
+            'KV cache sharding validation FAILED — this will cause a '
+            'JIT compilation cache miss and likely proxy OOM: %s', e,
+        )
+        raise
+
       logging.info('[Sampler] phase=prefill START')
       t0 = time.monotonic()
       sampling_state = self._compiled_prefill_fn(
