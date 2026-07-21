@@ -14,7 +14,7 @@
 
 """Utilities for sharding tensors."""
 
-from typing import Tuple
+from __future__ import annotations
 
 import jax
 from jax.interpreters import pxla
@@ -23,7 +23,7 @@ import numpy as np
 
 
 def shard_input(
-    input_data: jax.Array, data_sharding_axis: Tuple[str, ...]
+    input_data: jax.Array, data_sharding_axis: tuple[str, ...]
 ) -> jax.Array:
   """Shards the input data across the available devices.
 
@@ -73,8 +73,33 @@ def shard_input(
     )
 
 
-def get_sharding(x: jax.Array, mesh: shd.Mesh, pspec: shd.PartitionSpec):
-  """Get a sharding for an tensor given a mesh and partition spec."""
+def get_sharding(
+    x: np.ndarray | jax.Array,
+    mesh: shd.Mesh,
+    pspec: shd.PartitionSpec,
+    *,
+    strict: bool = False,
+) -> shd.NamedSharding:
+  """Get a sharding for a tensor given a mesh and partition spec.
+
+  Args:
+    x: The array to determine sharding for.
+    mesh: The device mesh to shard across.
+    pspec: The desired partition spec.
+    strict: If True, raise ``ValueError`` when the array's shape is not
+      evenly divisible by the mesh axis sizes (instead of silently falling
+      back to full replication).  Enable this for data batches where an
+      indivisible dimension indicates a configuration bug.
+
+  Returns:
+    A ``NamedSharding`` matching ``pspec`` if the array is compatible,
+    or a fully-replicated sharding if the array is scalar, low-rank,
+    or (when ``strict=False``) not evenly divisible.
+
+  Raises:
+    ValueError: If ``strict=True`` and the array is not evenly divisible
+      along a sharded axis.
+  """
   # Only shard arrays with rank > 0.
   if not isinstance(x, (np.ndarray, jax.Array)) or x.ndim == 0:
     return shd.NamedSharding(mesh, shd.PartitionSpec())  # Replicated
@@ -90,6 +115,13 @@ def get_sharding(x: jax.Array, mesh: shd.Mesh, pspec: shd.PartitionSpec):
       for name in axis_names:
         axis_size = mesh.shape[name]
         if x.shape[i] % axis_size != 0:
+          if strict:
+            raise ValueError(
+                f"Array dimension {i} (size={x.shape[i]}) is not evenly "
+                f"divisible by mesh axis '{name}' (size={axis_size}). "
+                f"Array shape: {x.shape}, pspec: {pspec}. "
+                f"This usually means the batch size is misconfigured."
+            )
           # Replicate if not evenly divisible.
           return shd.NamedSharding(mesh, shd.PartitionSpec())
   return shd.NamedSharding(mesh, pspec)

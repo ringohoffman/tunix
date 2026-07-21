@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
-import contextlib
 import dataclasses
 import inspect
 import time
@@ -225,12 +224,6 @@ class Sampler(base_sampler.BaseSampler):
     cache_config: Configuration for the KV cache.
     image_processor: Optional image processor for vision-language models.
     eos_tokens: End-of-sequence token IDs. Defaults to tokenizer's eos_id.
-    data_sharding: Explicit `NamedSharding` for input batch arrays (e.g.
-      `NamedSharding(mesh, PartitionSpec("fsdp", None))`). If `None`, the
-      sharding is automatically derived from the active `jax.set_mesh()` context
-      and model `shd_config`. Every generation call on this sampler instance
-      will use `self.data_sharding` to ensure JIT static signature invariance
-      and prevent Pathways proxy compilation cache misses.
   """
 
   def __init__(
@@ -240,7 +233,6 @@ class Sampler(base_sampler.BaseSampler):
       cache_config: CacheConfig,
       image_processor: image_processor_lib.ImageProcessor | None = None,
       eos_tokens: Sequence[int] | None = None,
-      data_sharding: jax.sharding.NamedSharding | None = None,
   ) -> None:
     self.tokenizer = tokenizer
     if not isinstance(tokenizer, tok_adapter.TokenizerAdapter):
@@ -251,33 +243,36 @@ class Sampler(base_sampler.BaseSampler):
         eos_tokens if eos_tokens is not None else [self.tokenizer.eos_id()]
     )
 
-    if data_sharding is None:
-      mesh = sharding_utils.get_current_mesh()
-      if mesh is not None and not mesh.empty:
-        shd_config = getattr(
-            getattr(transformer, 'config', None), 'shd_config', None
-        )
-        batch_axis = (
-            shd_config.act_btd[0]
-            if shd_config is not None and hasattr(shd_config, 'act_btd')
-            else ('fsdp' if 'fsdp' in mesh.shape else None)
-        )
-        data_sharding = jax.sharding.NamedSharding(
-            mesh, jax.sharding.PartitionSpec(batch_axis, None)
-        )
+    mesh = jax.sharding.get_mesh()
+    if mesh.empty:
+      mesh = jax.sharding.get_abstract_mesh()
+    if not mesh.empty:
+      shd_config = getattr(
+          getattr(transformer, 'config', None), 'shd_config', None
+      )
+      if shd_config is not None and hasattr(shd_config, 'input_pspec'):
+        # Preferred: explicit input sharding from model config.
+        input_pspec = shd_config.input_pspec
+      elif shd_config is not None and hasattr(shd_config, 'act_btd'):
+        # Legacy fallback: infer batch axis from activation spec.
+        batch_axis = shd_config.act_btd[0]
+        input_pspec = jax.sharding.PartitionSpec(batch_axis, None)
       else:
-        active_mesh = jax.sharding.Mesh(np.array(jax.devices()[:1]), ('dev',))
-        data_sharding = jax.sharding.NamedSharding(
-            active_mesh, jax.sharding.PartitionSpec()
-        )
-    self.data_sharding = data_sharding
-    batch_axis = data_sharding.spec[0] if len(data_sharding.spec) > 0 else None
+        batch_axis = 'fsdp' if 'fsdp' in mesh.shape else None
+        input_pspec = jax.sharding.PartitionSpec(batch_axis, None)
+      self.data_sharding = jax.sharding.NamedSharding(mesh, input_pspec)
+    else:
+      active_mesh = jax.sharding.Mesh(np.array(jax.devices()[:1]), ('dev',))
+      self.data_sharding = jax.sharding.NamedSharding(
+          active_mesh, jax.sharding.PartitionSpec()
+      )
+    batch_axis = self.data_sharding.spec[0] if len(self.data_sharding.spec) > 0 else None
     self.batch_sharding = jax.sharding.NamedSharding(
-        data_sharding.mesh,
+        self.data_sharding.mesh,
         jax.sharding.PartitionSpec(batch_axis),
     )
     self.logits_sharding = jax.sharding.NamedSharding(
-        data_sharding.mesh,
+        self.data_sharding.mesh,
         jax.sharding.PartitionSpec(batch_axis, None, None),
     )
 
@@ -1046,74 +1041,62 @@ class Sampler(base_sampler.BaseSampler):
           f' cache size {self.cache_config.cache_size}.'
       )
 
-    mesh = sharding_utils.get_current_mesh()
-    # Activate the mesh context for both concrete Mesh and AbstractMesh.
-    # On Pathways, only AbstractMesh may be available via jax.set_mesh().
-    # The old code checked `isinstance(mesh, jax.sharding.Mesh)` which
-    # excluded AbstractMesh → no mesh context during generation → cache
-    # arrays created without sharding → JIT cache miss → proxy OOM.
-    mesh_ctx = (
-        jax.set_mesh(mesh)
-        if (mesh is not None and not mesh.empty)
-        else contextlib.nullcontext()
+    logging.info('[Sampler] phase=init_sample_state START')
+    t0 = time.monotonic()
+    sampling_state = self.init_sample_state(
+        jnp.array(all_input_ids),
+        include_logits=return_logits,
+        total_sampling_steps=total_sampling_steps,
+        forbidden_token_ids=forbidden_token_ids,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        seed=seed,
+        beam_size=beam_size,
+        include_logprobs=return_logprobs,
     )
-    with mesh_ctx:
-      logging.info('[Sampler] phase=init_sample_state START')
-      t0 = time.monotonic()
-      sampling_state = self.init_sample_state(
-          jnp.array(all_input_ids),
-          include_logits=return_logits,
-          total_sampling_steps=total_sampling_steps,
-          forbidden_token_ids=forbidden_token_ids,
-          temperature=temperature,
-          top_p=top_p,
-          top_k=top_k,
-          seed=seed,
-          beam_size=beam_size,
-          include_logprobs=return_logprobs,
-      )
-      logging.info(
-          '[Sampler] phase=init_sample_state DONE (%.3fs)',
-          time.monotonic() - t0,
-      )
+    logging.info(
+        '[Sampler] phase=init_sample_state DONE (%.3fs)',
+        time.monotonic() - t0,
+    )
 
-      # Validate shardings before dispatch to catch cache misses early.
-      # On Pathways, a sharding mismatch causes the proxy to recompile
-      # (costing ~90 GB proxy RAM for a 31B model) and crash.
-      sharding_utils.log_sharding_summary(
-          sampling_state.cache, label='KV cache (before prefill)'
+    # Validate shardings before dispatch to catch cache misses early.
+    # On Pathways, a sharding mismatch causes the proxy to recompile
+    # (costing ~90 GB proxy RAM for a 31B model) and crash.
+    sharding_utils.log_sharding_summary(
+        sampling_state.cache, label='KV cache (before prefill)'
+    )
+    try:
+      sharding_utils.validate_shardings(
+          sampling_state.cache,
+          expected_mesh=self.data_sharding.mesh,
+          label='KV cache',
       )
-      try:
-        sharding_utils.validate_shardings(
-            sampling_state.cache,
-            expected_mesh=self.data_sharding.mesh,
-            label='KV cache',
-        )
-      except ValueError as e:
-        logging.error(
-            'KV cache sharding validation FAILED — this will cause a '
-            'JIT compilation cache miss and likely proxy OOM: %s', e,
-        )
-        raise
+    except ValueError as e:
+      logging.error(
+          'KV cache sharding validation FAILED — this will cause a '
+          'JIT compilation cache miss and likely proxy OOM: %s', e,
+      )
+      raise
 
-      logging.info('[Sampler] phase=prefill START')
-      t0 = time.monotonic()
-      sampling_state = self._compiled_prefill_fn(
-          self._flattened_transformer_state,
-          sampling_state,
-          processed_images,
-          echo=echo,
-      )
-      logging.info(
-          '[Sampler] phase=prefill DONE (%.3fs)', time.monotonic() - t0
-      )
+    logging.info('[Sampler] phase=prefill START')
+    t0 = time.monotonic()
+    sampling_state = self._compiled_prefill_fn(
+        self._flattened_transformer_state,
+        sampling_state,
+        processed_images,
+        echo=echo,
+    )
+    logging.info(
+        '[Sampler] phase=prefill DONE (%.3fs)', time.monotonic() - t0
+    )
 
-      logging.info('[Sampler] phase=decode START')
-      t0 = time.monotonic()
-      sampling_state = self._compiled_decode_fn(
-          self._flattened_transformer_state, sampling_state
-      )
-      logging.info('[Sampler] phase=decode DONE (%.3fs)', time.monotonic() - t0)
+    logging.info('[Sampler] phase=decode START')
+    t0 = time.monotonic()
+    sampling_state = self._compiled_decode_fn(
+        self._flattened_transformer_state, sampling_state
+    )
+    logging.info('[Sampler] phase=decode DONE (%.3fs)', time.monotonic() - t0)
     token_buffers = sampling_state.token_buffer
     logits_buffers = sampling_state.logits_buffer
 

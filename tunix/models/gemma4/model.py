@@ -288,31 +288,60 @@ class ShardingConfig:
   per_layer_input_gate: Tuple[str | None, ...]
   per_layer_projection: Tuple[str | None, ...]
   per_layer_input_embedding: Tuple[str | None, ...]
+  # Input data sharding (token IDs, masks, etc. of shape [B, T])
+  input_bt: Tuple[str | None, ...] = ('fsdp', None)
+
+  @property
+  def input_pspec(self) -> jax.sharding.PartitionSpec:
+    return jax.sharding.PartitionSpec(*self.input_bt)
 
   @staticmethod
   def get_default_sharding(is_sampling: bool = False) -> ShardingConfig:
-    fsdp = "fsdp" if not is_sampling else None
-
     return ShardingConfig(
-        emb_vd=("tp", fsdp),
-        q_weight_ndh=("tp", fsdp, None),
-        kv_weight_cndh=(None, "tp", fsdp, None),
-        qkv_weight_cndh=(None, "tp", fsdp, None),
-        o_weight_nhd=("tp", None, fsdp),
-        ffw_weight_df=(fsdp, "tp"),
-        ffw_weight_fd=("tp", fsdp),
+        emb_vd=("tp", "fsdp"),
+        q_weight_ndh=("tp", "fsdp", None),
+        kv_weight_cndh=(None, "tp", "fsdp", None),
+        qkv_weight_cndh=(None, "tp", "fsdp", None),
+        o_weight_nhd=("tp", None, "fsdp"),
+        ffw_weight_df=("fsdp", "tp"),
+        ffw_weight_fd=("tp", "fsdp"),
         rms_norm_weight=("tp",),
-        act_btd=(fsdp, None, None if is_sampling else "tp"),
-        act_btf=(fsdp, None, "tp"),
-        act_btnh=(fsdp, None, "tp", None),
-        vision_proj=(fsdp, "tp"),
+        act_btd=("fsdp", None, None if is_sampling else "tp"),
+        act_btf=("fsdp", None, "tp"),
+        act_btnh=("fsdp", None, "tp", None),
+        vision_proj=("fsdp", "tp"),
         vision_soft_emb_norm_weight=("tp",),
-        exp_weight_edf=(fsdp, None, None, "tp"),
-        exp_weight_efd=(fsdp, "tp", None),
-        per_layer_model_projection=(fsdp, None, "tp"),
-        per_layer_input_gate=(fsdp, "tp"),
-        per_layer_projection=("tp", fsdp),
-        per_layer_input_embedding=("tp", None, fsdp),
+        exp_weight_edf=("fsdp", None, None, "tp"),
+        exp_weight_efd=("fsdp", "tp", None),
+        per_layer_model_projection=("fsdp", None, "tp"),
+        per_layer_input_gate=("fsdp", "tp"),
+        per_layer_projection=("tp", "fsdp"),
+        per_layer_input_embedding=("tp", None, "fsdp"),
+    )
+
+  @staticmethod
+  def no_shard() -> ShardingConfig:
+    return ShardingConfig(
+        emb_vd=(None, None),
+        q_weight_ndh=(None, None, None),
+        kv_weight_cndh=(None, None, None, None),
+        qkv_weight_cndh=(None, None, None, None),
+        o_weight_nhd=(None, None, None),
+        ffw_weight_df=(None, None),
+        ffw_weight_fd=(None, None),
+        rms_norm_weight=(None,),
+        act_btd=(None, None, None),
+        act_btf=(None, None, None),
+        act_btnh=(None, None, None, None),
+        vision_proj=(None, None),
+        vision_soft_emb_norm_weight=(None,),
+        exp_weight_edf=(None, None, None, None),
+        exp_weight_efd=(None, None, None),
+        per_layer_model_projection=(None, None, None),
+        per_layer_input_gate=(None, None),
+        per_layer_projection=(None, None),
+        per_layer_input_embedding=(None, None, None),
+        input_bt=(None, None),
     )
 
   def with_scan_axis(self) -> Self:

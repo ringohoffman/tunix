@@ -43,10 +43,6 @@ def _make_sampler(
       config=tc.ModelConfig(vocab_size=vocab.GetPieceSize()),
       rngs=nnx.Rngs(42),
   )
-  data_sharding = jax.sharding.NamedSharding(
-      jax.sharding.Mesh(np.array(jax.devices()[:1]), ('dev',)),
-      jax.sharding.PartitionSpec(),
-  )
   sampler = sampler_lib.Sampler(
       transformer=transformer,
       tokenizer=vocab,
@@ -56,7 +52,6 @@ def _make_sampler(
           num_kv_heads=4,
           head_dim=16,
       ),
-      data_sharding=data_sharding,
   )
   # eos_ids is normally set inside __call__/generate_from_tokens at runtime.
   # Set it here so that .lower() tests can trace through _prefill_fn/_decode_fn

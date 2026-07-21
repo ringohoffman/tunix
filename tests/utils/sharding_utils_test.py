@@ -24,51 +24,6 @@ import numpy as np
 from tunix.utils import sharding_utils
 
 
-class GetCurrentMeshTest(absltest.TestCase):
-
-  def test_none_when_no_mesh(self):
-    """When no mesh is active, get_current_mesh returns None."""
-    mesh = sharding_utils.get_current_mesh()
-    self.assertIsNone(mesh)
-
-  def test_under_set_mesh(self):
-    """When jax.set_mesh is active, get_current_mesh returns active mesh."""
-    devices = np.array(jax.devices()[:1]).reshape((1,))
-    mesh = shd.Mesh(devices, ('data',))
-    with jax.set_mesh(mesh):
-      current = sharding_utils.get_current_mesh()
-      self.assertIsNotNone(current)
-      self.assertEqual(current.axis_names, mesh.axis_names)
-
-  def test_prefers_physical_mesh(self):
-    """When both physical and abstract mesh are active, prefers physical."""
-    devices = np.array(jax.devices()[:1]).reshape((1,))
-    mesh = shd.Mesh(devices, ('data',))
-    with mesh:
-      with use_abstract_mesh(mesh.abstract_mesh):
-        current = sharding_utils.get_current_mesh()
-        self.assertIsInstance(current, shd.Mesh)
-
-
-class GetPhysicalMeshTest(absltest.TestCase):
-
-  def test_none_when_no_mesh(self):
-    self.assertIsNone(sharding_utils.get_physical_mesh())
-
-  def test_returns_mesh_when_physical(self):
-    devices = np.array(jax.devices()[:1]).reshape((1,))
-    mesh = shd.Mesh(devices, ('data',))
-    with mesh:
-      self.assertIsNotNone(sharding_utils.get_physical_mesh())
-      self.assertIsInstance(sharding_utils.get_physical_mesh(), shd.Mesh)
-
-  def test_none_when_only_abstract(self):
-    devices = np.array(jax.devices()[:1]).reshape((1,))
-    mesh = shd.Mesh(devices, ('data',))
-    with use_abstract_mesh(mesh.abstract_mesh):
-      self.assertIsNone(sharding_utils.get_physical_mesh())
-
-
 class ShardTest(absltest.TestCase):
 
   def test_fallback_returns_asarray(self):
@@ -110,18 +65,6 @@ class ShardTest(absltest.TestCase):
       with self.assertRaises(RuntimeError) as cm:
         sharding_utils.shard(x, ('data',), eager=True)
       self.assertIn('concrete jax.sharding.Mesh', str(cm.exception))
-
-  def test_shard_eager_with_both_meshes_uses_physical(self):
-    """When both physical and abstract mesh are active, eager uses physical."""
-    devices = np.array(jax.devices()[:1]).reshape((1,))
-    mesh = shd.Mesh(devices, ('data',))
-    with mesh:
-      with use_abstract_mesh(mesh.abstract_mesh):
-        x = jnp.arange(8)
-        # Should NOT raise — physical mesh is available for device_put.
-        sharded = sharding_utils.shard(x, ('data',), eager=True)
-        if jax.devices()[0].platform != 'cpu':
-          self.assertIsInstance(sharded.sharding, shd.NamedSharding)
 
   def test_shard_lazy_under_abstract_mesh_does_not_raise(self):
     """Lazy (eager=False) shard with AbstractMesh does not raise."""

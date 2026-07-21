@@ -19,6 +19,7 @@ from __future__ import annotations
 from typing import Any, TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
+  import jax
   from jax.typing import ArrayLike
 
   from tunix.sft import peft_trainer
@@ -41,7 +42,7 @@ class TrainingHooks(Protocol):
       train_ctx: peft_trainer.PeftTrainer,
       train_step: int,
       batch: Any,
-      train_loss: ArrayLike,
+      train_loss: jax.Array,
   ) -> None:
     """Called at the end of a training step."""
 
@@ -49,7 +50,7 @@ class TrainingHooks(Protocol):
       self,
       train_ctx: peft_trainer.PeftTrainer,
       batch: Any,
-      train_loss: ArrayLike,
+      train_loss: jax.Array,
       grad_norm: ArrayLike | None = None,
       aux: dict[str, ArrayLike] | None = None,
   ) -> None:
@@ -61,7 +62,7 @@ class TrainingHooks(Protocol):
   def on_eval_end(
       self,
       train_ctx: peft_trainer.PeftTrainer,
-      eval_loss: ArrayLike,
+      eval_loss: jax.Array,
   ) -> None:
     """Called at the end of an evaluation phase."""
 
@@ -72,7 +73,7 @@ class TrainingHooks(Protocol):
       self,
       train_ctx: peft_trainer.PeftTrainer,
       batch: Any,
-      eval_loss: ArrayLike,
+      eval_loss: jax.Array,
   ) -> None:
     """Called at the end of an evaluation step (batch)."""
 
@@ -80,7 +81,7 @@ class TrainingHooks(Protocol):
       self,
       train_ctx: peft_trainer.PeftTrainer,
       batch: Any,
-      eval_loss: ArrayLike,
+      eval_loss: jax.Array,
       aux: dict[str, ArrayLike] | None = None,
   ) -> None:
     """Called at the end of a micro-step during evaluation."""

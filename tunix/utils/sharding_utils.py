@@ -17,68 +17,15 @@
 This module provides helpers for placing JAX arrays with correct sharding
 across devices, and for validating that arrays carry the expected shardings
 before they are dispatched to JIT-compiled functions.
-
-**Why this matters on Pathways / multi-controller runtimes:**
-
-JAX offers two APIs for constraining how arrays are partitioned across devices:
-
-  1. ``jax.device_put(x, sharding)`` — works eagerly (outside JIT), but
-     requires a concrete ``jax.sharding.Mesh`` with real devices.  It raises
-     ``ValueError`` if given an ``AbstractMesh`` because ``is_fully_addressable``
-     is not implemented for abstract meshes.
-
-  2. ``jax.lax.with_sharding_constraint(x, sharding)`` — emits an XLA
-     sharding annotation, but is a **silent no-op outside JIT** (the returned
-     array has the same sharding as the input).
-
-On Pathways, only an ``AbstractMesh`` may be available (via ``jax.set_mesh``),
-making ``device_put`` fail.  If ``eager=True`` is requested but only an
-``AbstractMesh`` is present, the old code silently fell back to
-``with_sharding_constraint``, which is a no-op outside JIT → arrays end up
-**unsharded** → JIT compilation cache miss → proxy recompiles → OOM.
-
-``shard()`` now raises a loud error for this case so the caller can fix the
-mesh context, rather than silently producing unsharded arrays.
 """
 
 from __future__ import annotations
 
-from jax._src.tree_util import PyTree
-
 from absl import logging
 import jax
 from jax import numpy as jnp
-from jax.interpreters import pxla
+from jax._src.tree_util import PyTree
 import jax.sharding as shd
-
-
-def get_current_mesh() -> shd.Mesh | shd.AbstractMesh | None:
-  """Returns the current active JAX sharding mesh, preferring physical mesh.
-
-  Discovery order:
-    1. Physical mesh from ``pxla.thread_resources`` (set by ``with mesh:``).
-    2. Abstract mesh from ``jax.set_mesh()`` / ``jax.sharding.get_abstract_mesh()``.
-    3. ``None`` if no mesh is active.
-
-  This function does NOT set or modify any mesh context — it only reads.
-  """
-  mesh = pxla.thread_resources.env.physical_mesh
-  if mesh is not None and not mesh.empty:
-    return mesh
-  abstract_mesh = shd.get_abstract_mesh()
-  return None if abstract_mesh.empty else abstract_mesh
-
-
-def get_physical_mesh() -> shd.Mesh | None:
-  """Returns the current physical (concrete) mesh, or None.
-
-  Unlike ``get_current_mesh``, this never returns an ``AbstractMesh``.
-  Use this when you need a concrete mesh for ``jax.device_put``.
-  """
-  mesh = pxla.thread_resources.env.physical_mesh
-  if mesh is not None and not mesh.empty:
-    return mesh
-  return None
 
 
 # TODO(abheesht17): Use this function for all models and unify with the fn in
@@ -94,10 +41,10 @@ def shard(
     x: The JAX array to shard.
     s: The sharding spec (axis names or None per dimension).
     eager: If ``True``, place the array onto devices immediately via
-      ``jax.device_put``.  This requires a concrete physical ``Mesh`` in the
-      current thread context (set by ``with mesh:``).  If only an
-      ``AbstractMesh`` is available, this function raises ``RuntimeError``
-      rather than silently producing an unsharded array.
+      ``jax.device_put``.  This requires a concrete physical ``Mesh`` active in
+      context via ``with jax.set_mesh(mesh):``.  If only an ``AbstractMesh`` is
+      available, this function raises ``RuntimeError`` rather than silently
+      producing an unsharded array.
 
       If ``False``, the sharding is deferred via
       ``jax.lax.with_sharding_constraint``, which only takes effect inside
@@ -107,11 +54,16 @@ def shard(
     The sharded JAX array.
 
   Raises:
-    RuntimeError: If ``eager=True`` but no concrete physical mesh is
-      available (only ``AbstractMesh``).
+    RuntimeError: If ``eager=True`` but no concrete physical mesh is active
+      in context (only ``AbstractMesh``).
   """
-  mesh = get_current_mesh()
-  if mesh is None or mesh.empty or jax.devices()[0].platform == 'cpu':
+  try:
+    mesh = shd.get_mesh()
+  except ValueError:
+    mesh = shd.get_abstract_mesh()
+  if mesh.empty:
+    mesh = shd.get_abstract_mesh()
+  if mesh.empty or jax.devices()[0].platform == 'cpu':
     return jnp.asarray(x)
   sharding = shd.NamedSharding(mesh, shd.PartitionSpec(*s))
   if eager:
@@ -124,12 +76,10 @@ def shard(
     # cache misses and proxy OOM), raise a loud error so the caller can fix
     # the mesh context.
     raise RuntimeError(
-        f'shard(eager=True) requires a concrete jax.sharding.Mesh in the '
-        f'thread context (set by `with mesh:`), but only an AbstractMesh '
-        f'was found: {mesh}.  This typically means the outermost training '
-        f'loop is not using `with mesh:` alongside `jax.set_mesh(mesh)`, '
-        f'or the code is running in a thread that does not inherit the '
-        f'mesh context.  On Pathways, both context managers are required.'
+        f'shard(eager=True) requires a concrete jax.sharding.Mesh active in '
+        f'context via `with jax.set_mesh(mesh):`, but only an AbstractMesh '
+        f'was found: {mesh}. Ensure the entry point wraps execution in '
+        f'`with jax.set_mesh(mesh):`.'
     )
   return jax.lax.with_sharding_constraint(x, sharding)
 
@@ -172,14 +122,22 @@ def validate_shardings(
           f'no sharding attribute'
       )
       continue
-    if not isinstance(leaf_sharding, shd.NamedSharding):
+    if isinstance(leaf_sharding, shd.SingleDeviceSharding):
+      if expected_mesh is None or expected_mesh.size > 1:
+        errors.append(
+            f'  [{label} leaf {i}] shape={leaf.shape} dtype={leaf.dtype}: '
+            f'expected NamedSharding, got SingleDeviceSharding '
+            f'({leaf_sharding})'
+        )
+        continue
+    elif not isinstance(leaf_sharding, shd.NamedSharding):
       errors.append(
           f'  [{label} leaf {i}] shape={leaf.shape} dtype={leaf.dtype}: '
           f'expected NamedSharding, got {type(leaf_sharding).__name__} '
           f'({leaf_sharding})'
       )
       continue
-    if expected_mesh is not None:
+    if expected_mesh is not None and hasattr(leaf_sharding, 'mesh'):
       # Compare mesh shapes and axis names — not object identity, since
       # Mesh and AbstractMesh may differ in type but represent the same
       # logical mesh.
@@ -187,7 +145,7 @@ def validate_shardings(
       if leaf_mesh.shape != expected_mesh.shape:
         errors.append(
             f'  [{label} leaf {i}] shape={leaf.shape} '
-            f'spec={leaf_sharding.spec}: '
+            f'spec={getattr(leaf_sharding, "spec", None)}: '
             f'mesh shape {leaf_mesh.shape} != expected {expected_mesh.shape}'
         )
   if errors:
