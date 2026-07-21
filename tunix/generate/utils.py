@@ -16,13 +16,14 @@
 """Utility functions for sampler."""
 
 from collections import abc
+from collections.abc import Callable, Iterator, Mapping
 import functools
 import gc
-from absl import logging
 import math
 import re
-from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, TypedDict
 
+from absl import logging
 from flax import nnx
 from flax import traverse_util
 import jax
@@ -157,7 +158,8 @@ def np_find_first_non_pad_idx(ids: np.ndarray, pad_id: int) -> int:
 
 
 def np_find_first_eos_idx(
-    ids: np.ndarray, eos_id: int | jax.Array,
+    ids: np.ndarray,
+    eos_id: int | jax.Array,
 ) -> int:
   """Numpy version of find_first_eos_idx. Works on CPU arrays."""
   assert ids.ndim == 1, f'ids should be a 1d array. Got: {ids.shape}'
@@ -299,23 +301,61 @@ def build_positions_from_mask(input_mask: jax.Array) -> jax.Array:
 
 
 def check_sampling_mode_conflict(
-    original_sampling_mode: list[
-        str | None
-    ],  # pass in as list to modify in place
+    current_sampling_mode: str | None,
     new_sampling_mode: str,
-) -> None:
-  """Checks if the new sampling mode conflicts with the original sampling mode."""
-
-  if original_sampling_mode[0] is not None:
+) -> str:
+  """Checks if the new sampling mode conflicts with the current sampling mode."""
+  if current_sampling_mode is not None:
     raise ValueError(
         'Conflicts setting sampling_mode, the current set sampling_mode is'
-        f' {original_sampling_mode[0]} but trying to override to'
-        f' {new_sampling_mode}. The rules are\n: 1. If top_p is provided,'
-        ' top_p will be used. 2. If beam_size is provided,beam_search will be'
-        ' used 3. If none of the above, greedy will be used.'
+        f' {current_sampling_mode} but trying to override to'
+        f' {new_sampling_mode}. The rules are:\n 1. If top_p is provided,'
+        ' top_p will be used. 2. If beam_size is provided, beam_search will be'
+        ' used. 3. If none of the above, greedy will be used.'
     )
-  else:
-    original_sampling_mode[0] = new_sampling_mode
+  return new_sampling_mode
+
+
+class SamplingParameters(TypedDict, total=False):
+  """Sampling parameters for top_p or beam search."""
+
+  beam_size: int
+  top_p: float
+  top_k: int | None
+
+
+def resolve_sampling_config(
+    beam_size: int | None = None,
+    top_p: float | None = None,
+    top_k: int | None = None,
+) -> tuple[str, SamplingParameters]:
+  """Resolves the sampling mode and populates sampling parameters.
+
+  Args:
+    beam_size: Optional beam size for beam search.
+    top_p: Optional nucleus sampling threshold.
+    top_k: Optional top-k sampling threshold.
+
+  Returns:
+    A tuple of (sampling_mode, sampling_parameters).
+  """
+  sampling_parameters: SamplingParameters = {}
+  sampling_mode: str | None = None
+
+  if beam_size is not None:
+    sampling_mode = check_sampling_mode_conflict(sampling_mode, 'beam_search')
+    sampling_parameters['beam_size'] = beam_size
+
+  if top_p is not None:
+    sampling_mode = check_sampling_mode_conflict(sampling_mode, 'top_p')
+    sampling_parameters['top_p'] = top_p
+    sampling_parameters['top_k'] = top_k
+
+  if sampling_mode is None:
+    sampling_mode = 'greedy'
+
+  logging.debug('Using sampling mode: %s', sampling_mode)
+  return sampling_mode, sampling_parameters
 
 
 def get_logprobs_from_vllm_output(
@@ -617,7 +657,9 @@ def _align_shape(
         new_tgt_shape = tgt_shape
 
     elif (
-        re.compile(r'.*(per_layer_input_embedding|per_layer_model_projection\.w)').match(src_key)
+        re.compile(
+            r'.*(per_layer_input_embedding|per_layer_model_projection\.w)'
+        ).match(src_key)
         and len(val.shape) == 3
         and len(tgt_shape) == 2
         and math.prod(tgt_shape) == math.prod(val.shape)
@@ -661,16 +703,24 @@ def _align_shape(
           new_tgt_shape = tgt_shape[:-1] + (repeated_dim, padded_dim)
     elif re.compile(r'layers\..*\.moe\.gating_einsum').match(src_key):
       tp_size = kwargs['tp_size']
-      num_experts, expert_dim, embed_dim = val.shape[0], val.shape[2], val.shape[3]
+      num_experts, expert_dim, embed_dim = (
+          val.shape[0],
+          val.shape[2],
+          val.shape[3],
+      )
       gate_chunks, up_chunks = val[:, 0, :, :], val[:, 1, :, :]
       chunk_size = expert_dim // tp_size
-      padded_expert_chunk_dim = ((chunk_size + 127)//128)*128
+      padded_expert_chunk_dim = ((chunk_size + 127) // 128) * 128
       pad_amount = padded_expert_chunk_dim - chunk_size
       gate_chunks = gate_chunks.reshape(num_experts, tp_size, -1, embed_dim)
       up_chunks = up_chunks.reshape(num_experts, tp_size, -1, embed_dim)
       if pad_amount > 0:
-        gate_chunks = jnp.pad(gate_chunks, ((0, 0), (0, 0), (0, pad_amount), (0, 0)))
-        up_chunks = jnp.pad(up_chunks, ((0, 0), (0, 0), (0, pad_amount), (0, 0)))
+        gate_chunks = jnp.pad(
+            gate_chunks, ((0, 0), (0, 0), (0, pad_amount), (0, 0))
+        )
+        up_chunks = jnp.pad(
+            up_chunks, ((0, 0), (0, 0), (0, pad_amount), (0, 0))
+        )
       val_chunks = jnp.stack([gate_chunks, up_chunks], axis=2)
       val_chunks = val_chunks.reshape(num_experts, -1, embed_dim)
       val_chunks = val_chunks.transpose(0, 2, 1)
@@ -680,9 +730,7 @@ def _align_shape(
           f'Rank mismatch for {src_key}: {val.shape} vs {tgt_shape}'
       )
   elif re.compile(r'layers\..*\.attn\.(k|v)_bias').match(src_key):
-    logging.debug(
-        'Handling 1-D KV bias for %s in SGLangJAX rollout.', src_key
-    )
+    logging.debug('Handling 1-D KV bias for %s in SGLangJAX rollout.', src_key)
     assert tgt_shape[0] > val.shape[0] and tgt_shape[0] % val.shape[0] == 0, (
         f'Unexpected attention bias shape: {val.shape} and target shape:'
         f' {tgt_shape}'
@@ -952,8 +1000,10 @@ def _unstack_scanned_param(
 ) -> Tuple[jax.Array | np.ndarray, ...]:
   """Unstacks a scanned parameter by moving the scan axis to 0.
 
-  This helper unstacks a scanned array at the specified scan_axis. When scan_axis
-  is provided, it transposes that axis to position 0 and unstacks it. This is used
+  This helper unstacks a scanned array at the specified scan_axis. When
+  scan_axis
+  is provided, it transposes that axis to position 0 and unstacks it. This is
+  used
   when transferring weights from a scanned representation (e.g., MaxText) to an
   unrolled one (e.g., vLLM).
 
@@ -965,7 +1015,8 @@ def _unstack_scanned_param(
       auto-detect it for backward compatibility.
 
   Returns:
-      A tuple of unstacked arrays, or a tuple containing just the original src_val
+      A tuple of unstacked arrays, or a tuple containing just the original
+      src_val
       if unstacking fails or is unnecessary.
   """
   if not (hasattr(src_val, 'shape') and hasattr(tgt_val, 'shape')):
@@ -985,11 +1036,13 @@ def _unstack_scanned_param(
         if _shapes_are_repeatable(candidate, tgt_shape):
           scan_axis = i
           break
-    
+
     if scan_axis is not None:
       # Transpose the scanned axis to the 0th position
       if scan_axis != 0:
-        perm = (scan_axis,) + tuple(i for i in range(len(src_shape)) if i != scan_axis)
+        perm = (scan_axis,) + tuple(
+            i for i in range(len(src_shape)) if i != scan_axis
+        )
         if hasattr(src_val, 'transpose'):
           src_val = src_val.transpose(perm)
         elif isinstance(src_val, np.ndarray):
@@ -1003,19 +1056,22 @@ def _unstack_scanned_param(
         elif hasattr(jnp, 'unstack'):
           return jnp.unstack(src_val)
         else:
-           # Fallback for older JAX versions
+          # Fallback for older JAX versions
           return [src_val[i] for i in range(src_val.shape[0])]
       except Exception as e:
         logging.debug(
             "Failed to unstack parameter '%s'. Error: %s. Using original.",
-            key_path, e
+            key_path,
+            e,
         )
         return (src_val,)
     else:
       logging.warning(
           "Shape mismatch in scanned param '%s'. Src: %s, Tgt: %s. Cannot"
           ' determine scan axis.',
-          key_path, src_shape, tgt_shape,
+          key_path,
+          src_shape,
+          tgt_shape,
       )
 
   return (src_val,)
@@ -1124,7 +1180,7 @@ def _align_per_axis(
     return arr
   if len(arr.shape) != len(tgt_shape):
     raise ShapeMismatchError(
-        f"Rank mismatch for {key_path}: src={arr.shape} vs tgt={tgt_shape}"
+        f'Rank mismatch for {key_path}: src={arr.shape} vs tgt={tgt_shape}'
     )
 
   mismatches = []
@@ -1133,7 +1189,7 @@ def _align_per_axis(
       continue
     if t < s:
       raise ShapeMismatchError(
-          f"Cannot shrink axis {axis} for {key_path}: src={s} -> tgt={t}"
+          f'Cannot shrink axis {axis} for {key_path}: src={s} -> tgt={t}'
       )
     mismatches.append((axis, s, t))
   if not mismatches:
@@ -1148,16 +1204,16 @@ def _align_per_axis(
         n_shards = _partition_size(_spec_at_axis(tgt_sharding, axis), mesh)
         if t % n_shards != 0:
           raise ValueError(
-              f"Target dimension {t} on axis {axis} for {key_path} is not "
-              f"divisible by n_shards={n_shards}; the target shape itself "
-              f"is misconfigured for the requested sharding."
+              f'Target dimension {t} on axis {axis} for {key_path} is not '
+              f'divisible by n_shards={n_shards}; the target shape itself '
+              'is misconfigured for the requested sharding.'
           )
         if (t - s) % n_shards != 0 or s % n_shards != 0:
           raise ValueError(
-              f"Cannot interleave pad axis {axis} for {key_path}: src_dim "
-              f"({s}) or extra ({t - s}) is not cleanly divisible by "
-              f"n_shards ({n_shards}). Ensure the source tensor is evenly "
-              f"partitionable."
+              f'Cannot interleave pad axis {axis} for {key_path}: src_dim '
+              f'({s}) or extra ({t - s}) is not cleanly divisible by '
+              f'n_shards ({n_shards}). Ensure the source tensor is evenly '
+              'partitionable.'
           )
         pad_specs.append((axis, n_shards, (t - s) // n_shards))
     else:
@@ -1168,9 +1224,9 @@ def _align_per_axis(
   for axis, s, t in mismatches:
     if t % s != 0:
       raise ShapeMismatchError(
-          f"Cannot align axis {axis} for {key_path}: src={s} -> tgt={t} "
-          f"is not an integer multiple and the key is not a recognized "
-          f"MoE pattern."
+          f'Cannot align axis {axis} for {key_path}: src={s} -> tgt={t} '
+          'is not an integer multiple and the key is not a recognized '
+          'MoE pattern.'
       )
     repeats.append((axis, t // s))
   return _jit_repeat_axes(arr, tuple(repeats))
@@ -1186,7 +1242,7 @@ def _interleave_moe_weights(
   """Interleaves wi_0 and wi_1 per-shard into a single tensor."""
   if axis is None:
     axis = len(tgt_shape) - 1
-    
+
   target_half_dim = tgt_shape[axis] // 2
 
   def _pad_and_chunk(arr):
@@ -1287,8 +1343,10 @@ def _scanned_sharding_from_per_layer(
     scan_axis: int,
 ) -> Optional[jax.sharding.NamedSharding]:
   """Builds a scanned `NamedSharding` from a per-layer one by inserting
+
   `PartitionSpec(None)` at `scan_axis`. Returns None if input isn't a
-  NamedSharding."""
+  NamedSharding.
+  """
   if not isinstance(per_layer_sharding, jax.sharding.NamedSharding):
     return None
   spec = list(per_layer_sharding.spec)
@@ -1317,13 +1375,14 @@ def _jit_fuse_and_unstack_moe(
   avoids materializing the full concatenated intermediate on device.
 
   Args:
-    wi_0: First MoE gate weight; per-layer layout matches `tgt_shape`
-      (with the padded dim halved), with `num_layers` inserted at `scan_axis`.
+    wi_0: First MoE gate weight; per-layer layout matches `tgt_shape` (with the
+      padded dim halved), with `num_layers` inserted at `scan_axis`.
     wi_1: Second MoE gate weight, same layout as `wi_0`.
     scan_axis: Axis at which `num_layers` is stacked in `wi_0` / `wi_1`.
     num_layers: Number of layers (== `wi_0.shape[scan_axis]`).
     n_shards: Mesh shards along the per-layer fused/padded axis.
-    tgt_shape: Per-layer fused target shape (fused mlp dim on `tgt_padded_axis`).
+    tgt_shape: Per-layer fused target shape (fused mlp dim on
+      `tgt_padded_axis`).
     scan_padded_axis: Position of the padded axis in the scanned layout.
     tgt_padded_axis: Position of the padded axis in the per-layer layout.
 
@@ -1382,7 +1441,10 @@ def _fuse_moe_weights(
     logging.info(
         'Fusing MoE %s: wi_0=%s, wi_1=%s -> %s on axis %d',
         '.'.join(str(k) for k in tgt_key),
-        wi_0.shape, wi_1.shape, tgt_val.shape, axis,
+        wi_0.shape,
+        wi_1.shape,
+        tgt_val.shape,
+        axis,
     )
     new_src_flat[tgt_key] = _interleave_moe_weights(
         wi_0, wi_1, tgt_val.shape, n_shards, axis=axis
@@ -1410,7 +1472,7 @@ def _collect_src_buffer_ids(
       try:
         ids.add(shard.data.unsafe_buffer_pointer())
       except jax.errors.JaxRuntimeError as e:
-        if "PjRt-compatible backend only" in str(e):
+        if 'PjRt-compatible backend only' in str(e):
           # Backend doesn't support unsafe pointers (e.g., disaggregated Pathways setup).
           # Fast-fail and return None to signal that aliasing checks should be skipped.
           return None
@@ -1431,9 +1493,10 @@ def _delete_target_buffers(
   for tgt_val in spec_flat.values():
     tgt_arr = tgt_val.value if hasattr(tgt_val, 'value') else tgt_val
     # Skip if the array cannot be deleted or is already deleted
-    if not hasattr(tgt_arr, 'delete') or getattr(
-        tgt_arr, 'is_deleted', lambda: False
-    )():
+    if (
+        not hasattr(tgt_arr, 'delete')
+        or getattr(tgt_arr, 'is_deleted', lambda: False)()
+    ):
       continue
     # Check for aliasing only if the backend supports buffer pointer tracking
     if src_buffer_ids is not None and hasattr(tgt_arr, 'addressable_shards'):
@@ -1461,7 +1524,9 @@ def _snapshot_dst_sharding(
   ):
     return arr
 
-  assert hasattr(arr, 'sharding'), f'Expected array with sharding, got {type(arr)}'
+  assert hasattr(
+      arr, 'sharding'
+  ), f'Expected array with sharding, got {type(arr)}'
   s = arr.sharding
 
   if isinstance(
@@ -1545,11 +1610,16 @@ def transfer_state_directly(
 ) -> None:
   """Transfers state directly by matching structure, stripping wrappers.
 
-  This handles the logic for syncing weights where no explicit mapping is provided,
-  common in MaxText -> MaxText workflows. This method should work for all MaxText models.
-  It automatically unwraps common containers present in MaxText models like 'base'
-  (MaxText TrainState) and nested 'model' keys (vLLM wrappers). Additionally, it handles
-  multiple mapping types including dicts, nnx.State, and nnx.Dict. Mismatches in keys are
+  This handles the logic for syncing weights where no explicit mapping is
+  provided,
+  common in MaxText -> MaxText workflows. This method should work for all
+  MaxText models.
+  It automatically unwraps common containers present in MaxText models like
+  'base'
+  (MaxText TrainState) and nested 'model' keys (vLLM wrappers). Additionally, it
+  handles
+  multiple mapping types including dicts, nnx.State, and nnx.Dict. Mismatches in
+  keys are
   logged for debugging and handled by intersecting the source and target trees.
 
   Args:
@@ -1561,15 +1631,16 @@ def transfer_state_directly(
       before resharding to save HBM. Buffers that physically alias a source
       shard are preserved automatically (see `_delete_target_buffers`).
     reshard_chunk_size: When set, the final reshard is split into sequential
-      groups of this many flat keys instead of one monolithic call. This
-      reduces peak contiguous HBM pressure, which prevents XLA allocator
-      fragmentation on large models. The unit is *number of flat keys per
-      chunk* — per-layer key counts vary by architecture (MQA vs GQA, biases
-      on/off, dense vs MoE, fused vs split MoE gates), so as a rule of thumb
-      start with roughly `10 * num_layers` for a dense transformer and tune
-      downward if you still see fragmentation. When None (default) the
-      original single-call reshard behavior is preserved.
+      groups of this many flat keys instead of one monolithic call. This reduces
+      peak contiguous HBM pressure, which prevents XLA allocator fragmentation
+      on large models. The unit is *number of flat keys per chunk* — per-layer
+      key counts vary by architecture (MQA vs GQA, biases on/off, dense vs MoE,
+      fused vs split MoE gates), so as a rule of thumb start with roughly `10 *
+      num_layers` for a dense transformer and tune downward if you still see
+      fragmentation. When None (default) the original single-call reshard
+      behavior is preserved.
   """
+
   def safe_has_key(obj: Mapping[str, Any], key: str) -> bool:
     if isinstance(obj, dict):
       return key in obj
@@ -1577,16 +1648,12 @@ def transfer_state_directly(
     return hasattr(obj, key)
 
   # Unwrap Source (Remove 'base' wrapper from MaxText)
-  if isinstance(src_state, abc.Mapping) and safe_has_key(
-      src_state, 'base'
-  ):
+  if isinstance(src_state, abc.Mapping) and safe_has_key(src_state, 'base'):
     logging.info("Unwrapping 'base' key from source state.")
     src_state = src_state['base']
 
   # Unwrap Target (Remove nested 'model' wrappers from vLLM)
-  while isinstance(dst_state, abc.Mapping) and safe_has_key(
-      dst_state, 'model'
-  ):
+  while isinstance(dst_state, abc.Mapping) and safe_has_key(dst_state, 'model'):
     logging.info("Unwrapping nested 'model' key from target state.")
     dst_state = dst_state['model']
 
@@ -1618,7 +1685,9 @@ def transfer_state_directly(
     Uses flat dictionary traversal for efficiency.
     """
     # Fast path for non-dict inputs (leaves)
-    if not isinstance(src, abc.Mapping) or not isinstance(tgt_spec, abc.Mapping):
+    if not isinstance(src, abc.Mapping) or not isinstance(
+        tgt_spec, abc.Mapping
+    ):
       return src, tgt_spec
 
     # Flatten both structures to (path_tuple) -> value
@@ -1691,7 +1760,7 @@ def transfer_state_directly(
             # Cast the bulk tensor once before unstacking.
             src_val = _apply_dtype_cast(src_val, tgt_val.dtype, candidate_path)
             scanned_per_layer_shape = (
-                src_val.shape[:scan_axis] + src_val.shape[scan_axis + 1:]
+                src_val.shape[:scan_axis] + src_val.shape[scan_axis + 1 :]
             )
             if scanned_per_layer_shape == tgt_val.shape:
               # Pure unstack — no alignment needed.
@@ -1704,7 +1773,9 @@ def transfer_state_directly(
               # one bulk op + free unstack.
               logging.info(
                   'Bulk-aligning scanned %s: %s -> per-layer %s',
-                  candidate_path, src_val.shape, tgt_val.shape,
+                  candidate_path,
+                  src_val.shape,
+                  tgt_val.shape,
               )
               unstacked_cache[cache_key] = _bulk_align_and_unstack(
                   src_val, scan_axis, tgt_val, candidate_path
@@ -1724,7 +1795,9 @@ def transfer_state_directly(
         # allocations that cause compilation pressure and memory fragmentation.
         if key_tuple and key_tuple[-1] == 'wi':
           scanned_prefix = (
-              key_tuple[:match_index] + ('layers',) + key_tuple[match_index + 1:-1]
+              key_tuple[:match_index]
+              + ('layers',)
+              + key_tuple[match_index + 1 : -1]
           )
           wi_0_key = scanned_prefix + ('wi_0',)
           wi_1_key = scanned_prefix + ('wi_1',)
@@ -1733,28 +1806,53 @@ def transfer_state_directly(
             fused_scanned_key = scanned_prefix + ('wi_fused',)
             if fused_scanned_key not in unstacked_cache:
               scanned_prefix_path = '.'.join(str(k) for k in scanned_prefix)
-              logging.info('Fusing scanned MoE weights for %s', scanned_prefix_path)
+              logging.info(
+                  'Fusing scanned MoE weights for %s', scanned_prefix_path
+              )
               wi_0_full = _apply_dtype_cast(
-                  src_flat[wi_0_key], tgt_val.dtype, '.'.join(str(k) for k in wi_0_key)
+                  src_flat[wi_0_key],
+                  tgt_val.dtype,
+                  '.'.join(str(k) for k in wi_0_key),
               )
               wi_1_full = _apply_dtype_cast(
-                  src_flat[wi_1_key], tgt_val.dtype, '.'.join(str(k) for k in wi_1_key)
+                  src_flat[wi_1_key],
+                  tgt_val.dtype,
+                  '.'.join(str(k) for k in wi_1_key),
               )
               num_layers = src_flat[wi_0_key].shape[scan_axis]
-              
+
               # Remove scan_axis to compare against the per-layer tgt_val shape
-              wi_0_single_shape = wi_0_full.shape[:scan_axis] + wi_0_full.shape[scan_axis + 1:]
+              wi_0_single_shape = (
+                  wi_0_full.shape[:scan_axis] + wi_0_full.shape[scan_axis + 1 :]
+              )
               mismatched_axes = [
-                  i for i, (s, t) in enumerate(zip(wi_0_single_shape, tgt_val.shape)) if s != t
+                  i
+                  for i, (s, t) in enumerate(
+                      zip(wi_0_single_shape, tgt_val.shape)
+                  )
+                  if s != t
               ]
-              tgt_axis = mismatched_axes[-1] if mismatched_axes else len(tgt_val.shape) - 1
+              tgt_axis = (
+                  mismatched_axes[-1]
+                  if mismatched_axes
+                  else len(tgt_val.shape) - 1
+              )
               n_shards = _get_n_shards(tgt_val, tgt_axis)
-              
+
               # Offset the axis by 1 if it falls after the scan axis in the bulk tensor
-              scan_padded_axis = tgt_axis if tgt_axis < scan_axis else tgt_axis + 1
+              scan_padded_axis = (
+                  tgt_axis if tgt_axis < scan_axis else tgt_axis + 1
+              )
 
               unstacked_cache[fused_scanned_key] = _jit_fuse_and_unstack_moe(
-                  wi_0_full, wi_1_full, scan_axis, num_layers, n_shards, tgt_val.shape, scan_padded_axis, tgt_axis
+                  wi_0_full,
+                  wi_1_full,
+                  scan_axis,
+                  num_layers,
+                  n_shards,
+                  tgt_val.shape,
+                  scan_padded_axis,
+                  tgt_axis,
               )
               del wi_0_full, wi_1_full
 
@@ -1846,20 +1944,20 @@ def resolve_parallelism_sizes(
 
   if total_mesh_devices % expert_parallel_size != 0:
     raise ValueError(
-        f"Total mesh devices ({total_mesh_devices}) must be divisible by"
-        f" expert_parallel_size ({expert_parallel_size})."
+        f'Total mesh devices ({total_mesh_devices}) must be divisible by'
+        f' expert_parallel_size ({expert_parallel_size}).'
     )
 
   if tensor_parallel_size == -1 and data_parallel_size == -1:
     tensor_parallel_size = total_mesh_devices // expert_parallel_size
     data_parallel_size = 1
   elif tensor_parallel_size == -1:
-    tensor_parallel_size = (
-        total_mesh_devices // (data_parallel_size * expert_parallel_size)
+    tensor_parallel_size = total_mesh_devices // (
+        data_parallel_size * expert_parallel_size
     )
   elif data_parallel_size == -1:
-    data_parallel_size = (
-        total_mesh_devices // (tensor_parallel_size * expert_parallel_size)
+    data_parallel_size = total_mesh_devices // (
+        tensor_parallel_size * expert_parallel_size
     )
 
   return tensor_parallel_size, data_parallel_size, expert_parallel_size

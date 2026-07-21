@@ -52,14 +52,6 @@ def is_variable(x: Any) -> TypeGuard[nnx.Variable[jax.Array]]:
   return isinstance(x, nnx.Variable)
 
 
-class SamplingParameters(TypedDict, total=False):
-  """Sampling parameters for top_p or beam search."""
-
-  beam_size: int
-  top_p: float
-  top_k: int | None
-
-
 @flax.struct.dataclass
 class _SamplingState:
   """Internal sampling state."""
@@ -106,7 +98,9 @@ class _SamplingState:
   # Sampling parameters.
   # For top_p, it contains "top_p" and "top_k".
   # For beam search, it contains "beam_size"
-  sampling_parameters: SamplingParameters = flax.struct.field(pytree_node=False)
+  sampling_parameters: utils.SamplingParameters = flax.struct.field(
+      pytree_node=False
+  )
 
   # Only present when sampling_mode is "beam_search".
   beam_search_sampling_state: (
@@ -504,23 +498,10 @@ class Sampler(base_sampler.BaseSampler):
         if include_logprobs
         else None
     )
-    sampling_parameters: SamplingParameters = {}
-    sampling_mode = [None]
 
-    if beam_size is not None:
-      utils.check_sampling_mode_conflict(sampling_mode, 'beam_search')
-      sampling_parameters['beam_size'] = beam_size
-
-    if top_p is not None:
-      utils.check_sampling_mode_conflict(sampling_mode, 'top_p')
-      sampling_parameters['top_p'] = top_p
-      sampling_parameters['top_k'] = top_k
-
-    if sampling_mode[0] is None:
-      sampling_mode[0] = 'greedy'
-
-    logging.debug('Using sampling mode: %s', sampling_mode[0])
-
+    sampling_mode, sampling_parameters = utils.resolve_sampling_config(
+        beam_size=beam_size, top_p=top_p, top_k=top_k
+    )
     return _SamplingState(
         decoding_step=num_input_tokens - 1,
         num_input_tokens=int(num_input_tokens),
@@ -535,7 +516,7 @@ class Sampler(base_sampler.BaseSampler):
         temperature=temperature,
         sampling_parameters=sampling_parameters,
         seed=seed,
-        sampling_mode=sampling_mode[0],
+        sampling_mode=sampling_mode,
         beam_search_sampling_state=None,
     )
 
