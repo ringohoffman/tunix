@@ -29,6 +29,8 @@ _DEFAULT_CHECKPOINTING_OPTIONS = ocp.CheckpointManagerOptions(
         minimum_interval_secs=180,
     ),
     max_to_keep=3,
+    enable_distributed_delete=True,
+    enable_background_delete=True,
 )
 
 
