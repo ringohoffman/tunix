@@ -57,12 +57,12 @@ class CheckpointManager:
       if 'proxy' in os.getenv('JAX_PLATFORMS', ''):
         item_handlers = {
             'model_params': ocp.PyTreeCheckpointHandler(
-                use_ocdbt=False,
+                use_ocdbt=True,
                 use_zarr3=False,
                 **concurrent_gb_args,
             ),
             'optimizer_state': ocp.PyTreeCheckpointHandler(
-                use_ocdbt=False,
+                use_ocdbt=True,
                 use_zarr3=False,
                 **concurrent_gb_args,
             ),
