@@ -81,7 +81,7 @@ def _stack_layers_for_scan(
         or (isinstance(path[0], str) and path[0].startswith('layer_'))
     ):
       if path[0] == 'layers':
-        layer_idx = path[1]
+        layer_idx = int(path[1])
         param_path = path[2:]
       else:
         layer_idx = int(path[0].split('_')[1])

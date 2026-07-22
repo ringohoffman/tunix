@@ -918,6 +918,41 @@ class BuildShardedRestoreTargetTest(absltest.TestCase):
     # Shape: (num_groups=2, global_kv_heads, embed, global_head_dim)
     self.assertEqual(flat_state[k_key].shape, (2, _GKV, _E, _GHD))
 
+  def test_stack_layers_for_scan_string_and_int_layer_keys(self):
+    """Tests _stack_layers_for_scan with string ('0') and integer (0) layer keys."""
+    # Test 1: String layer keys ('layers': {'0': ..., '1': ...}) from restored checkpoints
+    dummy_params_str_keys = {
+        'layers': {
+            '0': {'attn': {'w': np.ones((4, 4))}},
+            '1': {'attn': {'w': np.ones((4, 4)) * 2}},
+        }
+    }
+    stacked_str = params._stack_layers_for_scan(
+        dummy_params_str_keys, num_layers=2, pattern_len=1
+    )
+    self.assertIn('scan_groups', stacked_str)
+    self.assertIn('sub_layers', stacked_str['scan_groups'])
+    # Stacked shape for sub_layer 0 should be (num_groups=2, 4, 4)
+    self.assertEqual(
+        stacked_str['scan_groups']['sub_layers'][0]['attn']['w'].shape,
+        (2, 4, 4),
+    )
+
+    # Test 2: Integer layer keys ('layers': {0: ..., 1: ...})
+    dummy_params_int_keys = {
+        'layers': {
+            0: {'attn': {'w': np.ones((4, 4))}},
+            1: {'attn': {'w': np.ones((4, 4)) * 2}},
+        }
+    }
+    stacked_int = params._stack_layers_for_scan(
+        dummy_params_int_keys, num_layers=2, pattern_len=1
+    )
+    self.assertEqual(
+        stacked_int['scan_groups']['sub_layers'][0]['attn']['w'].shape,
+        (2, 4, 4),
+    )
+
 
 if __name__ == '__main__':
   absltest.main()
