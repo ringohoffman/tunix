@@ -15,6 +15,7 @@
 """Checkpoint manager for PEFT."""
 
 import os
+from pathlib import Path
 import time
 from typing import Any, Tuple
 
@@ -29,6 +30,45 @@ _DEFAULT_CHECKPOINTING_OPTIONS = ocp.CheckpointManagerOptions(
     ),
     max_to_keep=3,
 )
+
+
+def gcsfuse_to_gs_path(path: str) -> str:
+  """Translates a local GCSFuse mount path into a direct `gs://` URI for TPU 
+  DMA saving.
+  """
+  if path.startswith("gs://"):
+    return path
+
+  abs_path = Path(path).resolve()
+  proc_mounts = Path("/proc/mounts")
+  if proc_mounts.exists():
+    try:
+      with proc_mounts.open("r", encoding="utf-8") as f:
+        for line in f:
+          parts = line.split()
+          if len(parts) >= 3:
+            device, mount_point_str, fstype, *_ = parts
+            if "gcsfuse" in fstype or "gcsfuse" in device:
+              mount_point = Path(mount_point_str).resolve()
+              if abs_path == mount_point or mount_point in abs_path.parents:
+                bucket_name = device.split(":")[-1].strip("/")
+                if not bucket_name or "/" in bucket_name:
+                  bucket_name = mount_point.name
+                rel_path = abs_path.relative_to(mount_point)
+                gs_path = f"gs://{bucket_name}/{rel_path}".rstrip("/")
+                logging.info(
+                    "[Checkpointing] Translated GCSFuse mount path %r -> %r "
+                    "to enable TPU DMA saving.",
+                    path,
+                    gs_path,
+                )
+                return gs_path
+    except (OSError, UnicodeDecodeError) as e:
+      logging.warning(
+          "Could not read /proc/mounts for GCSFuse translation: %s", e
+      )
+
+  return path
 
 
 class CheckpointManager:
@@ -48,6 +88,7 @@ class CheckpointManager:
     """
     self._checkpoint_manager: ocp.CheckpointManager | None = None
     if root_directory is not None:
+      root_directory = gcsfuse_to_gs_path(root_directory)
       # When using Pathways, the checkpoint manager only supports persistence
       # APIs now.
       concurrent_gb_args = {}
