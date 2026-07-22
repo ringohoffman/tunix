@@ -23,7 +23,6 @@ import functools
 import inspect
 import itertools
 from typing import Any, Literal, Self, Tuple, TypedDict, overload
-from typing_extensions import NotRequired, Unpack
 
 import flax
 from flax import nnx
@@ -47,6 +46,7 @@ from tunix.models.gemma4 import moe
 from tunix.utils import compat
 from tunix.utils import env_utils
 from tunix.utils import sharding_utils
+from typing_extensions import NotRequired, Unpack
 
 # JAX checkpoint policy type — matches nnx.remat's policy parameter.
 CheckpointPolicy = Callable[..., bool]
@@ -111,11 +111,9 @@ class GemmaOutput:
   cache: Cache | StackedCache | None = None
   hidden_states: jax.Array | None = None
 
-  def tree_flatten(
-      self
-  ) -> tuple[
-    tuple[jax.Array, Cache | StackedCache | None, jax.Array | None],
-    None,
+  def tree_flatten(self) -> tuple[
+      tuple[jax.Array, Cache | StackedCache | None, jax.Array | None],
+      None,
   ]:
     children = (self.logits, self.cache, self.hidden_states)
     aux_data = None
@@ -123,14 +121,14 @@ class GemmaOutput:
 
   @classmethod
   def tree_unflatten(
-    cls,
-    aux_data: None,
-    children: tuple[jax.Array, Cache | StackedCache | None, jax.Array | None],
+      cls,
+      aux_data: None,
+      children: tuple[jax.Array, Cache | StackedCache | None, jax.Array | None],
   ) -> Self:
     return cls(*children)
 
   def __iter__(
-      self
+      self,
   ) -> Iterator[Unpack[tuple[jax.Array, Cache | StackedCache | None]]]:
     """Yield (logits, cache) for backward-compatible tuple unpacking."""
     yield self.logits
@@ -138,19 +136,25 @@ class GemmaOutput:
 
   @overload
   def __getitem__(
-    self,
-    idx: Literal[0],
-  ) -> jax.Array: ...
+      self,
+      idx: Literal[0],
+  ) -> jax.Array:
+    ...
+
   @overload
   def __getitem__(
-    self,
-    idx: Literal[1],
-  ) -> Cache | StackedCache | None: ...
+      self,
+      idx: Literal[1],
+  ) -> Cache | StackedCache | None:
+    ...
+
   @overload
   def __getitem__(
-    self,
-    idx: int,
-  ) -> jax.Array | Cache | StackedCache | None: ...
+      self,
+      idx: int,
+  ) -> jax.Array | Cache | StackedCache | None:
+    ...
+
   def __getitem__(self, idx: int) -> jax.Array | Cache | StackedCache | None:
     return (self.logits, self.cache)[idx]
 
@@ -289,7 +293,7 @@ class ShardingConfig:
   per_layer_projection: Tuple[str | None, ...]
   per_layer_input_embedding: Tuple[str | None, ...]
   # Input data sharding (token IDs, masks, etc. of shape [B, T])
-  input_bt: Tuple[str | None, ...] = ('fsdp', None)
+  input_bt: Tuple[str | None, ...] = ("fsdp", None)
 
   @property
   def input_pspec(self) -> jax.sharding.PartitionSpec:
@@ -1328,8 +1332,15 @@ class Attention(nnx.Module):
       # as the first argument. graph_updates=False prevents TraceContextError
       # when mutating params across jax transformation trace levels.
       return _compat_remat(self.block.__func__, graph_updates=False)(
-          self, x, segment_pos, cache, attn_mask, kv_shared_cache,
-          kv_override, use_kv_override, segment_ids
+          self,
+          x,
+          segment_pos,
+          cache,
+          attn_mask,
+          kv_shared_cache,
+          kv_override,
+          use_kv_override,
+          segment_ids,
       )
     else:
       return self.block(
@@ -1343,6 +1354,7 @@ class Attention(nnx.Module):
           segment_ids=segment_ids,
       )
 
+  @nnx.jit(static_argnames=("batch_size", "max_seq_len", "dtype"))
   def init_cache(
       self, batch_size: int, max_seq_len: int, dtype: jnp.dtype
   ) -> LayerCache:
@@ -1358,17 +1370,14 @@ class Attention(nnx.Module):
     k = sharding_utils.shard(
         jnp.zeros(cache_shape, dtype),
         self.config.shd_config.act_btnh,
-        eager=True,
     )
     v = sharding_utils.shard(
         jnp.zeros(cache_shape, dtype),
         self.config.shd_config.act_btnh,
-        eager=True,
     )
     end_index = sharding_utils.shard(
         jnp.zeros((batch_size,), jnp.int32),
         self.config.shd_config.act_btnh[:1],
-        eager=True,
     )
     return {"k": k, "v": v, "end_index": end_index}
 
@@ -1641,6 +1650,7 @@ class DecoderLayer(nnx.Module):
           segment_ids=segment_ids,
       )
 
+  @nnx.jit(static_argnames=("batch_size", "max_seq_len", "dtype"))
   def init_cache(
       self, batch_size: int, max_seq_len: int, dtype: jnp.dtype
   ) -> LayerCache:
@@ -2230,17 +2240,13 @@ class Gemma4(BackendMappingMixin, nnx.Module):
             cache=group_cache,
             origin_kv=origin_kv,
             is_shared=is_shared_slice,
-            origin_sub_indices=(
-                origin_sub_indices if has_sharing else None
-            ),
+            origin_sub_indices=(origin_sub_indices if has_sharing else None),
             per_layer_inputs=group_per_layer_inputs,
             new_cache=new_group_cache,
             segment_ids=segment_ids,
         )
 
-        out_cache = tuple(
-            new_group_cache[sub] for sub in range(pattern_len)
-        )
+        out_cache = tuple(new_group_cache[sub] for sub in range(pattern_len))
 
         if has_sharing:
           assert is_origin_slice is not None
@@ -2362,6 +2368,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
     )
     return x, None
 
+  @nnx.jit(static_argnames=("batch_size", "max_seq_len", "dtype"))
   def init_cache(
       self,
       batch_size: int,
@@ -2396,7 +2403,6 @@ class Gemma4(BackendMappingMixin, nnx.Module):
                       dtype=proto_cache["k"].dtype,
                   ),
                   shd_btnh,
-                  eager=True,
               ),
               "v": sharding_utils.shard(
                   jnp.zeros(
@@ -2404,7 +2410,6 @@ class Gemma4(BackendMappingMixin, nnx.Module):
                       dtype=proto_cache["v"].dtype,
                   ),
                   shd_btnh,
-                  eager=True,
               ),
               "end_index": sharding_utils.shard(
                   jnp.zeros(
@@ -2412,7 +2417,6 @@ class Gemma4(BackendMappingMixin, nnx.Module):
                       dtype=proto_cache["end_index"].dtype,
                   ),
                   shd_b,
-                  eager=True,
               ),
           })
         else:

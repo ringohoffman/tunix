@@ -467,7 +467,7 @@ class CreateModelTest(absltest.TestCase):
     self.mock_ckptr_cls.return_value.restore.return_value = self.fake_params
     self.mock_map.return_value = self.fake_params
     self.mock_prune.return_value = self.fake_params
-    self.mock_state.return_value = self.fake_params
+    self.mock_state.return_value = nnx.State(self.fake_params)
     self.config = mock.create_autospec(
         params.model_lib.ModelConfig, instance=True
     )
@@ -545,31 +545,31 @@ class BuildShardedRestoreTargetTest(absltest.TestCase):
     config.use_scan_layers = False
 
     # Downstream layout matches upstream map output exactly
-    model_state = nnx.State({
-        'layers': {
-            0: {
-                'mlp': {
-                    'gate_proj': {
+    model_state = nnx.Dict({
+        'layers': nnx.Dict({
+            '0': nnx.Dict({
+                'mlp': nnx.Dict({
+                    'gate_proj': nnx.Dict({
                         'kernel': nnx.Param(
                             np.zeros((4, 8)),
                             sharding=jax.sharding.PartitionSpec('fsdp', 'tp'),
                         )
-                    },
-                    'up_proj': {
+                    }),
+                    'up_proj': nnx.Dict({
                         'kernel': nnx.Param(
                             np.zeros((4, 8)),
                             sharding=jax.sharding.PartitionSpec('fsdp', 'tp'),
                         )
-                    },
-                }
-            }
-        },
-        'embedder': {
+                    }),
+                })
+            })
+        }),
+        'embedder': nnx.Dict({
             'input_embedding': nnx.Param(
                 np.zeros((16, 4)),
                 sharding=jax.sharding.PartitionSpec('fsdp', None),
             )
-        },
+        }),
     })
 
     target, _ = params._build_sharded_restore_target(
@@ -596,37 +596,37 @@ class BuildShardedRestoreTargetTest(absltest.TestCase):
     config.num_layers = 1
 
     # Downstream scan layout: scan_groups/sub_layers/0/...
-    model_state = nnx.State({
-        'scan_groups': {
-            'sub_layers': {
-                0: {
-                    'mlp': {
-                        'gate_proj': {
+    model_state = nnx.Dict({
+        'scan_groups': nnx.Dict({
+            'sub_layers': nnx.Dict({
+                '0': nnx.Dict({
+                    'mlp': nnx.Dict({
+                        'gate_proj': nnx.Dict({
                             'kernel': nnx.Param(
                                 np.zeros((1, 4, 8)),
                                 sharding=jax.sharding.PartitionSpec(
                                     'fsdp', 'tp'
                                 ),
                             )
-                        },
-                        'up_proj': {
+                        }),
+                        'up_proj': nnx.Dict({
                             'kernel': nnx.Param(
                                 np.zeros((1, 4, 8)),
                                 sharding=jax.sharding.PartitionSpec(
                                     'fsdp', 'tp'
                                 ),
                             )
-                        },
-                    }
-                }
-            }
-        },
-        'embedder': {
+                        }),
+                    })
+                })
+            })
+        }),
+        'embedder': nnx.Dict({
             'input_embedding': nnx.Param(
                 np.zeros((16, 4)),
                 sharding=jax.sharding.PartitionSpec('fsdp', None),
             )
-        },
+        }),
     })
 
     target, _ = params._build_sharded_restore_target(

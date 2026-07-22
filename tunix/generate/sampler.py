@@ -176,6 +176,18 @@ def sample_best(
   return next_token, logp_sampled
 
 
+@nnx.jit(
+    static_argnames=(
+        'n_layers',
+        'cache_size',
+        'batch_size',
+        'num_kv_heads',
+        'head_dim',
+        'dtype',
+        'batch_sharding',
+        'data_sharding',
+    )
+)
 def _init_cache(
     n_layers: int,
     cache_size: int,
@@ -433,6 +445,11 @@ class Sampler(base_sampler.BaseSampler):
   ) -> _SamplingState:
     """Initializes the sampling state given input prompts."""
     batch_size, num_input_tokens, *_ = all_input_ids.shape
+
+    if seed is None:
+      seed = jax.random.key(0)
+    elif not hasattr(seed, "dtype"):
+      seed = jax.random.key(seed)
 
     token_buffer = jnp.full(
         (batch_size, total_sampling_steps),
