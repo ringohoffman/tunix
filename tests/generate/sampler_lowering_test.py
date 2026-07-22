@@ -53,10 +53,9 @@ def _make_sampler(
           head_dim=16,
       ),
   )
-  # eos_ids is normally set inside __call__/generate_from_tokens at runtime.
-  # Set it here so that .lower() tests can trace through _prefill_fn/_decode_fn
-  # without calling the full generation pipeline first.
-  sampler.eos_ids = jnp.array([vocab.eos_id()])
+  # eos_tokens is set during construction, but when building the sampler
+  # manually for lowering tests we need to ensure it's set explicitly.
+  sampler.eos_tokens = jnp.array([vocab.eos_id()])
   return sampler
 
 

@@ -558,13 +558,13 @@ class SamplerTest(parameterized.TestCase):
             num_kv_heads=4,
             head_dim=16,
         ),
+        eos_tokens=[7, 21],
     )
     result = sampler(
         ['input string training', 'hello world'],
         max_generation_steps=10,
         return_logits=True,
         max_prompt_length=4,
-        eos_tokens=[7, 21],
         temperature=0.9,
         top_p=1.0,
         seed=0,

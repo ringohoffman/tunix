@@ -65,7 +65,7 @@ class _SamplingState:
   positions: jnp.ndarray  # [B, L]
 
   # Model state for conditioning the model on autoregressively.
-  cache: dict[str, dict[str, jaxtyping.Array]]
+  cache: dict[str, LayerCache]
 
   # Is decoding done on the given sequence?
   done: jnp.ndarray  # [B]
@@ -251,7 +251,7 @@ class Sampler(base_sampler.BaseSampler):
       self.tokenizer = tok_adapter.TokenizerAdapter(tokenizer)
     self.cache_config = cache_config
     self.image_processor = image_processor
-    self.eos_ids = jnp.array(
+    self.eos_tokens = jnp.array(
         eos_tokens if eos_tokens is not None else [self.tokenizer.eos_id()]
     )
 
@@ -278,7 +278,9 @@ class Sampler(base_sampler.BaseSampler):
       self.data_sharding = jax.sharding.NamedSharding(
           active_mesh, jax.sharding.PartitionSpec()
       )
-    batch_axis = self.data_sharding.spec[0] if len(self.data_sharding.spec) > 0 else None
+    batch_axis = (
+        self.data_sharding.spec[0] if len(self.data_sharding.spec) > 0 else None
+    )
     self.batch_sharding = jax.sharding.NamedSharding(
         self.data_sharding.mesh,
         jax.sharding.PartitionSpec(batch_axis),
@@ -543,9 +545,8 @@ class Sampler(base_sampler.BaseSampler):
 
   def _sample(
       self,
-      logits: jnp.ndarray,
-      eos: jax.Array,
-      cache: dict[str, dict[str, jaxtyping.Array]],
+      logits: jax.Array,
+      cache: dict[str, LayerCache],
       sampler_state: _SamplingState,
   ) -> _SamplingState:
     """Samples a token from the logits."""
@@ -568,7 +569,7 @@ class Sampler(base_sampler.BaseSampler):
           cache=cache,
           logits_buffer=logits_buffer,
           state=beam_search_state,
-          pad_token_id=eos[0],
+          pad_token_id=self.tokenizer.pad_id(),
           decoding_step=decoding_step,
           logprobs_buffer=logprobs_buffer,
       )
@@ -602,7 +603,7 @@ class Sampler(base_sampler.BaseSampler):
       if logprobs_buffer is not None:
         logprobs_buffer = logprobs_buffer.at[:, decoding_step + 1].set(logp)
 
-    done = done | jnp.isin(token_buffer[:, decoding_step + 1], eos)
+    done = done | jnp.isin(token_buffer[:, decoding_step + 1], self.eos_tokens)
     return _SamplingState(
         decoding_step=sampler_state.decoding_step + 1,
         num_input_tokens=sampler_state.num_input_tokens,
@@ -733,7 +734,6 @@ class Sampler(base_sampler.BaseSampler):
     updated_sampler_state = self._sample(
         logits=logits,
         cache=cache,
-        eos=self.eos_ids,
         sampler_state=updated_sampling_state,
     )
     return updated_sampler_state
@@ -773,7 +773,9 @@ class Sampler(base_sampler.BaseSampler):
     return sampling_state
 
   def _sample_step(
-      self, transformer: nnx.Module, sampler_state: _SamplingState
+      self,
+      transformer: nnx.Module,
+      sampler_state: _SamplingState,
   ) -> _SamplingState:
     """Performs a single sampling step.
 
@@ -810,7 +812,6 @@ class Sampler(base_sampler.BaseSampler):
     updated_sampler_state = self._sample(
         logits=logits,
         cache=cache,
-        eos=self.eos_ids,
         sampler_state=sampler_state,
     )
 
@@ -836,7 +837,6 @@ class Sampler(base_sampler.BaseSampler):
       echo: bool = False,
       return_logits: bool = False,
       return_logprobs: bool = False,
-      eos_tokens: Sequence[int] | None = None,
       forbidden_tokens: Iterable[int] | None = None,
       temperature: float = 0.0,
       top_p: float | None = None,
@@ -864,10 +864,8 @@ class Sampler(base_sampler.BaseSampler):
         longest prompt in the batch.
       max_prompt_length: maximum length of the prompt. Specify to avoid
         recompilation on different prompt lengths.
-      echo: whgether to return the prompt as part of the output sample.
+      echo: whether to return the prompt as part of the output sample.
       return_logits: whether to return per-step logits used during generation.
-      eos_tokens: end of sequence tokens to stop generation. If None, the
-        tokenizer's eos_id will be used.
       forbidden_tokens: Optional Iterable of token IDs that are disallowed.
       temperature: temperature for sampling.
       top_p: top-p sampling threshold.
@@ -886,14 +884,10 @@ class Sampler(base_sampler.BaseSampler):
     Returns:
       sampler_output: A SamplerOutput object containing the generated samples.
     """
-    if eos_tokens is not None:
-      self.eos_ids = jnp.array(eos_tokens)
     input_strings = (
         [input_strings] if isinstance(input_strings, str) else input_strings
     )
-
     forbidden_token_ids = tuple(forbidden_tokens) if forbidden_tokens else None
-
     tokens = [self.tokenize(x) for x in input_strings]
 
     processed_images = images
@@ -937,7 +931,6 @@ class Sampler(base_sampler.BaseSampler):
       input_ids: np.ndarray | jnp.ndarray,
       max_generation_steps: int,
       *,
-      eos_tokens: Sequence[int] | None = None,
       forbidden_tokens: Iterable[int] | None = None,
       temperature: float = 0.0,
       top_p: float | None = None,
@@ -965,7 +958,6 @@ class Sampler(base_sampler.BaseSampler):
       input_ids: Left-padded token IDs of shape [B, prompt_len]. Padding should
         use the tokenizer's pad_id.
       max_generation_steps: Maximum number of tokens to generate.
-      eos_tokens: End-of-sequence tokens. Defaults to tokenizer's eos_id.
       forbidden_tokens: Token IDs that are disallowed during generation.
       temperature: Sampling temperature (0.0 = greedy).
       top_p: Nucleus sampling threshold.
@@ -980,15 +972,10 @@ class Sampler(base_sampler.BaseSampler):
     Returns:
       SamplerOutput with generated text, tokens, and optional logits/logprobs.
     """
-    if eos_tokens is not None:
-      self.eos_ids = jnp.array(eos_tokens)
     forbidden_token_ids = tuple(forbidden_tokens) if forbidden_tokens else None
 
     # Ensure we have a numpy array for padded_prompt_tokens in the output.
-    if isinstance(input_ids, jnp.ndarray):
-      all_input_ids_np = np.asarray(input_ids)
-    else:
-      all_input_ids_np = np.asarray(input_ids)
+    all_input_ids_np = np.asarray(input_ids)
 
     max_prompt_length = input_ids.shape[1]
 
@@ -1058,8 +1045,6 @@ class Sampler(base_sampler.BaseSampler):
           f' cache size {self.cache_config.cache_size}.'
       )
 
-    logging.info('[Sampler] phase=init_sample_state START')
-    t0 = time.monotonic()
     sampling_state = self.init_sample_state(
         jnp.array(all_input_ids),
         include_logits=return_logits,
@@ -1072,61 +1057,18 @@ class Sampler(base_sampler.BaseSampler):
         beam_size=beam_size,
         include_logprobs=return_logprobs,
     )
-    logging.info(
-        '[Sampler] phase=init_sample_state DONE (%.3fs)',
-        time.monotonic() - t0,
-    )
-
-    # Validate shardings before dispatch to catch cache misses early.
-    # On Pathways, a sharding mismatch causes the proxy to recompile
-    # (costing ~90 GB proxy RAM for a 31B model) and crash.
-    sharding_utils.log_sharding_summary(
-        sampling_state.cache, label='KV cache (before prefill)'
-    )
-    try:
-      sharding_utils.validate_shardings(
-          sampling_state.cache,
-          expected_mesh=self.data_sharding.mesh,
-          label='KV cache',
-      )
-      sharding_utils.validate_shardings(
-          self._flattened_transformer_state,
-          expected_mesh=self.data_sharding.mesh,
-          label='Transformer parameters',
-      )
-      sharding_utils.validate_shardings(
-          sampling_state,
-          expected_mesh=self.data_sharding.mesh,
-          label='Sampling state',
-      )
-    except ValueError as e:
-      logging.error(
-          'Sharding validation FAILED — this will cause a '
-          'JIT compilation cache miss and likely proxy OOM: %s', e,
-      )
-      raise
-
-    logging.info('[Sampler] phase=prefill START')
-    t0 = time.monotonic()
     sampling_state = self._compiled_prefill_fn(
         self._flattened_transformer_state,
         sampling_state,
         processed_images,
         echo=echo,
     )
-    logging.info(
-        '[Sampler] phase=prefill DONE (%.3fs)', time.monotonic() - t0
-    )
-
-    logging.info('[Sampler] phase=decode START')
-    t0 = time.monotonic()
     sampling_state = self._compiled_decode_fn(
-        self._flattened_transformer_state, sampling_state
+        self._flattened_transformer_state,
+        sampling_state,
     )
-    logging.info('[Sampler] phase=decode DONE (%.3fs)', time.monotonic() - t0)
     token_buffers = sampling_state.token_buffer
     logits_buffers = sampling_state.logits_buffer
-
     final_logprobs_buffer = sampling_state.logprobs_buffer
 
     if sampling_state.sampling_mode == 'beam_search':
@@ -1151,7 +1093,7 @@ class Sampler(base_sampler.BaseSampler):
           return_logits,
           echo,
           self.tokenizer.pad_id(),
-          self.eos_ids,
+          self.eos_tokens,
           max_prompt_length,
           max_len,
       )
@@ -1160,7 +1102,7 @@ class Sampler(base_sampler.BaseSampler):
           self.tokenizer.decode(tokens[:length].tolist())
           for tokens, length in zip(out_tokens, lengths)
       ]
-      out_logprobs = []
+      out_logprobs: list[jax.Array] = []
       if return_logprobs:
         token_buffers = jax.device_get(token_buffers)
         final_logprobs_buffer = jax.device_get(final_logprobs_buffer)
@@ -1174,7 +1116,7 @@ class Sampler(base_sampler.BaseSampler):
           )
           end_idx = (
               utils.np_find_first_eos_idx(
-                  token_buffers[i][max_prompt_length:], self.eos_ids
+                  token_buffers[i][max_prompt_length:], self.eos_tokens
               )
               + max_prompt_length
           )
@@ -1190,9 +1132,9 @@ class Sampler(base_sampler.BaseSampler):
           out_logprobs.append(padded_logprobs.tolist())
 
     else:
-      out_tokens = []
-      out_logits = []
-      out_logprobs = []
+      out_tokens: list[jax.Array] = []
+      out_logits: list[jax.Array] = []
+      out_logprobs: list[jax.Array] = []
       token_buffers = jax.device_get(token_buffers)
       if return_logprobs:
         final_logprobs_buffer = jax.device_get(final_logprobs_buffer)
@@ -1209,7 +1151,7 @@ class Sampler(base_sampler.BaseSampler):
         )
         end_idx = (
             utils.np_find_first_eos_idx(
-                token_buffer[max_prompt_length:], self.eos_ids
+                token_buffer[max_prompt_length:], self.eos_tokens
             )
             + max_prompt_length
         )
