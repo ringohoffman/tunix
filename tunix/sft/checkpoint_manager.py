@@ -108,40 +108,38 @@ class CheckpointManager:
     if root_directory is not None:
       if is_pathways_persistence_enabled():
         root_directory = gcsfuse_to_gs_path(root_directory)
-      # When using Pathways, the checkpoint manager only supports persistence
-      # APIs now.
-      concurrent_gb_args = {}
-      if options and hasattr(options, 'save_device_host_concurrent_gb') and options.save_device_host_concurrent_gb is not None:
-        concurrent_gb_args['save_device_host_concurrent_gb'] = options.save_device_host_concurrent_gb
-
-      if is_pathways_persistence_enabled():
+        # CloudPathwaysArrayHandler is already registered by
+        # pathwaysutils.initialize() in train.py.  It uses the Pathways
+        # Persistence API (PluginExecutable) for direct TPU-worker-to-GCS
+        # writes with zero host/proxy memory.
+        # NOTE: CloudPathwaysArrayHandler does not support OCDBT.
         logging.info(
-            "Registering Pathways colocated Python type handlers for "
-            "host-bypass checkpoint saving."
-        )
-        checkpointing_impl = ocp.pathways.CheckpointingImpl.from_options(
-            use_colocated_python=True,
-        )
-        ocp.pathways.register_type_handlers(
-            use_single_replica_array_handler=True,
-            checkpointing_impl=checkpointing_impl,
+            "Pathways persistence enabled — using CloudPathwaysArrayHandler "
+            "(registered by pathwaysutils.initialize)."
         )
         item_handlers = {
             'model_params': ocp.PyTreeCheckpointHandler(
-                use_ocdbt=True,
+                use_ocdbt=False,
                 use_zarr3=False,
-                **concurrent_gb_args,
             ),
             'optimizer_state': ocp.PyTreeCheckpointHandler(
-                use_ocdbt=True,
+                use_ocdbt=False,
                 use_zarr3=False,
-                **concurrent_gb_args,
             ),
         }
       else:
+        pytree_checkpoint_handler_kwargs: dict[str, Any] = {}
+        if options is not None:
+          pytree_checkpoint_handler_kwargs['save_device_host_concurrent_gb'] = (
+              options.save_device_host_concurrent_gb
+          )
         item_handlers = {
-            'model_params': ocp.PyTreeCheckpointHandler(**concurrent_gb_args),
-            'optimizer_state': ocp.PyTreeCheckpointHandler(**concurrent_gb_args),
+            'model_params': ocp.PyTreeCheckpointHandler(
+                **pytree_checkpoint_handler_kwargs
+            ),
+            'optimizer_state': ocp.PyTreeCheckpointHandler(
+                **pytree_checkpoint_handler_kwargs
+            ),
         }
       item_handlers['custom_metadata'] = ocp.JsonCheckpointHandler()
       self._checkpoint_manager = ocp.CheckpointManager(
