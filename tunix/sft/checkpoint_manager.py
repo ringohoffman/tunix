@@ -114,7 +114,18 @@ class CheckpointManager:
       if options and hasattr(options, 'save_device_host_concurrent_gb') and options.save_device_host_concurrent_gb is not None:
         concurrent_gb_args['save_device_host_concurrent_gb'] = options.save_device_host_concurrent_gb
 
-      if 'proxy' in os.getenv('JAX_PLATFORMS', ''):
+      if is_pathways_persistence_enabled():
+        logging.info(
+            "Registering Pathways colocated Python type handlers for "
+            "host-bypass checkpoint saving."
+        )
+        checkpointing_impl = ocp.pathways.CheckpointingImpl.from_options(
+            use_colocated_python=True,
+        )
+        ocp.pathways.register_type_handlers(
+            use_single_replica_array_handler=True,
+            checkpointing_impl=checkpointing_impl,
+        )
         item_handlers = {
             'model_params': ocp.PyTreeCheckpointHandler(
                 use_ocdbt=True,
@@ -127,15 +138,6 @@ class CheckpointManager:
                 **concurrent_gb_args,
             ),
         }
-        if os.getenv('ENABLE_PATHWAYS_PERSISTENCE', ''):
-          logging.info(
-              'Using persistence API for checkpointing with Pathways.'
-          )
-        else:
-          logging.warning(
-              'Checkpointing without the persistence API, be aware of potential'
-              ' OOM.'
-          )
       else:
         item_handlers = {
             'model_params': ocp.PyTreeCheckpointHandler(**concurrent_gb_args),
