@@ -36,7 +36,7 @@ import jax
 from jax import numpy as jnp
 from orbax import checkpoint as ocp
 import sentencepiece as spm
-from tunix.models.gemma4 import model as model_lib
+from tunix.models.gemma4 import model as gemma4_model
 from tunix.sft import checkpoint_manager
 
 # Pretrained
@@ -190,7 +190,7 @@ def _build_sharded_restore_target(
     checkpoint_path: str,
     model_state: Any,
     mesh: jax.sharding.Mesh,
-    model_config: model_lib.ModelConfig,
+    model_config: gemma4_model.ModelConfig,
 ) -> tuple[dict[str, Any], ocp.PyTreeCheckpointer]:
   """Build a sharded restore target for direct-to-device DMA loading.
 
@@ -365,10 +365,10 @@ def _build_sharded_restore_target(
 
 def create_model_from_checkpoint(
     checkpoint_path: str,
-    model_config: model_lib.ModelConfig,
+    model_config: gemma4_model.ModelConfig,
     mesh: jax.sharding.Mesh | None = None,
     dtype: jnp.dtype = jnp.bfloat16,
-) -> model_lib.Gemma4:
+) -> gemma4_model.Gemma4:
   """Load a Gemma4 model from an Orbax checkpoint.
 
   Uses nnx.eval_shape to build an abstract model without allocating memory,
@@ -402,7 +402,7 @@ def create_model_from_checkpoint(
   # ── Phase 1: Abstract model (no memory allocated) ──────────────────────
   with nnx.use_eager_sharding(True), jax.set_mesh(mesh):
     abs_model = nnx.eval_shape(
-        lambda: model_lib.Gemma4(model_config, rngs=nnx.Rngs(0))
+        lambda: gemma4_model.Gemma4(model_config, rngs=nnx.Rngs(0))
     )
   model_state = nnx.state(abs_model)
 
@@ -536,10 +536,10 @@ def create_model_from_checkpoint(
   return abs_model
 
 
-def _log_sharding_summary(model: model_lib.Gemma4) -> None:
+def _log_sharding_summary(model: gemma4_model.Gemma4) -> None:
   """Log a sample of tensor shardings and flag large replicated tensors."""
   flat_state = jax.tree_util.tree_leaves_with_path(nnx.state(model))
-  replicated_large = []
+  replicated_large: list[tuple[str, tuple[int, ...], int]] = []
 
   for i, (path, leaf) in enumerate(flat_state):
     if not hasattr(leaf, 'sharding') or not hasattr(leaf, 'shape'):
@@ -695,7 +695,7 @@ def create_tokenizer(
 
 def map_from_upstream_checkpoint(
     params: Mapping[str, Any],
-    model_config: model_lib.ModelConfig | None = None,
+    model_config: gemma4_model.ModelConfig | None = None,
 ) -> dict[str, Any]:
   """Map from upstream Orbax NESTED checkpoint to Tunix NNX layout.
 
@@ -903,8 +903,7 @@ def map_from_upstream_checkpoint(
     if len(k) >= 4 and k[2] == 'attn' and k[-1] == 'w':
       if (
           len(v.shape) == 3
-          and model_config
-          and hasattr(model_config, 'embed_dim')
+          and model_config is not None
           and model_config.embed_dim > 0
           and v.shape[0] == model_config.embed_dim
       ):
@@ -912,17 +911,16 @@ def map_from_upstream_checkpoint(
 
   # Adapt kv_einsum <-> (k_einsum, v_einsum) based on model_config attention pattern
   if (
-      model_config
-      and hasattr(model_config, 'num_layers')
-      and hasattr(model_config, 'attention_pattern')
+      model_config is not None
+      and model_config.attention_pattern is not None
       and len(model_config.attention_pattern) > 0
   ):
     pattern_len = len(model_config.attention_pattern)
     for i in range(model_config.num_layers):
       is_global = (
           model_config.attention_pattern[i % pattern_len]
-          == model_lib.AttentionType.GLOBAL
-      )
+          == gemma4_model.AttentionType.GLOBAL
+      ) and model_config.k_eq_v_global
       layer_key = ('layers', i, 'attn')
       if is_global:
         kv_w_key = (*layer_key, 'kv_einsum', 'w')
