@@ -37,6 +37,7 @@ from jax import numpy as jnp
 from orbax import checkpoint as ocp
 import sentencepiece as spm
 from tunix.models.gemma4 import model as model_lib
+from tunix.sft import checkpoint_manager
 
 # Pretrained
 GEMMA4_E2B_PT = 'gs://gemma-data/checkpoints/gemma4-e2b-pt'
@@ -386,6 +387,8 @@ def create_model_from_checkpoint(
     A Gemma4 model instance with loaded weights.
   """
   t0 = time.monotonic()
+  if checkpoint_manager.is_pathways_persistence_enabled():
+    checkpoint_path = checkpoint_manager.gcsfuse_to_gs_path(checkpoint_path)
 
   # ── Phase 0: Resolve subpath (handles step dir or model_params subpath) ──
   clean_path = checkpoint_path.rstrip('/')

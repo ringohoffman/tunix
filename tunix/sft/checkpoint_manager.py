@@ -32,9 +32,23 @@ _DEFAULT_CHECKPOINTING_OPTIONS = ocp.CheckpointManagerOptions(
 )
 
 
+def is_pathways_persistence_enabled() -> bool:
+  """Returns True if Pathways persistence API or proxy platform is enabled."""
+  return (
+      os.getenv("ENABLE_PATHWAYS_PERSISTENCE") == "1"
+      or "proxy" in os.getenv("JAX_PLATFORMS", "")
+  )
+
+
 def gcsfuse_to_gs_path(path: str) -> str:
-  """Translates a local GCSFuse mount path into a direct `gs://` URI for TPU 
-  DMA saving.
+  """Translates a local GCSFuse mount path into a direct `gs://` URI.
+
+  Args:
+    path: Input path string (POSIX local mount or gs:// URI).
+
+  Returns:
+    The translated `gs://` URI if `path` is on a GCSFuse mount point,
+    otherwise the original `path`.
   """
   if path.startswith("gs://"):
     return path
@@ -88,7 +102,8 @@ class CheckpointManager:
     """
     self._checkpoint_manager: ocp.CheckpointManager | None = None
     if root_directory is not None:
-      root_directory = gcsfuse_to_gs_path(root_directory)
+      if is_pathways_persistence_enabled():
+        root_directory = gcsfuse_to_gs_path(root_directory)
       # When using Pathways, the checkpoint manager only supports persistence
       # APIs now.
       concurrent_gb_args = {}
