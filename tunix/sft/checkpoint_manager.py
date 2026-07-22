@@ -62,11 +62,15 @@ def gcsfuse_to_gs_path(path: str) -> str:
           parts = line.split()
           if len(parts) >= 3:
             device, mount_point_str, fstype, *_ = parts
-            if "gcsfuse" in fstype or "gcsfuse" in device:
+            if "gcsfuse" in fstype or "gcsfuse" in device or "fuse" in fstype:
               mount_point = Path(mount_point_str).resolve()
               if abs_path == mount_point or mount_point in abs_path.parents:
                 bucket_name = device.split(":")[-1].strip("/")
-                if not bucket_name or "/" in bucket_name:
+                if (
+                    not bucket_name
+                    or "/" in bucket_name
+                    or bucket_name in ("gcsfuse", "fuse", "/dev/fuse")
+                ):
                   bucket_name = mount_point.name
                 rel_path = abs_path.relative_to(mount_point)
                 gs_path = f"gs://{bucket_name}/{rel_path}".rstrip("/")
