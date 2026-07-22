@@ -40,6 +40,13 @@ def is_pathways_persistence_enabled() -> bool:
   )
 
 
+def is_gcs_or_gcsfuse_path(path: str) -> bool:
+  """Returns True if path is a gs:// URI or mounted via GCSFuse."""
+  if path.startswith("gs://"):
+    return True
+  return gcsfuse_to_gs_path(path).startswith("gs://")
+
+
 def gcsfuse_to_gs_path(path: str) -> str:
   """Translates a local GCSFuse mount path into a direct `gs://` URI.
 
