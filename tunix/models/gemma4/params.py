@@ -391,12 +391,14 @@ def create_model_from_checkpoint(
   # PyTreeCheckpointer can resolve them correctly on any backend.
   # This is a no-op for paths that are already gs:// or not on GCSFuse.
   checkpoint_path = checkpoint_manager.gcsfuse_to_gs_path(checkpoint_path)
+  logging.info('Creating model from checkpoint path %s', checkpoint_path)
 
-  # ── Phase 0: Resolve subpath (handles step dir or model_params subpath) ──
+  # ── Phase 0: Resolve subpath ───────────────────────────────────────────
   clean_path = checkpoint_path.rstrip('/')
   if clean_path.endswith('/model_params'):
     resolved_path = clean_path
   elif (epath.Path(clean_path) / 'model_params').exists():
+    # Tunix step dir (e.g. .../checkpoints/20000) -> append '/model_params'
     resolved_path = str(epath.Path(clean_path) / 'model_params')
   else:
     resolved_path = clean_path
