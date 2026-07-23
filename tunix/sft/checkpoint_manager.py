@@ -12,7 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Checkpoint manager for PEFT."""
+"""Checkpoint manager for fine-tuning.
+
+Automatically detects the runtime environment and selects the optimal
+checkpoint I/O strategy:
+
+**Pathways DMA** (``CloudPathwaysArrayHandler`` active):
+  - Saves in zarr format via direct TPU-worker-to-GCS DMA writes
+    (zero host/proxy memory).
+  - Loads fine-tuned checkpoints back via DMA.
+  - Auto-translates GCSFuse mount paths to ``gs://`` URIs.
+  - ``CloudPathwaysArrayHandler`` does not support the OCDBT TensorStore
+    driver, so zarr format is required.
+
+**Standard JAX** (default ``ArrayHandler``):
+  - Saves in OCDBT format via TensorStore (host transfer).
+  - Optional throttling via ``save_device_host_concurrent_gb``.
+
+Pretrained checkpoint loading (which may be OCDBT format from upstream)
+is handled separately by ``PyTreeCheckpointer.restore()`` in the orbax
+fork, which auto-detects the checkpoint format and dispatches to the
+most efficient compatible handler.
+"""
 
 import os
 from pathlib import Path
@@ -35,7 +56,12 @@ _DEFAULT_CHECKPOINTING_OPTIONS = ocp.CheckpointManagerOptions(
 
 
 def is_pathways_persistence_enabled() -> bool:
-  """Returns True if Pathways persistence API or proxy platform is enabled."""
+  """Returns True if Pathways persistence API or proxy platform is enabled.
+
+  This detects whether ``pathwaysutils.initialize()`` has (or will have)
+  registered ``CloudPathwaysArrayHandler`` as the global ``jax.Array``
+  type handler.
+  """
   return (
       os.getenv("ENABLE_PATHWAYS_PERSISTENCE") == "1"
       or "proxy" in os.getenv("JAX_PLATFORMS", "")
@@ -50,14 +76,10 @@ def is_gcs_or_gcsfuse_path(path: str) -> bool:
 
 
 def gcsfuse_to_gs_path(path: str) -> str:
-  """Translates a local GCSFuse mount path into a direct `gs://` URI.
+  """Translates a local GCSFuse mount path into a direct ``gs://`` URI.
 
-  Args:
-    path: Input path string (POSIX local mount or gs:// URI).
-
-  Returns:
-    The translated `gs://` URI if `path` is on a GCSFuse mount point,
-    otherwise the original `path`.
+  Returns the original path unchanged if it is already a ``gs://`` URI
+  or is not on a GCSFuse mount.
   """
   if path.startswith("gs://"):
     return path
@@ -84,8 +106,7 @@ def gcsfuse_to_gs_path(path: str) -> str:
                 rel_path = abs_path.relative_to(mount_point)
                 gs_path = f"gs://{bucket_name}/{rel_path}".rstrip("/")
                 logging.info(
-                    "[Checkpointing] Translated GCSFuse mount path %r -> %r "
-                    "to enable TPU DMA saving.",
+                    "[Checkpointing] Translated GCSFuse path %r -> %r",
                     path,
                     gs_path,
                 )
@@ -99,63 +120,69 @@ def gcsfuse_to_gs_path(path: str) -> str:
 
 
 class CheckpointManager:
-  """Checkpoint manager for PEFT."""
+  """Checkpoint manager for fine-tuning.
+
+  Automatically selects the optimal save format and I/O strategy based on
+  the runtime environment.
+
+  Args:
+    root_directory: Root directory for checkpoints. If None, the
+      checkpoint manager is disabled (all operations become no-ops).
+    options: Orbax checkpoint manager options.  On standard JAX,
+      ``save_device_host_concurrent_gb`` is forwarded to handlers to
+      throttle Device-to-Host transfers. On Pathways (DMA saves),
+      this option is ignored since no host transfer occurs.
+
+  Examples:
+    >>> manager = CheckpointManager("/path/to/checkpoints")
+    >>> manager.save(step, model, optimizer)
+    >>> manager.maybe_restore(model, optimizer)
+    >>> manager.close()
+  """
 
   def __init__(
       self,
       root_directory: str | None = None,
       options: ocp.CheckpointManagerOptions | None = None,
-  ):
-    """Initializes the checkpoint manager.
-
-    Args:
-      root_directory: The root directory for the checkpoint manager. If None,
-        the checkpoint manager will be disabled.
-      options: The options for the checkpoint manager.
-    """
+  ) -> None:
     self._checkpoint_manager: ocp.CheckpointManager | None = None
-    if root_directory is not None:
-      if is_pathways_persistence_enabled():
-        root_directory = gcsfuse_to_gs_path(root_directory)
-        # CloudPathwaysArrayHandler is already registered by
-        # pathwaysutils.initialize() in train.py.  It uses the Pathways
-        # Persistence API (PluginExecutable) for direct TPU-worker-to-GCS
-        # writes with zero host/proxy memory.
-        # NOTE: CloudPathwaysArrayHandler does not support OCDBT.
-        logging.info(
-            "Pathways persistence enabled — using CloudPathwaysArrayHandler "
-            "(registered by pathwaysutils.initialize)."
-        )
-        item_handlers = {
-            'model_params': ocp.PyTreeCheckpointHandler(
-                use_ocdbt=False,
-                use_zarr3=False,
-            ),
-            'optimizer_state': ocp.PyTreeCheckpointHandler(
-                use_ocdbt=False,
-                use_zarr3=False,
-            ),
-        }
-      else:
-        pytree_checkpoint_handler_kwargs: dict[str, Any] = {}
-        if options is not None:
-          pytree_checkpoint_handler_kwargs['save_device_host_concurrent_gb'] = (
-              options.save_device_host_concurrent_gb
-          )
-        item_handlers = {
-            'model_params': ocp.PyTreeCheckpointHandler(
-                **pytree_checkpoint_handler_kwargs
-            ),
-            'optimizer_state': ocp.PyTreeCheckpointHandler(
-                **pytree_checkpoint_handler_kwargs
-            ),
-        }
-      item_handlers['custom_metadata'] = ocp.JsonCheckpointHandler()
-      self._checkpoint_manager = ocp.CheckpointManager(
-          root_directory,
-          item_handlers=item_handlers,
-          options=options or _DEFAULT_CHECKPOINTING_OPTIONS,
+    if root_directory is None:
+      return
+    root_directory = gcsfuse_to_gs_path(root_directory)
+
+    handler_kwargs: ocp.PyTreeCheckpointHandlerKwargs = {}
+    if use_dma := is_pathways_persistence_enabled():
+      # CloudPathwaysArrayHandler is registered by pathwaysutils.initialize()
+      # and writes zarr format via direct TPU-worker-to-GCS DMA
+      # OCDBT is not supported by the Pathways Persistence API
+      handler_kwargs["use_ocdbt"] = False
+      handler_kwargs["use_zarr3"] = False
+    elif (
+        options is not None
+        and options.save_device_host_concurrent_gb is not None
+    ):
+      # Standard ArrayHandler: OCDBT via TensorStore (host transfer)
+      handler_kwargs['save_device_host_concurrent_gb'] = (
+          options.save_device_host_concurrent_gb
       )
+
+    item_handlers = {
+        'model_params': ocp.PyTreeCheckpointHandler(**handler_kwargs),
+        'optimizer_state': ocp.PyTreeCheckpointHandler(**handler_kwargs),
+        'custom_metadata': ocp.JsonCheckpointHandler(),
+    }
+    self._checkpoint_manager = ocp.CheckpointManager(
+        root_directory,
+        item_handlers=item_handlers,
+        options=options or _DEFAULT_CHECKPOINTING_OPTIONS,
+    )
+
+    logging.info(
+        '[Checkpointing] Initialized — strategy=%s, format=%s, path=%s',
+        'Pathways DMA (zero host memory)' if use_dma else 'TensorStore (host transfer)',
+        'zarr' if use_dma else 'OCDBT',
+        root_directory,
+    )
 
   def latest_step(self) -> int | None:
     """Returns the latest step."""

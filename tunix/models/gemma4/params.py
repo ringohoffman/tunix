@@ -387,8 +387,10 @@ def create_model_from_checkpoint(
     A Gemma4 model instance with loaded weights.
   """
   t0 = time.monotonic()
-  if checkpoint_manager.is_pathways_persistence_enabled():
-    checkpoint_path = checkpoint_manager.gcsfuse_to_gs_path(checkpoint_path)
+  # Translate GCSFuse mount paths to gs:// URIs so TensorStore and
+  # PyTreeCheckpointer can resolve them correctly on any backend.
+  # This is a no-op for paths that are already gs:// or not on GCSFuse.
+  checkpoint_path = checkpoint_manager.gcsfuse_to_gs_path(checkpoint_path)
 
   # ── Phase 0: Resolve subpath (handles step dir or model_params subpath) ──
   clean_path = checkpoint_path.rstrip('/')
@@ -407,6 +409,8 @@ def create_model_from_checkpoint(
   model_state = nnx.state(abs_model)
 
   # ── Phase 2: Restore checkpoint ────────────────────────────────────────
+  # PyTreeCheckpointer.restore() auto-detects OCDBT vs zarr format and
+  # dispatches to the most efficient compatible handler automatically.
   step_parent = os.path.dirname(resolved_path.rstrip('/'))
   step_name = os.path.basename(step_parent)
   is_step_dir = (
