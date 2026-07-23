@@ -820,6 +820,9 @@ def map_from_upstream_checkpoint(
         'pre_self_attention_norm': 'pre_attention_norm',
         'post_self_attention_norm': 'post_attention_norm',
         'self_attention': 'attn',
+        'post_ffw1_norm': 'dense_post_ffw_norm',
+        'pre_ffw2_norm': 'moe_pre_ffw_norm',
+        'post_ffw2_norm': 'moe_post_ffw_norm',
     }
     module_path = [norm_submodules.get(p, p) for p in module_path]
     if 'attn' in module_path:
@@ -849,8 +852,12 @@ def map_from_upstream_checkpoint(
     ):
       param_name = 'w'
 
-    if 'mlp' in module_path:
-      m_idx = module_path.index('mlp')
+    if 'mlp' in module_path or 'mlp2' in module_path:
+      m_idx = (
+          module_path.index('mlp2')
+          if 'mlp2' in module_path
+          else module_path.index('mlp')
+      )
       if m_idx + 1 < len(module_path):
         sub = module_path[m_idx + 1]
         mlp_sub_map = {
@@ -861,21 +868,36 @@ def map_from_upstream_checkpoint(
         if sub in mlp_sub_map:
           module_path[m_idx + 1] = mlp_sub_map[sub]
 
-    # MLP gating_einsum -> split into gate_proj and up_proj.
-    if module_path[1:] == ['mlp', 'gating_einsum']:
-      if value.shape[0] != 2:
-        raise ValueError(
-            f'Expected gating_einsum shape[0]=2, got {value.shape[0]} for'
-            f' {"/".join(str(p) for p in parts)}'
-        )
+    # MLP gating_einsum -> split into gate_proj and up_proj (dense shared MLP or
+    # standard MLP)
+    if module_path[1:] in (['mlp', 'gating_einsum'], ['mlp2', 'gating_einsum']):
+      if len(value.shape) == 4 or value.shape[0] != 2:
+        # MoE gating_einsum (e.g. 128 experts)
+        new_params[(*layer_idx, 'moe', 'gating_einsum')] = value
+        continue
       new_params[(*layer_idx, 'mlp', 'gate_proj', 'kernel')] = value[0].T
       new_params[(*layer_idx, 'mlp', 'up_proj', 'kernel')] = value[1].T
       continue
 
-    # MLP linear -> down_proj (no transpose).
-    if module_path[1:] == ['mlp', 'linear']:
+    # MLP linear -> down_proj (no transpose) or MoE linear
+    if module_path[1:] in (['mlp', 'linear'], ['mlp2', 'linear']):
+      if len(value.shape) == 3 and module_path[1] == 'mlp':
+        # MoE linear (e.g. 128 experts)
+        new_params[(*layer_idx, 'moe', 'linear')] = value
+        continue
       new_params[(*layer_idx, 'mlp', 'down_proj', 'kernel')] = value
       continue
+
+    # MoE router and expert scale params.
+    if len(module_path) >= 2 and module_path[1] == 'mlp':
+      sub = (
+          param_name
+          if param_name in ('router_logits', 'router_scale', 'per_expert_scale')
+          else module_path[-1]
+      )
+      if sub in ('router_logits', 'router_scale', 'per_expert_scale'):
+        new_params[(*layer_idx, 'moe', sub)] = value
+        continue
 
     # Normalize query/key norm names to underscore-prefixed form.
     if module_path[-1] in (
