@@ -23,6 +23,7 @@ Tunix NNX implementation.
 from __future__ import annotations
 
 import collections
+import dataclasses
 from collections.abc import Callable
 import contextlib
 import itertools
@@ -414,6 +415,11 @@ def _try_restore_native_tunix(
   They are distinguished from upstream checkpoints by the absence of
   'token_embedder' and 'decoder' top-level keys.
 
+  To handle checkpoints saved with or without scan layers regardless of the
+  current model config, this function always restores into a flat
+  ``use_scan_layers=False`` model first, then re-stacks into scan groups if
+  the actual model config requires it.
+
   Returns True if the checkpoint was successfully restored, False if this
   is not a native Tunix checkpoint and the caller should fall through to
   the upstream mapping path.
@@ -443,6 +449,44 @@ def _try_restore_native_tunix(
 
   ckpt_root = os.path.dirname(step_parent)
   step_num = int(step_name)
+  model_config = abs_model.config
+
+  # Determine whether the checkpoint is flat (layers.N) or scanned
+  # (scan_groups), and whether the model expects the same format.
+  ckpt_has_layers = 'layers' in top_keys
+  ckpt_has_scan = (
+      'scan_groups' in top_keys or 'unshared_scan_groups' in top_keys
+  )
+  model_wants_scan = (
+      model_config.attention_pattern is not None
+      and model_config.use_scan_layers
+  )
+
+  # If the checkpoint format matches the model, restore directly.
+  # Otherwise, build a temporary flat model and re-stack after restore.
+  needs_restack = ckpt_has_layers and model_wants_scan
+  needs_unstack = ckpt_has_scan and not model_wants_scan
+
+  if needs_restack or needs_unstack:
+    # Build a temporary abstract model with the OPPOSITE scan setting to
+    # match the checkpoint's key layout.
+    restore_config = dataclasses.replace(
+        model_config,
+        use_scan_layers=not model_config.use_scan_layers,
+    )
+    with nnx.use_eager_sharding(True), _mesh_context(mesh):
+      restore_model = nnx.eval_shape(
+          lambda: gemma4_model.Gemma4(restore_config, rngs=nnx.Rngs(0))
+      )
+    logging.info(
+        'Checkpoint layout (%s) does not match model (scan=%s). '
+        'Restoring with scan=%s first, then converting.',
+        'layers.N' if ckpt_has_layers else 'scan_groups',
+        model_wants_scan,
+        restore_config.use_scan_layers,
+    )
+  else:
+    restore_model = abs_model
 
   def _bind_mesh(x: Any) -> Any:
     if isinstance(x, jax.ShapeDtypeStruct) and isinstance(
@@ -456,17 +500,52 @@ def _try_restore_native_tunix(
     return x
 
   with _mesh_context(mesh):
-    nnx.update(abs_model, jax.tree.map(_bind_mesh, nnx.state(abs_model)))
+    nnx.update(
+        restore_model,
+        jax.tree.map(_bind_mesh, nnx.state(restore_model)),
+    )
     mgr = tunix_ckpt_mgr.CheckpointManager(ckpt_root)
-    mgr.maybe_restore(abs_model, step=step_num)
+    mgr.maybe_restore(restore_model, step=step_num)
     mgr.close()
 
+  if needs_restack and model_config.attention_pattern is not None:
+    # Convert flat layers.N → scan_groups by extracting the restored params,
+    # stacking them, then updating the original abs_model.
+    flat_params = nnx.to_pure_dict(nnx.state(restore_model))
+    stacked = _stack_layers_for_scan(
+        flat_params,
+        model_config.num_layers,
+        len(model_config.attention_pattern),
+        model_config.frac_shared_layers,
+    )
+    # Prune stacked params to match the target model's state keys and update.
+    model_state = nnx.state(abs_model)
+    pruned = _prune_to_model_keys(stacked, model_state)
+    _validate_param_shapes(pruned, model_state)
+    with _mesh_context(mesh):
+      shardings = nnx.to_pure_dict(nnx.get_named_sharding(model_state, mesh))
+      typed = jax.tree_util.tree_map_with_path(
+          lambda p, x, s: jnp.asarray(x, device=s, dtype=model_config.param_dtype),
+          pruned,
+          shardings,
+      )
+    nnx.update(abs_model, typed)
+  elif needs_unstack:
+    # Convert scan_groups → flat layers.N (future-proofing).
+    # For now, the restored model already has the right layout; just copy.
+    nnx.update(abs_model, nnx.state(restore_model))
+  elif restore_model is not abs_model:
+    nnx.update(abs_model, nnx.state(restore_model))
+
   logging.info(
-      'Restored native Tunix model from step %d via CheckpointManager in %.2fs',
+      'Restored native Tunix model from step %d via CheckpointManager in %.2fs'
+      ' (restack=%s)',
       step_num,
       time.monotonic() - t0,
+      needs_restack,
   )
   return True
+
 
 
 def create_model_from_checkpoint(
