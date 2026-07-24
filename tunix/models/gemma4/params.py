@@ -22,16 +22,18 @@ Tunix NNX implementation.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import collections
+from collections.abc import Callable
 import itertools
 import os
 import time
-from typing import Any
+from typing import Any, TypeVar
 
 from absl import logging
 from etils import epath
 import flax
 from flax import nnx
+import flax.typing
 import jax
 from jax import numpy as jnp
 from orbax import checkpoint as ocp
@@ -49,64 +51,21 @@ GEMMA4_E4B_IT = 'gs://gemma-data/checkpoints/gemma4-e4b-it'
 GEMMA4_TOKENIZER = 'gs://gemma-data/tokenizers/tokenizer_gemma4.model'
 
 
-def _stack_layers_for_scan(
-    params: dict[str, Any],
-    num_layers: int = 42,
-    pattern_len: int = 6,
-) -> dict[str, Any]:
-  """Restructure per-layer params into scan_groups/sub_layers with stacking.
-
-  When use_scan_layers is True, the model uses vmapped scan groups instead
-  of individual layer modules. This function takes the flat per-layer
-  checkpoint layout (layers/0..N) and reorganizes it into the scan layout
-  (scan_groups/sub_layers/0..pattern_len) with an extra leading axis of
-  size num_groups = num_layers // pattern_len.
+def create_tokenizer(
+    path: str = GEMMA4_TOKENIZER,
+) -> spm.SentencePieceProcessor:
+  """Load the Gemma 4 SentencePiece tokenizer.
 
   Args:
-    params: Nested parameter dict from map_from_upstream_checkpoint.
-    num_layers: Total number of layers in the model.
-    pattern_len: Number of sub-layers per scan group.
+    path: Path to the SentencePiece model file.
 
   Returns:
-    Parameter dict with layers restructured into scan groups.
+    A loaded SentencePieceProcessor instance.
   """
-  num_groups = num_layers // pattern_len
-  flat = flax.traverse_util.flatten_dict(params)
-  new_flat: dict[tuple[Any, ...], Any] = {}
-  collector: dict[tuple[Any, ...], dict[int, Any]] = {}
-
-  for path, val in flat.items():
-    if len(path) >= 1 and (
-        path[0] == 'layers'
-        or (isinstance(path[0], str) and path[0].startswith('layer_'))
-    ):
-      if path[0] == 'layers':
-        layer_idx = int(path[1])
-        param_path = path[2:]
-      else:
-        layer_idx = int(path[0].split('_')[1])
-        param_path = path[1:]
-      sub_layer_idx = layer_idx % pattern_len
-      group_idx = layer_idx // pattern_len
-      target_path = ('scan_groups', 'sub_layers', sub_layer_idx) + param_path
-      collector.setdefault(target_path, {})[group_idx] = val
-    else:
-      new_flat[path] = val
-
-  for target_path, slices in collector.items():
-    sorted_slices = [slices[i] for i in range(num_groups)]
-    if isinstance(sorted_slices[0], _ShapeTracer):
-      new_flat[target_path] = _ShapeTracer(
-          tuple(s.key for s in sorted_slices),
-          (num_groups,) + sorted_slices[0].shape,
-          sorted_slices[0]._transposed,
-          sorted_slices[0]._slice_idx,
-          sorted_slices[0].perm,
-      )
-    else:
-      new_flat[target_path] = jnp.stack(sorted_slices, axis=0)
-
-  return flax.traverse_util.unflatten_dict(new_flat)
+  spm_processor = spm.SentencePieceProcessor()
+  model_proto = epath.Path(path).read_bytes()
+  spm_processor.LoadFromSerializedProto(model_proto)
+  return spm_processor
 
 
 class _ShapeTracer:
@@ -125,7 +84,7 @@ class _ShapeTracer:
 
   def __init__(
       self,
-      key: tuple[str, ...],
+      key: flax.typing.PathParts | tuple[flax.typing.PathParts, ...],
       shape: tuple[int, ...],
       transposed: bool = False,
       slice_idx: int | None = None,
@@ -186,12 +145,76 @@ class _ShapeTracer:
     return jax.sharding.PartitionSpec(*s)
 
 
+LeafT = TypeVar('LeafT', jax.Array, _ShapeTracer)
+
+
+def _stack_layers_for_scan(
+    params: flax.typing.PyTree[jax.Array],
+    num_layers: int,
+    pattern_len: int,
+) -> flax.typing.PyTree[jax.Array]:
+  """Restructure per-layer params into scan_groups/sub_layers with stacking.
+
+  When use_scan_layers is True, the model uses vmapped scan groups instead
+  of individual layer modules. This function takes the flat per-layer
+  checkpoint layout (layers/0..N) and reorganizes it into the scan layout
+  (scan_groups/sub_layers/0..pattern_len) with an extra leading axis of
+  size num_groups = num_layers // pattern_len.
+
+  Args:
+    params: Nested parameter dict from map_from_upstream_checkpoint.
+    num_layers: Total number of layers in the model.
+    pattern_len: Number of sub-layers per scan group.
+
+  Returns:
+    Parameter dict with layers restructured into scan groups.
+  """
+  num_groups = num_layers // pattern_len
+  flat = flax.traverse_util.flatten_dict(params)
+  new_flat: flax.typing.FlatPyTree[jax.Array] = {}
+  collector: dict[flax.typing.PathParts, dict[int, jax.Array]] = (
+      collections.defaultdict(dict)
+  )
+
+  for path, param in flat.items():
+    root = path[0]
+    assert isinstance(root, str)
+    if len(path) >= 1 and (root == 'layers' or root.startswith('layer_')):
+      if root == 'layers':
+        layer_idx, *param_path = path[1:]
+        assert isinstance(layer_idx, int)
+        param_path = tuple(param_path)
+      else:
+        _, layer_idx_str = root.split('_')
+        layer_idx = int(layer_idx_str)
+        param_path = path[1:]
+
+      sub_layer_idx = layer_idx % pattern_len
+      group_idx = layer_idx // pattern_len
+      target_path: flax.typing.PathParts = (
+          'scan_groups',
+          'sub_layers',
+          sub_layer_idx,
+      ) + param_path
+      collector[target_path][group_idx] = param
+    else:
+      new_flat[path] = param
+
+  for target_path, slices in collector.items():
+    sorted_slices = [slices[i] for i in range(num_groups)]
+    new_flat[target_path] = jnp.stack(sorted_slices, axis=0)
+
+  return flax.traverse_util.unflatten_dict(new_flat)
+
+
 def _build_sharded_restore_target(
     checkpoint_path: str,
-    model_state: Any,
+    model_state: nnx.State[
+        flax.typing.PathParts, nnx.Variable[jax.ShapeDtypeStruct]
+    ],
     mesh: jax.sharding.Mesh,
     model_config: gemma4_model.ModelConfig,
-) -> tuple[dict[str, Any], ocp.PyTreeCheckpointer]:
+) -> tuple[flax.typing.PyTree[jax.ShapeDtypeStruct], ocp.PyTreeCheckpointer]:
   """Build a sharded restore target for direct-to-device DMA loading.
 
   Traces map_from_upstream_checkpoint with _ShapeTracer objects to determine
@@ -212,82 +235,62 @@ def _build_sharded_restore_target(
   """
   ckptr = ocp.PyTreeCheckpointer()
   meta = ckptr.metadata(checkpoint_path)
+  assert meta.item_metadata is not None
   item_tree = meta.item_metadata.tree
+  assert flax.typing.is_pytree_of(item_tree, ocp.metadata.ArrayMetadata)
   flat_upstream = flax.traverse_util.flatten_dict(item_tree)
 
-  # Trace through the key mapper with abstract _ShapeTracer values.
   mock_upstream = flax.traverse_util.unflatten_dict(
       {k: _ShapeTracer(k, v.shape) for k, v in flat_upstream.items()}
   )
+
+  def _tracer_stack_kv(
+      k: _ShapeTracer,
+      v: _ShapeTracer,
+  ) -> _ShapeTracer:
+    return _ShapeTracer(
+        (k.key, v.key),
+        (2, *k.shape),
+        k._transposed,
+        k._slice_idx,
+        k.perm,
+    )
+
   flat_traced = flax.traverse_util.flatten_dict(
-      map_from_upstream_checkpoint(mock_upstream, model_config=model_config)
+      map_from_upstream_checkpoint(
+          mock_upstream,
+          model_config=model_config,
+          stack_kv=_tracer_stack_kv,
+      )
   )
 
-  # Get downstream shardings from the abstract model.
   with jax.set_mesh(mesh):
-    shd = nnx.get_named_sharding(model_state, mesh)
-    state_shd = nnx.state(shd) if isinstance(shd, nnx.Module) else shd
+    shd_state = nnx.get_named_sharding(model_state, mesh)
     flat_shardings = flax.traverse_util.flatten_dict(
-        nnx.to_pure_dict(state_shd)
+        nnx.to_pure_dict(shd_state)
     )
-    flat_shardings = {
-        tuple(
-            int(k) if isinstance(k, str) and k.isdigit() else k for k in path
-        ): s
-        for path, s in flat_shardings.items()
-    }
-    if not flat_shardings and isinstance(model_state, nnx.State):
 
-      def _get_ns(v: Any) -> jax.sharding.NamedSharding:
-        if isinstance(v, jax.sharding.NamedSharding):
-          return v
-        meta = v.get_metadata() if hasattr(v, 'get_metadata') else {}
-        spec = (
-            getattr(v, 'sharding_names', None)
-            or meta.get('out_sharding')
-            or getattr(v, 'out_sharding', None)
-            or getattr(v, 'sharding', None)
-        )
-        if isinstance(spec, jax.sharding.NamedSharding):
-          return spec
-        if not isinstance(spec, jax.sharding.PartitionSpec):
-          spec = jax.sharding.PartitionSpec()
-        return jax.sharding.NamedSharding(mesh, spec)
-
-      flat_raw = flax.traverse_util.flatten_dict(model_state.raw_mapping)
-      flat_shardings = {k: _get_ns(v) for k, v in flat_raw.items()}
   pattern_len = (
-      len(model_config.attention_pattern) if model_config.use_scan_layers else 0
+      len(model_config.attention_pattern)
+      if (
+          model_config.attention_pattern is not None
+          and model_config.use_scan_layers
+      )
+      else 0
   )
 
-  # Invert traced operations to compute upstream PartitionSpecs.
-  upstream_target: dict[tuple[str, ...], jax.ShapeDtypeStruct] = {}
+  upstream_target: flax.typing.FlatPyTree[jax.ShapeDtypeStruct] = {}
   for downstream_key, tracer in flat_traced.items():
-    norm_downstream_key = tuple(
-        int(k) if isinstance(k, str) and k.isdigit() else k
-        for k in downstream_key
-    )
-    # If using scan layers, map flat downstream key to scan group key.
     if (
         pattern_len > 0
-        and len(norm_downstream_key) >= 1
-        and (
-            norm_downstream_key[0].startswith('layer_')
-            or norm_downstream_key[0] in ('scan_groups', 'layers')
-        )
+        and len(downstream_key) >= 2
+        and downstream_key[0] == 'layers'
     ):
-      if norm_downstream_key[0] == 'scan_groups':
-        scan_key = norm_downstream_key
-      elif norm_downstream_key[0].startswith('layer_'):
-        layer_idx = int(norm_downstream_key[0].split('_')[1])
-        param_path = norm_downstream_key[1:]
-        sub_layer_idx = layer_idx % pattern_len
-        scan_key = ('scan_groups', 'sub_layers', sub_layer_idx) + param_path
-      else:
-        layer_idx = norm_downstream_key[1]
-        param_path = norm_downstream_key[2:]
-        sub_layer_idx = layer_idx % pattern_len
-        scan_key = ('scan_groups', 'sub_layers', sub_layer_idx) + param_path
+      layer_idx = downstream_key[1]
+      assert isinstance(layer_idx, int)
+      param_path = downstream_key[2:]
+      sub_layer_idx = layer_idx % pattern_len
+      scan_key = ('scan_groups', 'sub_layers', sub_layer_idx) + param_path
       if scan_key not in flat_shardings:
         if ('scan_groups',) + scan_key in flat_shardings:
           scan_key = ('scan_groups',) + scan_key
@@ -299,7 +302,7 @@ def _build_sharded_restore_target(
           continue
       sharding = flat_shardings[scan_key]
       # The stacked param's spec has a leading None for the scan/vmap axis
-      # (prepended by _init_scan_layers Phase 2).  The checkpoint stores
+      # (prepended by _init_scan_layers Phase 2). The checkpoint stores
       # per-layer (un-stacked) tensors without that axis, so strip it before
       # inverting to the upstream checkpoint spec.
       spec_axes = tuple(sharding.spec)
@@ -309,33 +312,25 @@ def _build_sharded_restore_target(
             jax.sharding.PartitionSpec(*spec_axes[1:]),
         )
     else:
-      if norm_downstream_key not in flat_shardings:
+      if downstream_key not in flat_shardings:
         logging.info(
             'Skipping sharded restore target for pruned key: %s',
-            '/'.join(str(p) for p in norm_downstream_key),
+            '/'.join(str(p) for p in downstream_key),
         )
         continue
-      sharding = flat_shardings[norm_downstream_key]
-
-    def _find_orig_key(key: Any) -> Any:
-      if isinstance(key, tuple):
-        str_k = tuple(str(x) if isinstance(x, int) else x for x in key)
-        if str_k in flat_upstream:
-          return str_k
-      if key in flat_upstream:
-        return key
-      return key
+      sharding = flat_shardings[downstream_key]
 
     upstream_spec = tracer.invert_spec(sharding.spec)
     if tracer.key and isinstance(tracer.key[0], tuple):
-      # Dual-key tuple (e.g. kv_einsum stacked from separate k_einsum and v_einsum keys)
+      # Dual-key tuple (e.g. kv_einsum stacked from separate k_einsum and
+      # v_einsum keys)
       single_spec = (
           jax.sharding.PartitionSpec(*upstream_spec[1:])
           if len(upstream_spec) > 3 and upstream_spec[0] is None
           else upstream_spec
       )
-      for single_key in tracer.key:
-        matched_key = _find_orig_key(single_key)
+      for matched_key in tracer.key:
+        assert isinstance(matched_key, tuple)
         orig = flat_upstream[matched_key]
         upstream_target[matched_key] = jax.ShapeDtypeStruct(
             shape=orig.shape,
@@ -343,7 +338,7 @@ def _build_sharded_restore_target(
             sharding=jax.sharding.NamedSharding(mesh, single_spec),
         )
     else:
-      matched_key = _find_orig_key(tracer.key)
+      matched_key = tracer.key
       orig = flat_upstream[matched_key]
       upstream_target[matched_key] = jax.ShapeDtypeStruct(
           shape=orig.shape,
@@ -351,16 +346,77 @@ def _build_sharded_restore_target(
           sharding=jax.sharding.NamedSharding(mesh, upstream_spec),
       )
 
-  def _stringify_keys(d: Any) -> Any:
-    if isinstance(d, dict):
-      return {
-          str(k) if isinstance(k, int) else k: _stringify_keys(v)
-          for k, v in d.items()
-      }
-    return d
-
   unflattened = flax.traverse_util.unflatten_dict(upstream_target)
-  return _stringify_keys(unflattened), ckptr
+  return unflattened, ckptr
+
+
+def _try_restore_native_tunix(
+    resolved_path: str,
+    abs_model: gemma4_model.Gemma4,
+    mesh: jax.sharding.Mesh | None,
+    t0: float,
+) -> bool:
+  """Attempt to restore from a native Tunix CheckpointManager checkpoint.
+
+  Native Tunix checkpoints live under a step directory (e.g.
+  .../checkpoints/20000/model_params) and use Tunix NNX key layout directly.
+  They are distinguished from upstream checkpoints by the absence of
+  'token_embedder' and 'decoder' top-level keys.
+
+  Returns True if the checkpoint was successfully restored, False if this
+  is not a native Tunix checkpoint and the caller should fall through to
+  the upstream mapping path.
+  """
+  step_parent = os.path.dirname(resolved_path.rstrip('/'))
+  step_name = os.path.basename(step_parent)
+  is_step_dir = (
+      step_name.isdigit()
+      and os.path.basename(resolved_path.rstrip('/')) == 'model_params'
+  )
+  if not is_step_dir:
+    return False
+
+  ckptr_meta = ocp.PyTreeCheckpointer().metadata(resolved_path)
+  top_keys = (
+      list(ckptr_meta.item_metadata.tree.keys())
+      if ckptr_meta.item_metadata
+      else []
+  )
+  is_native_tunix = (
+      'token_embedder' not in top_keys and 'decoder' not in top_keys
+  )
+  if not is_native_tunix or mesh is None:
+    return False
+
+  from tunix.sft import checkpoint_manager as tunix_ckpt_mgr
+
+  ckpt_root = os.path.dirname(step_parent)
+  step_num = int(step_name)
+
+  def _bind_mesh(x: Any) -> Any:
+    if isinstance(x, jax.ShapeDtypeStruct) and isinstance(
+        getattr(x, 'sharding', None), jax.sharding.NamedSharding
+    ):
+      return jax.ShapeDtypeStruct(
+          x.shape,
+          x.dtype,
+          sharding=jax.sharding.NamedSharding(mesh, x.sharding.spec),
+      )
+    return x
+
+  with jax.set_mesh(mesh):
+    nnx.update(abs_model, jax.tree.map(_bind_mesh, nnx.state(abs_model)))
+    mgr = tunix_ckpt_mgr.CheckpointManager(ckpt_root)
+    mgr.maybe_restore(abs_model, step=step_num)
+    mgr.close()
+
+  logging.info(
+      'Restored native Tunix model from step %d via CheckpointManager in'
+      ' %.2fs',
+      step_num,
+      time.monotonic() - t0,
+  )
+  return True
 
 
 def create_model_from_checkpoint(
@@ -387,13 +443,10 @@ def create_model_from_checkpoint(
     A Gemma4 model instance with loaded weights.
   """
   t0 = time.monotonic()
-  # Translate GCSFuse mount paths to gs:// URIs so TensorStore and
-  # PyTreeCheckpointer can resolve them correctly on any backend.
-  # This is a no-op for paths that are already gs:// or not on GCSFuse.
+  # GCSFuse mount paths must be translated to gs:// URIs for TensorStore.
   checkpoint_path = checkpoint_manager.gcsfuse_to_gs_path(checkpoint_path)
   logging.info('Creating model from checkpoint path %s', checkpoint_path)
 
-  # ── Phase 0: Resolve subpath ───────────────────────────────────────────
   clean_path = checkpoint_path.rstrip('/')
   if clean_path.endswith('/model_params'):
     resolved_path = clean_path
@@ -403,62 +456,16 @@ def create_model_from_checkpoint(
   else:
     resolved_path = clean_path
 
-  # ── Phase 1: Abstract model (no memory allocated) ──────────────────────
   with nnx.use_eager_sharding(True), jax.set_mesh(mesh):
     abs_model = nnx.eval_shape(
         lambda: gemma4_model.Gemma4(model_config, rngs=nnx.Rngs(0))
     )
-  model_state = nnx.state(abs_model)
+  model_state: nnx.State[
+      flax.typing.PathParts, nnx.Variable[jax.ShapeDtypeStruct]
+  ] = nnx.state(abs_model)
 
-  # ── Phase 2: Restore checkpoint ────────────────────────────────────────
-  # PyTreeCheckpointer.restore() auto-detects OCDBT vs zarr format and
-  # dispatches to the most efficient compatible handler automatically.
-  step_parent = os.path.dirname(resolved_path.rstrip('/'))
-  step_name = os.path.basename(step_parent)
-  is_step_dir = (
-      step_name.isdigit()
-      and os.path.basename(resolved_path.rstrip('/')) == 'model_params'
-  )
-  if is_step_dir:
-    ckptr_meta = ocp.PyTreeCheckpointer().metadata(resolved_path)
-    top_keys = (
-        list(ckptr_meta.item_metadata.tree.keys())
-        if ckptr_meta.item_metadata
-        else []
-    )
-    is_native_tunix = (
-        'token_embedder' not in top_keys and 'decoder' not in top_keys
-    )
-    if is_native_tunix:
-      from tunix.sft import checkpoint_manager as tunix_ckpt_mgr
-
-      ckpt_root = os.path.dirname(step_parent)
-      step_num = int(step_name)
-      with jax.set_mesh(mesh):
-
-        def _bind_mesh(x: Any) -> Any:
-          if isinstance(x, jax.ShapeDtypeStruct) and isinstance(
-              getattr(x, 'sharding', None), jax.sharding.NamedSharding
-          ):
-            concrete_sharding = jax.sharding.NamedSharding(
-                mesh, x.sharding.spec
-            )
-            return jax.ShapeDtypeStruct(
-                x.shape, x.dtype, sharding=concrete_sharding
-            )
-          return x
-
-        nnx.update(abs_model, jax.tree.map(_bind_mesh, nnx.state(abs_model)))
-        mgr = tunix_ckpt_mgr.CheckpointManager(ckpt_root)
-        mgr.maybe_restore(abs_model, step=step_num)
-        mgr.close()
-      logging.info(
-          'Restored native Tunix model from step %d via CheckpointManager in'
-          ' %.2fs',
-          step_num,
-          time.monotonic() - t0,
-      )
-      return abs_model
+  if _try_restore_native_tunix(resolved_path, abs_model, mesh, t0):
+    return abs_model
 
   if mesh is not None:
     target, ckptr = _build_sharded_restore_target(
@@ -475,28 +482,31 @@ def create_model_from_checkpoint(
   else:
     raw_params = ocp.PyTreeCheckpointer().restore(resolved_path)
 
-  # ── Phase 3: Map upstream keys → downstream layout ──────────────────────
-  mapped = map_from_upstream_checkpoint(raw_params, model_config=model_config)
+  mapped = map_from_upstream_checkpoint(
+      raw_params,
+      model_config=model_config,
+      stack_kv=lambda k, v: jnp.stack([k, v], axis=0),
+  )
 
-  # ── Phase 4: Stack layers for scan (if enabled) ────────────────────────
-  if model_config.use_scan_layers:
+  if (
+      model_config.attention_pattern is not None
+      and model_config.use_scan_layers
+  ):
     mapped = _stack_layers_for_scan(
         mapped,
         model_config.num_layers,
         len(model_config.attention_pattern),
     )
 
-  # ── Phase 5: Prune and validate ────────────────────────────────────────
   pruned = _prune_to_model_keys(mapped, model_state)
   _validate_param_shapes(pruned, model_state)
 
-  # ── Phase 6: Fill missing keys and cast dtype with target shardings ────
   pure_state = nnx.to_pure_dict(model_state)
 
   if mesh is not None:
     with jax.set_mesh(mesh):
       shardings = nnx.to_pure_dict(nnx.get_named_sharding(model_state, mesh))
-      # Align pruned structure with pure_state by filling missing leaves
+      # Fill missing leaves (e.g. vision weights absent from text-only ckpt)
       flat_pure = flax.traverse_util.flatten_dict(pure_state)
       flat_pruned = flax.traverse_util.flatten_dict(pruned)
       for k, v in flat_pure.items():
@@ -516,11 +526,10 @@ def create_model_from_checkpoint(
 
   nnx.update(abs_model, typed)
 
-  # ── Phase 6: Materialize any remaining abstract values ─────────────────
   # partial_restore may leave ShapeDtypeStructs for unused keys (e.g. vision
   # weights in a text-only model). Replace them with zeros so subsequent
   # nnx.jit calls don't hit TraceContextErrors.
-  def _materialize(x: Any) -> Any:
+  def _materialize(x: jax.ShapeDtypeStruct | jax.Array) -> jax.Array:
     if isinstance(x, jax.ShapeDtypeStruct):
       return jnp.zeros(
           x.shape,
@@ -529,11 +538,11 @@ def create_model_from_checkpoint(
       )
     return x
 
-  state = nnx.state(abs_model)
+  state: nnx.State[
+      flax.typing.PathParts,
+      nnx.Variable[jax.Array] | nnx.Variable[jax.ShapeDtypeStruct],
+  ] = nnx.state(abs_model)
   nnx.update(abs_model, jax.tree_util.tree_map(_materialize, state))
-
-  if mesh is not None:
-    _log_sharding_summary(abs_model)
 
   logging.info(
       '[TIMING] create_model_from_checkpoint: %.1fs',
@@ -542,43 +551,11 @@ def create_model_from_checkpoint(
   return abs_model
 
 
-def _log_sharding_summary(model: gemma4_model.Gemma4) -> None:
-  """Log a sample of tensor shardings and flag large replicated tensors."""
-  flat_state = jax.tree_util.tree_leaves_with_path(nnx.state(model))
-  replicated_large: list[tuple[str, tuple[int, ...], int]] = []
-
-  for i, (path, leaf) in enumerate(flat_state):
-    if not hasattr(leaf, 'sharding') or not hasattr(leaf, 'shape'):
-      continue
-    spec = getattr(leaf.sharding, 'spec', None)
-    if i < 5:
-      key_str = '/'.join(str(k) for k in path)
-      logging.info(
-          '  [SHARDING] %s: shape=%s spec=%s', key_str, leaf.shape, spec
-      )
-    if (
-        spec is not None
-        and all(s is None for s in spec)
-        and hasattr(leaf, 'nbytes')
-        and leaf.nbytes > 1_000_000
-    ):
-      replicated_large.append(
-          ('/'.join(str(k) for k in path), leaf.shape, leaf.nbytes)
-      )
-
-  if replicated_large:
-    logging.warning(
-        '⚠️ %d large tensors fully replicated:', len(replicated_large)
-    )
-    for key_str, shape, nbytes in replicated_large[:10]:
-      logging.warning(
-          '    %s: shape=%s (%.1f MB)', key_str, shape, nbytes / 1e6
-      )
-
-
 def _validate_param_shapes(
-    mapped_params: Mapping[str, Any],
-    model_state: Any,
+    mapped_params: flax.typing.PyTree[LeafT],
+    model_state: nnx.State[
+        flax.typing.PathParts, nnx.Variable[jax.ShapeDtypeStruct]
+    ],
 ) -> None:
   """Validate that mapped checkpoint params match expected model shapes.
 
@@ -603,15 +580,9 @@ def _validate_param_shapes(
         f'{sorted(str(k) for k in missing_keys)}'
     )
 
-  # Should not fire after _prune_to_model_keys; kept as defensive guard.
-  extra_keys = mapped_keys - model_keys
-  if extra_keys:
-    logging.warning(
-        'Checkpoint has extra keys not in model (will be ignored): %s',
-        sorted(str(k) for k in extra_keys),
-    )
-
-  mismatched = []
+  mismatched: list[
+      tuple[flax.typing.PathParts, tuple[int, ...], tuple[int, ...]]
+  ] = []
   for key in mapped_keys & model_keys:
     mapped_val = flat_mapped[key]
     model_val = flat_model[key]
@@ -635,9 +606,11 @@ def _validate_param_shapes(
 
 
 def _prune_to_model_keys(
-    params: Mapping[str, Any],
-    model_state: Any,
-) -> dict[str, Any]:
+    params: flax.typing.PyTree[LeafT],
+    model_state: nnx.State[
+        flax.typing.PathParts, nnx.Variable[jax.ShapeDtypeStruct]
+    ],
+) -> flax.typing.PyTree[LeafT]:
   """Prune checkpoint params to only include keys present in the model.
 
   IT checkpoints contain multimodal params (audio_input_projection,
@@ -664,7 +637,9 @@ def _prune_to_model_keys(
         sorted(str(k) for k in pruned_keys),
     )
 
-  filtered = {k: v for k, v in flat_params.items() if k in flat_model}
+  filtered: flax.typing.FlatPyTree[LeafT] = {
+      k: v for k, v in flat_params.items() if k in flat_model
+  }
 
   # Guard: if we matched almost nothing, the checkpoint is likely in the wrong
   # format (e.g. a tunix CheckpointManager checkpoint passed to
@@ -682,27 +657,12 @@ def _prune_to_model_keys(
   return flax.traverse_util.unflatten_dict(filtered)
 
 
-def create_tokenizer(
-    path: str = GEMMA4_TOKENIZER,
-) -> spm.SentencePieceProcessor:
-  """Load the Gemma 4 SentencePiece tokenizer.
-
-  Args:
-    path: Path to the SentencePiece model file.
-
-  Returns:
-    A loaded SentencePieceProcessor instance.
-  """
-  spm_processor = spm.SentencePieceProcessor()
-  model_proto = epath.Path(path).read_bytes()
-  spm_processor.LoadFromSerializedProto(model_proto)
-  return spm_processor
-
-
 def map_from_upstream_checkpoint(
-    params: Mapping[str, Any],
+    params: flax.typing.PyTree[LeafT],
     model_config: gemma4_model.ModelConfig | None = None,
-) -> dict[str, Any]:
+    *,
+    stack_kv: Callable[[LeafT, LeafT], LeafT] | None = None,
+) -> flax.typing.PyTree[LeafT]:
   """Map from upstream Orbax NESTED checkpoint to Tunix NNX layout.
 
   Handles both key formats produced by Orbax checkpoints:
@@ -726,26 +686,26 @@ def map_from_upstream_checkpoint(
   Returns:
     A nested dict with keys matching the Tunix NNX Gemma4 model tree.
   """
-  new_params: dict[tuple[str | int, ...], Any] = {}
+  new_params: flax.typing.FlatPyTree[LeafT] = {}
 
   flat_params = flax.traverse_util.flatten_dict(params)
   raw_key_strings = set('/'.join(str(s) for s in k) for k in flat_params.keys())
 
-  # Pass through keys that are already in NNX layout (e.g. from Tunix CheckpointManager)
+  # Already in NNX layout (e.g. from Tunix CheckpointManager) — nothing to remap.
   if any(
       isinstance(k, tuple) and len(k) >= 2 and k[0] in ('layers', 'scan_groups')
       for k in flat_params.keys()
   ):
-    return dict(params)
+    return params
 
   for key_path, value in flat_params.items():
-    # Normalize semi-flat or nested key_path to a flat list of components.
-    parts = list(
-        itertools.chain.from_iterable(
-            (segment.split('/') if isinstance(segment, str) else [segment])
-            for segment in key_path
+
+    parts: list[str] = [
+        str(segment)
+        for segment in itertools.chain.from_iterable(
+            (s.split('/') if isinstance(s, str) else [str(s)]) for s in key_path
         )
-    )
+    ]
 
     if parts and parts[-1] == 'value':
       parts = parts[:-1]
@@ -768,56 +728,49 @@ def map_from_upstream_checkpoint(
     if not parts:
       logging.warning('Skipping empty key path: %r', key_path)
       continue
-    param_name = parts[-1]
-    module_path = parts[:-1]
 
-    # --- Embedder ---
+    *module_path, param_name = parts
+
     if module_path and module_path[0] == 'embedder':
-      if len(module_path) > 1 and module_path[1] == 'per_layer_embeddings':
-        # Rename upstream 'per_layer_embeddings' → Tunix field name.
+      embed_root, *embed_sub = module_path
+      if embed_sub and embed_sub[0] == 'per_layer_embeddings':
         new_params[('embedder', 'per_layer_input_embedding')] = value
       elif param_name in ('per_layer_embeddings', 'per_layer_input_embedding'):
         new_params[('embedder', 'per_layer_input_embedding')] = value
       elif param_name in ('embedding', 'input_embedding'):
         new_params[('embedder', 'input_embedding')] = value
-      elif len(module_path) > 1:
-        # Sub-modules of the embedder (e.g., mm_input_projection).
+      elif embed_sub:
         new_params[tuple(module_path + [param_name])] = value
       else:
-        # Bare embedder leaf (input_embedding).
         new_params[('embedder', param_name)] = value
       continue
 
-    # --- Final norm ---
     if module_path and module_path[0] == 'final_norm':
       new_params[('final_norm', param_name)] = value
       continue
 
-    # --- Layer weights ---
     if not module_path:
       logging.warning('Unexpected bare param after transformer: %r', key_path)
       continue
 
-    # Skip multimodal modules (e.g., audio_encoder).
-    if not module_path[0].startswith('layer_'):
-      logging.info(
-          'Skipping non-layer module: %s', '/'.join(str(p) for p in parts)
-      )
+    layer_segment, *layer_submodules = module_path
+
+    if not layer_segment.startswith('layer_'):
+      logging.info('Skipping non-layer module: %s', '/'.join(parts))
       continue
 
-    layer_idx = ('layers', int(module_path[0].removeprefix('layer_')))
+    layer_num = int(layer_segment.removeprefix('layer_'))
+    layer_key = ('layers', layer_num)
 
-    # Bare leaf on the layer itself (e.g., skip_scale / layer_scalar).
     if len(module_path) == 1:
       leaf_name = (
           'skip_scale'
           if param_name in ('layer_scalar', 'skip_scale')
           else param_name
       )
-      new_params[(*layer_idx, leaf_name)] = value
+      new_params[(*layer_key, leaf_name)] = value
       continue
 
-    # Normalize Linen/Tunix layer submodule names
     norm_submodules = {
         'pre_self_attention_norm': 'pre_attention_norm',
         'post_self_attention_norm': 'post_attention_norm',
@@ -836,6 +789,11 @@ def map_from_upstream_checkpoint(
         elif sub == 'out':
           module_path[a_idx + 1] = 'attn_vec_einsum'
         elif sub == 'key':
+          # Determine whether upstream 'key' maps to a separate k_einsum or a
+          # shared kv_einsum. If the same layer also has a 'value' sibling, the
+          # checkpoint stores K and V separately (→ k_einsum). Otherwise the
+          # single 'key' tensor holds both K and V (→ kv_einsum, as used by
+          # k_eq_v_global layers).
           orig_key_str = '/'.join(str(s) for s in key_path)
           prefix = orig_key_str.rsplit('self_attention', 1)[0]
           has_val = any(
@@ -870,27 +828,23 @@ def map_from_upstream_checkpoint(
         if sub in mlp_sub_map:
           module_path[m_idx + 1] = mlp_sub_map[sub]
 
-    # MLP gating_einsum -> split into gate_proj and up_proj (dense shared MLP or
-    # standard MLP)
+    # gating_einsum[0] → gate_proj, gating_einsum[1] → up_proj (transposed)
     if module_path[1:] in (['mlp', 'gating_einsum'], ['mlp2', 'gating_einsum']):
       if len(value.shape) == 4 or value.shape[0] != 2:
-        # MoE gating_einsum (e.g. 128 experts)
-        new_params[(*layer_idx, 'moe', 'gating_einsum')] = value
+        # 4D or shape[0]!=2 → MoE expert-level tensor, not gate/up split
+        new_params[(*layer_key, 'moe', 'gating_einsum')] = value
         continue
-      new_params[(*layer_idx, 'mlp', 'gate_proj', 'kernel')] = value[0].T
-      new_params[(*layer_idx, 'mlp', 'up_proj', 'kernel')] = value[1].T
+      new_params[(*layer_key, 'mlp', 'gate_proj', 'kernel')] = value[0].T
+      new_params[(*layer_key, 'mlp', 'up_proj', 'kernel')] = value[1].T
       continue
 
-    # MLP linear -> down_proj (no transpose) or MoE linear
     if module_path[1:] in (['mlp', 'linear'], ['mlp2', 'linear']):
       if len(value.shape) == 3 and module_path[1] == 'mlp':
-        # MoE linear (e.g. 128 experts)
-        new_params[(*layer_idx, 'moe', 'linear')] = value
+        new_params[(*layer_key, 'moe', 'linear')] = value
         continue
-      new_params[(*layer_idx, 'mlp', 'down_proj', 'kernel')] = value
+      new_params[(*layer_key, 'mlp', 'down_proj', 'kernel')] = value
       continue
 
-    # MoE router and expert scale params.
     if len(module_path) >= 2 and module_path[1] == 'mlp':
       sub = (
           param_name
@@ -898,10 +852,10 @@ def map_from_upstream_checkpoint(
           else module_path[-1]
       )
       if sub in ('router_logits', 'router_scale', 'per_expert_scale'):
-        new_params[(*layer_idx, 'moe', sub)] = value
+        new_params[(*layer_key, 'moe', sub)] = value
         continue
 
-    # Normalize query/key norm names to underscore-prefixed form.
+    # Tunix uses underscore-prefixed norm names (_query_norm, _key_norm).
     if module_path[-1] in (
         'query_norm',
         '_query_norm',
@@ -920,13 +874,12 @@ def map_from_upstream_checkpoint(
           )
           else module_path[:-1]
       )
-      new_params[(*layer_idx, *sub_path, target_norm, param_name)] = value
+      new_params[(*layer_key, *sub_path, target_norm, param_name)] = value
       continue
 
-    # Everything else: direct mapping.
-    new_params[(*layer_idx, *module_path[1:], param_name)] = value
+    new_params[(*layer_key, *module_path[1:], param_name)] = value
 
-  # Transpose 3D einsum kernels from Linen layout (embed_dim, num_heads, head_dim) -> (num_heads, embed_dim, head_dim)
+  # Linen layout is (embed, heads, head_dim); Tunix expects (heads, embed, head_dim).
   for k, v in list(new_params.items()):
     if len(k) >= 4 and k[2] == 'attn' and k[-1] == 'w':
       if (
@@ -937,7 +890,8 @@ def map_from_upstream_checkpoint(
       ):
         new_params[k] = v.transpose((1, 0, 2))
 
-  # Adapt kv_einsum <-> (k_einsum, v_einsum) based on model_config attention pattern
+  # Global attention with k_eq_v_global shares weights: kv_einsum → k + v.
+  # Local attention stacks separate k/v back: k + v → kv_einsum.
   if (
       model_config is not None
       and model_config.attention_pattern is not None
@@ -949,30 +903,20 @@ def map_from_upstream_checkpoint(
           model_config.attention_pattern[i % pattern_len]
           == gemma4_model.AttentionType.GLOBAL
       ) and model_config.k_eq_v_global
-      layer_key = ('layers', i, 'attn')
+      attn_key = ('layers', i, 'attn')
       if is_global:
-        kv_w_key = (*layer_key, 'kv_einsum', 'w')
+        kv_w_key = (*attn_key, 'kv_einsum', 'w')
         if kv_w_key in new_params:
-          kv_tr = new_params.pop(kv_w_key)
-          new_params[(*layer_key, 'k_einsum', 'w')] = kv_tr
-          new_params[(*layer_key, 'v_einsum', 'w')] = kv_tr
+          kv_val = new_params.pop(kv_w_key)
+          new_params[(*attn_key, 'k_einsum', 'w')] = kv_val
+          new_params[(*attn_key, 'v_einsum', 'w')] = kv_val
       else:
-        k_w_key = (*layer_key, 'k_einsum', 'w')
-        v_w_key = (*layer_key, 'v_einsum', 'w')
+        k_w_key = (*attn_key, 'k_einsum', 'w')
+        v_w_key = (*attn_key, 'v_einsum', 'w')
         if k_w_key in new_params and v_w_key in new_params:
-          k_tr = new_params.pop(k_w_key)
-          v_tr = new_params.pop(v_w_key)
-          if hasattr(k_tr, 'key'):
-            new_params[(*layer_key, 'kv_einsum', 'w')] = _ShapeTracer(
-                (k_tr.key, v_tr.key),
-                (2, *k_tr.shape),
-                k_tr._transposed,
-                k_tr._slice_idx,
-                k_tr.perm,
-            )
-          else:
-            new_params[(*layer_key, 'kv_einsum', 'w')] = jnp.stack(
-                [k_tr, v_tr], axis=0
-            )
+          k_val = new_params.pop(k_w_key)
+          v_val = new_params.pop(v_w_key)
+          if stack_kv is not None:
+            new_params[(*attn_key, 'kv_einsum', 'w')] = stack_kv(k_val, v_val)
 
   return flax.traverse_util.unflatten_dict(new_params)
