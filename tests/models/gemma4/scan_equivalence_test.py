@@ -125,36 +125,74 @@ def _copy_weights_loop_to_scan(
     loop_model: model_lib.Gemma4,
     scan_model: model_lib.Gemma4,
 ) -> None:
-  """Copy weights from for-loop model to scan model.
-
-  The loop model stores layers as layers[0], layers[1], ... layers[N-1].
-  The scan model stores layers as scan_groups.sub_layers[sub_idx] with a
-  leading vmap axis of size num_groups.
-
-  Mapping: layers[group * pattern_len + sub] ->
-  scan_groups.sub_layers[sub][group]
-  """
+  """Copy weights from for-loop model to scan model."""
   loop_gd, loop_state = nnx.split(loop_model)
   scan_gd, scan_state = nnx.split(scan_model)
 
-  num_groups = scan_model.num_scan_groups
+  num_layers = loop_model.config.num_layers
+  pattern_len = (
+      len(loop_model.config.attention_pattern)
+      if loop_model.config.attention_pattern is not None
+      else _PATTERN_LEN
+  )
+  num_unshared_layers = int(
+      num_layers - loop_model.config.frac_shared_layers * num_layers
+  )
+  num_shared_layers = num_layers - num_unshared_layers
+
+  num_unshared_groups = num_unshared_layers // pattern_len
+  num_shared_groups = num_shared_layers // pattern_len
 
   # Copy shared state (embedder, final_norm) from the loop model.
   scan_state['embedder'] = loop_state['embedder']
   scan_state['final_norm'] = loop_state['final_norm']
 
-  # Copy layer weights by stacking loop layers into scan groups.
-  for sub_idx in range(_PATTERN_LEN):
-    loop_indices = [g * _PATTERN_LEN + sub_idx for g in range(num_groups)]
+  unshared_key = (
+      'unshared_scan_groups'
+      if loop_model.config.frac_shared_layers > 0
+      else 'scan_groups'
+  )
+  for sub_idx in range(pattern_len):
+    loop_indices = [
+        g * pattern_len + sub_idx for g in range(num_unshared_groups)
+    ]
     loop_layer_states = [loop_state['layers'][li] for li in loop_indices]
 
     stacked = jax.tree.map(
         lambda *xs: jnp.stack(xs, axis=0),
         *loop_layer_states,
     )
-    scan_state['scan_groups']['sub_layers'][sub_idx] = stacked
+    scan_state[unshared_key]['sub_layers'][sub_idx] = stacked
+
+  if num_shared_groups > 0:
+    for sub_idx in range(pattern_len):
+      loop_indices = [
+          num_unshared_layers + g * pattern_len + sub_idx
+          for g in range(num_shared_groups)
+      ]
+      loop_layer_states = [loop_state['layers'][li] for li in loop_indices]
+
+      stacked = jax.tree.map(
+          lambda *xs: jnp.stack(xs, axis=0),
+          *loop_layer_states,
+      )
+      scan_state['shared_scan_groups']['sub_layers'][sub_idx] = stacked
 
   nnx.update(scan_model, scan_state)
+
+
+def _make_paired_models_from_config(
+    base_config: model_lib.ModelConfig,
+) -> tuple[model_lib.Gemma4, model_lib.Gemma4, model_lib.ModelConfig]:
+  """Create loop + scan model pair from a ModelConfig with identical weights."""
+  loop_config = dataclasses.replace(base_config, use_scan_layers=False)
+  scan_config = dataclasses.replace(base_config, use_scan_layers=True)
+
+  loop_model = model_lib.Gemma4(loop_config, rngs=nnx.Rngs(0))
+  scan_model = model_lib.Gemma4(scan_config, rngs=nnx.Rngs(1))
+  _copy_weights_loop_to_scan(loop_model, scan_model)
+
+  return loop_model, scan_model, loop_config
 
 
 def _make_paired_models(
@@ -173,18 +211,7 @@ def _make_paired_models(
       frac_shared_layers=frac_shared_layers,
       per_layer_input_dim=per_layer_input_dim,
   )
-  scan_config = _make_config(
-      num_layers=num_layers,
-      use_scan_layers=True,
-      frac_shared_layers=frac_shared_layers,
-      per_layer_input_dim=per_layer_input_dim,
-  )
-
-  loop_model = model_lib.Gemma4(loop_config, rngs=nnx.Rngs(0))
-  scan_model = model_lib.Gemma4(scan_config, rngs=nnx.Rngs(1))
-  _copy_weights_loop_to_scan(loop_model, scan_model)
-
-  return loop_model, scan_model, loop_config
+  return _make_paired_models_from_config(loop_config)
 
 
 # XLA while_loop introduces ~1e-5 forward diff vs unrolled on CPU.
@@ -463,15 +490,56 @@ class ScanForwardEquivalenceTest(absltest.TestCase):
         msg='Forward pass with per_layer_inputs diverged.',
     )
 
-  def test_forward_raises_for_shared_kv_layers(self):
-    """Training-mode forward (cache=None) must raise ValueError for frac_shared_layers > 0."""
-    _, scan_model, config = _make_paired_models(
+  def test_forward_equivalence_with_shared_kv_layers(self):
+    """Training-mode forward (cache=None) equivalence with frac_shared_layers > 0 using 2-scan."""
+    loop_model, scan_model, config = _make_paired_models(
         num_layers=12, frac_shared_layers=0.5
     )
     tokens, positions, attn_mask = _make_inputs(config)
 
-    with self.assertRaises(ValueError):
-      scan_model(tokens, positions=positions, attention_mask=attn_mask)
+    loop_logits, _ = loop_model(
+        tokens, positions=positions, attention_mask=attn_mask
+    )
+    scan_logits, _ = scan_model(
+        tokens, positions=positions, attention_mask=attn_mask
+    )
+
+    _assert_close(
+        self,
+        loop_logits,
+        scan_logits,
+        msg='Shared KV training forward pass diverged.',
+    )
+
+  def test_forward_equivalence_gemma4_e2b(self):
+    """Training-mode forward (cache=None) equivalence for Gemma 4 E2B architecture."""
+    config = model_lib.ModelConfig.gemma4_e2b()
+    config.num_embed = 128
+    config.embed_dim = 64
+    config.hidden_dim = 128
+    config.override_kv_shared_ffw_hidden = 256
+    config.num_heads = 4
+    config.head_dim = 16
+    config.num_kv_heads = 1
+
+    loop_model, scan_model, _ = _make_paired_models_from_config(config)
+    tokens, positions, attn_mask = _make_inputs(
+        config, batch_size=2, seq_len=16
+    )
+
+    loop_logits, _ = loop_model(
+        tokens, positions=positions, attention_mask=attn_mask
+    )
+    scan_logits, _ = scan_model(
+        tokens, positions=positions, attention_mask=attn_mask
+    )
+
+    _assert_close(
+        self,
+        loop_logits,
+        scan_logits,
+        msg='Gemma4 E2B training forward pass diverged.',
+    )
 
   def test_gradient_equivalence(self):
     """Gradients must be near-identical between for-loop and scan."""
@@ -815,6 +883,69 @@ class ScanGenerationEquivalenceTest(absltest.TestCase):
         loop_dec.logits,
         scan_dec.logits,
         msg='Shared-KV decode logits mismatch.',
+    )
+
+  def test_generation_equivalence_gemma4_e2b(self):
+    """Inference prefill + decode step equivalence for Gemma 4 E2B architecture."""
+    config = model_lib.ModelConfig.gemma4_e2b()
+    config.num_embed = 128
+    config.embed_dim = 64
+    config.hidden_dim = 128
+    config.override_kv_shared_ffw_hidden = 256
+    config.num_heads = 4
+    config.head_dim = 16
+    config.num_kv_heads = 1
+
+    loop_model, scan_model, _ = _make_paired_models_from_config(config)
+
+    loop_cache = loop_model.init_cache(
+        batch_size=2, max_seq_len=16, dtype=jnp.float32
+    )
+    scan_cache = scan_model.init_cache(
+        batch_size=2, max_seq_len=16, dtype=jnp.float32
+    )
+
+    tokens, positions, attn_mask = _make_inputs(config, batch_size=2, seq_len=8)
+
+    loop_out = loop_model(
+        tokens, positions=positions, cache=loop_cache, attention_mask=attn_mask
+    )
+    scan_out = scan_model(
+        tokens, positions=positions, cache=scan_cache, attention_mask=attn_mask
+    )
+
+    _assert_close(
+        self,
+        loop_out.logits,
+        scan_out.logits,
+        msg='Gemma4 E2B prefill logits diverged.',
+    )
+
+    # Single decode step
+    tok_decode = jax.random.randint(
+        jax.random.PRNGKey(1), (2, 1), 0, config.num_embed
+    )
+    pos_decode = jnp.full((2, 1), 8)
+    mask_decode = jnp.ones((2, 1, 16), dtype=jnp.bool_)
+
+    loop_dec = loop_model(
+        tok_decode,
+        positions=pos_decode,
+        cache=loop_out.cache,
+        attention_mask=mask_decode,
+    )
+    scan_dec = scan_model(
+        tok_decode,
+        positions=pos_decode,
+        cache=scan_out.cache,
+        attention_mask=mask_decode,
+    )
+
+    _assert_close(
+        self,
+        loop_dec.logits,
+        scan_dec.logits,
+        msg='Gemma4 E2B single decode step logits diverged.',
     )
 
   def test_generation_with_per_layer_inputs(self):
@@ -1184,7 +1315,9 @@ class CacheConversionTest(absltest.TestCase):
   def test_gemma_output_pytree_node(self):
     """Test that GemmaOutput is a valid JAX PyTree node (flatten/unflatten/map)."""
     logits = jnp.ones((2, 3))
-    cache = {'layer_0': {'k': jnp.zeros((2, 4, 16)), 'v': jnp.zeros((2, 4, 16))}}
+    cache = {
+        'layer_0': {'k': jnp.zeros((2, 4, 16)), 'v': jnp.zeros((2, 4, 16))}
+    }
     out = model_lib.GemmaOutput(logits=logits, cache=cache)
 
     leaves, treedef = jax.tree_util.tree_flatten(out)

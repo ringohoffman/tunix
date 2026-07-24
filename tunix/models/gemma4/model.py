@@ -22,13 +22,15 @@ import enum
 import functools
 import inspect
 import itertools
-from typing import Any, Literal, Self, Tuple, TypedDict, overload
+from typing import Literal, Self, TypeVar, TypedDict, overload
 
 import flax
 from flax import nnx
+import flax.typing
 import jax
 from jax import checkpoint_policies as cp
 from jax import numpy as jnp
+from jax import shard_map
 from jax.ad_checkpoint import checkpoint_name
 from jax.experimental.pallas.ops.tpu.splash_attention import (
     splash_attention_kernel as splash,
@@ -36,7 +38,6 @@ from jax.experimental.pallas.ops.tpu.splash_attention import (
 from jax.experimental.pallas.ops.tpu.splash_attention import (
     splash_attention_mask as mask_lib,
 )
-from jax.experimental.shard_map import shard_map
 import jax.sharding as shd
 from jax.sharding import PartitionSpec as P
 import jaxtyping
@@ -46,7 +47,7 @@ from tunix.models.gemma4 import moe
 from tunix.utils import compat
 from tunix.utils import env_utils
 from tunix.utils import sharding_utils
-from typing_extensions import NotRequired, Unpack
+from typing_extensions import NotRequired
 
 # JAX checkpoint policy type — matches nnx.remat's policy parameter.
 CheckpointPolicy = Callable[..., bool]
@@ -58,19 +59,53 @@ _REMAT_SUPPORTS_GRAPH_UPDATES = (
 )
 
 
+_F = TypeVar("_F", bound=Callable[..., object])
+
+
 def _compat_remat(
-    fn: Callable[..., Any],
+    fn: _F,
     *,
     graph_updates: bool = True,
     policy: CheckpointPolicy | None = None,
-) -> Callable[..., Any]:
+) -> _F:
   """nnx.remat wrapper that drops graph_updates if Flax doesn't support it."""
   if _REMAT_SUPPORTS_GRAPH_UPDATES:
     return nnx.remat(fn, graph_updates=graph_updates, policy=policy)
   return nnx.remat(fn, policy=policy)
 
 
-LayerCache = dict[str, jaxtyping.Array]
+class LayerKV(TypedDict):
+  """Key and value projection tensors for a single layer."""
+
+  k: jaxtyping.Array
+  """Key projection tensor of shape (batch_size, seq_len, num_kv_heads, head_dim)."""
+  v: jaxtyping.Array
+  """Value projection tensor of shape (batch_size, seq_len, num_kv_heads, head_dim)."""
+
+
+class LayerCache(TypedDict):
+  """Stateful pre-allocated KV cache buffer with position index for a single layer."""
+
+  k: jaxtyping.Array
+  """Pre-allocated key cache array of shape (batch_size, max_seq_len, num_kv_heads, head_dim)."""
+  v: jaxtyping.Array
+  """Pre-allocated value cache array of shape (batch_size, max_seq_len, num_kv_heads, head_dim)."""
+  end_index: jaxtyping.Array
+  """Current sequence length or insertion index array of shape (batch_size,)."""
+
+
+class OriginKV(TypedDict):
+  """Origin key and value projections for global and local layers in KV
+
+  sharing.
+  """
+
+  global_origin: LayerKV
+  """LayerKV projections from the global origin layer (shape (batch_size, seq_len, num_global_kv_heads, global_key_size))."""
+  local_origin: LayerKV
+  """LayerKV projections from the local origin layer (shape (batch_size, seq_len, num_kv_heads, head_dim))."""
+
+
 Cache = dict[str, LayerCache]
 StackedCache = tuple[LayerCache | None, ...]
 TransientKVs = dict[str, tuple[jaxtyping.Array, jaxtyping.Array]]
@@ -80,13 +115,21 @@ class GemmaInput(TypedDict):
   """Input parameters for the Gemma4 model."""
 
   tokens: jaxtyping.Array
+  """Input token IDs array of shape (batch_size, seq_len)."""
   positions: NotRequired[jaxtyping.Array | None]
+  """Optional position indices array of shape (batch_size, seq_len)."""
   cache: NotRequired[Cache | StackedCache | None]
+  """Optional existing KV cache dictionary or stacked cache tuple."""
   attention_mask: NotRequired[jaxtyping.Array | None]
+  """Optional attention mask array."""
   decode_only_last_token: NotRequired[bool]
+  """If True, only compute logits for the final token position."""
   segment_ids: NotRequired[jaxtyping.Array | None]
+  """Optional document segment IDs for packed sequence attention masking."""
   target_indices: NotRequired[jaxtyping.Array | None]
+  """Optional target token indices for sparse logit computation."""
   return_hidden_states: NotRequired[bool]
+  """If True, return post-norm hidden states in GemmaOutput."""
 
 
 @jax.tree_util.register_pytree_node_class
@@ -129,7 +172,7 @@ class GemmaOutput:
 
   def __iter__(
       self,
-  ) -> Iterator[Unpack[tuple[jax.Array, Cache | StackedCache | None]]]:
+  ) -> Iterator[jax.Array | Cache | StackedCache | None]:
     """Yield (logits, cache) for backward-compatible tuple unpacking."""
     yield self.logits
     yield self.cache
@@ -193,8 +236,8 @@ class RematStrategy:
   boundary: Literal["none", "block", "decoder"] = "block"
 
   # ── Policy: WHAT to save vs offload vs recompute ─────────────
-  save_on_device: list[str] = dataclasses.field(default_factory=list)
-  offload_to_host: list[str] = dataclasses.field(default_factory=list)
+  save_on_device: list[str] = dataclasses.field(default_factory=list[str])
+  offload_to_host: list[str] = dataclasses.field(default_factory=list[str])
   offload_dots: bool = False
 
   # ── Advanced ─────────────────────────────────────────────────
@@ -271,29 +314,29 @@ def _get_remat_strategy(config: object) -> RematStrategy:
 class ShardingConfig:
   """Sharding configuration for gemma transformer."""
 
-  emb_vd: Tuple[str | None, ...]
-  q_weight_ndh: Tuple[str | None, ...]
-  kv_weight_cndh: Tuple[str | None, ...]
-  qkv_weight_cndh: Tuple[str | None, ...]
-  o_weight_nhd: Tuple[str | None, ...]
-  ffw_weight_df: Tuple[str | None, ...]
-  ffw_weight_fd: Tuple[str | None, ...]
-  rms_norm_weight: Tuple[str | None, ...]
-  act_btd: Tuple[str | None, ...]
-  act_btf: Tuple[str | None, ...]
-  act_btnh: Tuple[str | None, ...]
-  vision_proj: Tuple[str | None, ...]
-  vision_soft_emb_norm_weight: Tuple[str | None, ...]
+  emb_vd: tuple[str | None, ...]
+  q_weight_ndh: tuple[str | None, ...]
+  kv_weight_cndh: tuple[str | None, ...]
+  qkv_weight_cndh: tuple[str | None, ...]
+  o_weight_nhd: tuple[str | None, ...]
+  ffw_weight_df: tuple[str | None, ...]
+  ffw_weight_fd: tuple[str | None, ...]
+  rms_norm_weight: tuple[str | None, ...]
+  act_btd: tuple[str | None, ...]
+  act_btf: tuple[str | None, ...]
+  act_btnh: tuple[str | None, ...]
+  vision_proj: tuple[str | None, ...]
+  vision_soft_emb_norm_weight: tuple[str | None, ...]
   # MoE sharding
-  exp_weight_edf: Tuple[str | None, ...]
-  exp_weight_efd: Tuple[str | None, ...]
+  exp_weight_edf: tuple[str | None, ...]
+  exp_weight_efd: tuple[str | None, ...]
   # PLE sharding
-  per_layer_model_projection: Tuple[str | None, ...]
-  per_layer_input_gate: Tuple[str | None, ...]
-  per_layer_projection: Tuple[str | None, ...]
-  per_layer_input_embedding: Tuple[str | None, ...]
+  per_layer_model_projection: tuple[str | None, ...]
+  per_layer_input_gate: tuple[str | None, ...]
+  per_layer_projection: tuple[str | None, ...]
+  per_layer_input_embedding: tuple[str | None, ...]
   # Input data sharding (token IDs, masks, etc. of shape [B, T])
-  input_bt: Tuple[str | None, ...] = ("fsdp", None)
+  input_bt: tuple[str | None, ...] = ("fsdp", None)
 
   @property
   def input_pspec(self) -> jax.sharding.PartitionSpec:
@@ -611,7 +654,7 @@ class Embedder(nnx.Module):
     return x
 
   def encode_per_layer_input(
-      self, x: jaxtyping.ArrayLike, t: jaxtyping.ArrayLike
+      self, x: jaxtyping.Array, t: jaxtyping.Array
   ) -> jaxtyping.Array:
     t = jnp.where(
         jnp.logical_and(t >= 0, t < self.vocab_size), t, jnp.zeros_like(t)
@@ -647,6 +690,7 @@ class Einsum(nnx.Module):
     self.w_scale = w_scale
 
     self.shape = shape
+    self.expected_in_ndim = len(einsum_str.split(",")[0].strip())
     self.w = nnx.Param(
         nnx.initializers.normal(dtype=param_dtype)(rngs.params(), shape),
         sharding=sharding,
@@ -658,6 +702,8 @@ class Einsum(nnx.Module):
       w = w * self.w_scale
     x = jnp.astype(x, self.dtype)
     w = jnp.astype(w, self.dtype)
+    if (diff := self.expected_in_ndim - x.ndim) > 0:
+      x = jnp.expand_dims(x, axis=tuple(range(1, 1 + diff)))
     return jnp.einsum(self.einsum_str, x, w)
 
 
@@ -722,7 +768,7 @@ class RMSNorm(nnx.Module):
       param_dtype: jnp.dtype,
   ) -> None:
     self.scale = nnx.Param(
-        nnx.initializers.ones_init()(rngs.params(), dim).astype(param_dtype),
+        nnx.initializers.ones_init()(rngs.params(), (dim,)).astype(param_dtype),
         sharding=sharding.rms_norm_weight,
     )
     self.dtype = dtype
@@ -901,10 +947,11 @@ class Attention(nnx.Module):
           param_dtype=config.param_dtype,
       )
     else:
-      if self.num_kv_heads == 1:
-        kv_sharding = (None, None, "fsdp", None)
-      else:
-        kv_sharding = config.shd_config.kv_weight_cndh
+      kv_sharding = (
+          (None, None, "fsdp", None)
+          if self.num_kv_heads == 1
+          else config.shd_config.kv_weight_cndh
+      )
 
       self.kv_einsum = Einsum(
           einsum_str="BSD,CKDH->CBSKH",
@@ -938,14 +985,14 @@ class Attention(nnx.Module):
       self,
       x: jaxtyping.Array,
       segment_pos: jaxtyping.Array,
-      cache: LayerCache | None,
-      attn_mask: jaxtyping.Array,
-      kv_shared_cache: LayerCache | None = None,
-      kv_override: LayerCache | None = None,
-      use_kv_override: jaxtyping.Array | None = None,
+      cache: LayerKV | LayerCache | None,
+      attn_mask: jaxtyping.Array | None,
+      kv_shared_cache: LayerKV | LayerCache | None = None,
+      kv_override: LayerKV | LayerCache | None = None,
+      use_kv_override: jaxtyping.Array | bool | None = None,
       segment_ids: jaxtyping.Array | None = None,
   ) -> tuple[
-      LayerCache | None,
+      LayerKV | LayerCache | None,
       jaxtyping.Array,
       tuple[jaxtyping.Array, jaxtyping.Array],
   ]:
@@ -993,7 +1040,9 @@ class Attention(nnx.Module):
           rope_proportion=self.rope_proportion,
       )
 
+    new_cache: LayerKV | LayerCache
     if cache is not None:
+      assert "end_index" in cache
       assert kv_shared_cache is None
       # Update cache with new kv projections
       cache_len = cache["v"].shape[1]
@@ -1058,12 +1107,18 @@ class Attention(nnx.Module):
         key_proj = jnp.where(use_kv_override, kv_override["k"], key_proj)
         value_proj = jnp.where(use_kv_override, kv_override["v"], value_proj)
       if cache is not None:
+        assert "end_index" in new_cache
+        kv_override_end_index = (
+            kv_override["end_index"]
+            if kv_override is not None and "end_index" in kv_override
+            else new_cache["end_index"]
+        )
         new_cache = {
             "k": jnp.where(use_kv_override, kv_override["k"], new_cache["k"]),
             "v": jnp.where(use_kv_override, kv_override["v"], new_cache["v"]),
             "end_index": jnp.where(
                 use_kv_override,
-                kv_override["end_index"],
+                kv_override_end_index,
                 new_cache["end_index"],
             ),
         }
@@ -1156,25 +1211,30 @@ class Attention(nnx.Module):
                 unsharded_seg_spec,
             ),
             out_specs=shd_spec,
-            check_rep=False,
+            check_vma=False,
         )
         def sharded_splash_attn_with_seg(
-            kernel: Any,
+            kernel: splash.SplashAttentionKernel,
             q_block: jaxtyping.Array,
             k_block: jaxtyping.Array,
             v_block: jaxtyping.Array,
-            q_seg_block: jaxtyping.Array | None,
-            kv_seg_block: jaxtyping.Array | None,
+            q_seg_block: jaxtyping.Array,
+            kv_seg_block: jaxtyping.Array,
         ) -> jaxtyping.Array:
           seg_ids = splash.SegmentIds(q=q_seg_block, kv=kv_seg_block)
-          return jax.vmap(kernel)(
+          result = jax.vmap(kernel)(
               q_block, k_block, v_block, segment_ids=seg_ids
           )
+          # vmap(kernel) returns SplashCustomReturnType (Array | tuple);
+          # without residuals it's always a plain Array.
+          assert isinstance(result, jax.Array)
+          return result
 
-        if hasattr(segment_ids, "q") and hasattr(segment_ids, "kv"):
+        if isinstance(segment_ids, splash.SegmentIds):
           q_seg = segment_ids.q
           kv_seg = segment_ids.kv
         else:
+          assert segment_ids is not None
           q_seg = segment_ids
           kv_seg = segment_ids
 
@@ -1198,15 +1258,17 @@ class Attention(nnx.Module):
                 unsharded_seq_kv,
             ),
             out_specs=shd_spec,
-            check_rep=False,
+            check_vma=False,
         )
         def sharded_splash_attn(
-            kernel: Any,
+            kernel: splash.SplashAttentionKernel,
             q_block: jaxtyping.Array,
             k_block: jaxtyping.Array,
             v_block: jaxtyping.Array,
         ) -> jaxtyping.Array:
-          return jax.vmap(kernel)(q_block, k_block, v_block)
+          result = jax.vmap(kernel)(q_block, k_block, v_block)
+          assert isinstance(result, jax.Array)
+          return result
 
         qkv = sharded_splash_attn(
             splash_attn_kernel,
@@ -1232,7 +1294,8 @@ class Attention(nnx.Module):
       else:
         logits = jnp.einsum("BTNH,BSNH->BTNS", query_proj, key_proj)
 
-      if seq_len > 1:
+      assert attn_mask is not None, "attn_mask required for non-flash path"
+      if seq_len > 1 and attn_mask is not None:
         # Only compute attention scores for the actual sequence length.
         attn_mask = attn_mask[..., :seq_len]
 
@@ -1249,6 +1312,7 @@ class Attention(nnx.Module):
                 " in decoding."
             )
           cache_len = key_proj.shape[1]
+          assert "end_index" in active_cache
           end_idx = active_cache["end_index"]
           if cache is None and kv_shared_cache is not None:
             # In case of shared KV cache, the origin layer already updated the
@@ -1312,14 +1376,14 @@ class Attention(nnx.Module):
       self,
       x: jaxtyping.Array,
       segment_pos: jaxtyping.Array,
-      cache: LayerCache | None,
-      attn_mask: jaxtyping.Array,
-      kv_shared_cache: LayerCache | None = None,
-      kv_override: LayerCache | None = None,
-      use_kv_override: jaxtyping.Array | None = None,
+      cache: LayerKV | LayerCache | None,
+      attn_mask: jaxtyping.Array | None,
+      kv_shared_cache: LayerKV | LayerCache | None = None,
+      kv_override: LayerKV | LayerCache | None = None,
+      use_kv_override: jaxtyping.Array | bool | None = None,
       segment_ids: jaxtyping.Array | None = None,
   ) -> tuple[
-      LayerCache | None,
+      LayerKV | LayerCache | None,
       jaxtyping.Array,
       tuple[jaxtyping.Array, jaxtyping.Array],
   ]:
@@ -1554,15 +1618,15 @@ class DecoderLayer(nnx.Module):
       self,
       x: jaxtyping.Array,
       segment_pos: jaxtyping.Array,
-      cache: LayerCache | None,
-      attn_mask: jaxtyping.Array,
+      cache: LayerKV | LayerCache | None,
+      attn_mask: jaxtyping.Array | None,
       per_layer_input: jaxtyping.Array | None = None,
-      kv_shared_cache: LayerCache | None = None,
-      kv_override: LayerCache | None = None,
-      use_kv_override: jaxtyping.Array | None = None,
+      kv_shared_cache: LayerKV | LayerCache | None = None,
+      kv_override: LayerKV | LayerCache | None = None,
+      use_kv_override: jaxtyping.Array | bool | None = None,
       segment_ids: jaxtyping.Array | None = None,
   ) -> tuple[
-      LayerCache | None,
+      LayerKV | LayerCache | None,
       jaxtyping.Array,
       tuple[jaxtyping.Array, jaxtyping.Array],
   ]:
@@ -1608,15 +1672,15 @@ class DecoderLayer(nnx.Module):
       self,
       x: jaxtyping.Array,
       segment_pos: jaxtyping.Array,
-      cache: LayerCache | None,
-      attn_mask: jaxtyping.Array,
+      cache: LayerKV | LayerCache | None,
+      attn_mask: jaxtyping.Array | None,
       per_layer_input: jaxtyping.Array | None = None,
-      kv_shared_cache: LayerCache | None = None,
-      kv_override: LayerCache | None = None,
-      use_kv_override: jaxtyping.Array | None = None,
+      kv_shared_cache: LayerKV | LayerCache | None = None,
+      kv_override: LayerKV | LayerCache | None = None,
+      use_kv_override: jaxtyping.Array | bool | None = None,
       segment_ids: jaxtyping.Array | None = None,
   ) -> tuple[
-      LayerCache | None,
+      LayerKV | LayerCache | None,
       jaxtyping.Array,
       tuple[jaxtyping.Array, jaxtyping.Array],
   ]:
@@ -1671,17 +1735,19 @@ class ScanLayerGroup(nnx.Module):
       config: ModelConfig,
       pattern: tuple[AttentionType, ...],
       *,
+      hidden_dim: int | None = None,
       rngs: nnx.Rngs,
   ) -> None:
     self.config = config
     self.pattern = pattern
-    self.sub_layers = compat.ModuleList()
+    self.sub_layers = compat.ModuleList[DecoderLayer]()
+    hidden_dim = hidden_dim if hidden_dim is not None else config.hidden_dim
     for attn_type in pattern:
       self.sub_layers.append(
           DecoderLayer(
               config=config,
               attn_type=attn_type,
-              hidden_dim=config.hidden_dim,
+              hidden_dim=hidden_dim,
               rngs=rngs,
           )
       )
@@ -1690,7 +1756,7 @@ class ScanLayerGroup(nnx.Module):
       self,
       x: jaxtyping.Array,
       positions: jaxtyping.Array,
-      attn_mask: jaxtyping.Array,
+      attn_mask: jaxtyping.Array | None,
       cache: (
           tuple[LayerCache | None, ...]
           | list[LayerCache | None]
@@ -1702,6 +1768,9 @@ class ScanLayerGroup(nnx.Module):
       origin_sub_indices: list[int] | None = None,
       per_layer_inputs: jaxtyping.Array | None = None,
       new_cache: dict[int, LayerCache] | None = None,
+      new_group_kvs: dict[int, LayerKV] | None = None,
+      origin_kv_global: LayerKV | LayerCache | None = None,
+      origin_kv_local: LayerKV | LayerCache | None = None,
       segment_ids: jaxtyping.Array | None = None,
   ) -> jaxtyping.Array:
     """Run one pattern-group of layers with full scan compatibility."""
@@ -1718,6 +1787,13 @@ class ScanLayerGroup(nnx.Module):
         origin_s = origin_sub_indices[sub_idx]
         kv_override = origin_kv[origin_s]
         use_kv_override = is_shared[sub_idx]
+      elif origin_kv_global is not None and origin_kv_local is not None:
+        attn_type = self.pattern[sub_idx]
+        if attn_type == AttentionType.GLOBAL:
+          kv_override = origin_kv_global
+        else:
+          kv_override = origin_kv_local
+        use_kv_override = jnp.array(True)
 
       pli = (
           per_layer_inputs[:, :, sub_idx, :]
@@ -1736,7 +1812,10 @@ class ScanLayerGroup(nnx.Module):
           segment_ids=segment_ids,
       )
       if new_cache is not None and layer_cache is not None:
+        assert "end_index" in layer_cache
         new_cache[sub_idx] = layer_cache
+      if new_group_kvs is not None and kv is not None:
+        new_group_kvs[sub_idx] = {"k": kv[0], "v": kv[1]}
 
     return x
 
@@ -1791,7 +1870,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
       rngs: nnx.Rngs,
   ) -> None:
     """Original for-loop layer initialization."""
-    self.layers = compat.ModuleList()
+    self.layers = compat.ModuleList[DecoderLayer]()
     for i in range(config.num_layers):
       attn_type = attention_types[i]
       h_dim = config.hidden_dim
@@ -1836,33 +1915,69 @@ class Gemma4(BackendMappingMixin, nnx.Module):
     tells JAX that the scan axis is replicated / unsharded.
     """
     pattern_len = len(pattern)
-    if config.num_layers % pattern_len != 0:
+    num_unshared_layers = int(
+        config.num_layers - config.frac_shared_layers * config.num_layers
+    )
+    num_shared_layers = config.num_layers - num_unshared_layers
+
+    if (
+        num_unshared_layers % pattern_len != 0
+        or num_shared_layers % pattern_len != 0
+    ):
       raise ValueError(
-          f"use_scan_layers requires num_layers ({config.num_layers}) to be "
-          f"divisible by the attention pattern length ({pattern_len})."
+          "use_scan_layers requires num_unshared_layers"
+          f" ({num_unshared_layers}) and num_shared_layers"
+          f" ({num_shared_layers}) to be divisible by pattern length"
+          f" ({pattern_len})."
       )
+
+    self.num_unshared_groups = num_unshared_layers // pattern_len
+    self.num_shared_groups = num_shared_layers // pattern_len
     self.num_scan_groups = config.num_layers // pattern_len
     self.scan_pattern = pattern
 
-    # Phase 1: initialize with original config so per-instance sharding
-    # constraints match the per-instance value rank.
-    @nnx.split_rngs(splits=self.num_scan_groups)
-    @nnx.vmap(axis_size=self.num_scan_groups)
-    def create_group(rngs: nnx.Rngs) -> ScanLayerGroup:
-      return ScanLayerGroup(config, pattern, rngs=rngs)
+    # Unshared scan groups
+    @nnx.split_rngs(splits=self.num_unshared_groups)
+    @nnx.vmap(axis_size=self.num_unshared_groups)
+    def create_unshared_group(rngs: nnx.Rngs) -> ScanLayerGroup:
+      return ScanLayerGroup(
+          config, pattern, hidden_dim=config.hidden_dim, rngs=rngs
+      )
 
-    self.scan_groups = create_group(rngs)
+    self.unshared_scan_groups = create_unshared_group(rngs)
+    if self.num_shared_groups == 0:
+      self.scan_groups = self.unshared_scan_groups
 
-    # Phase 2: patch out_sharding metadata on stacked params.  After vmap,
-    # every weight has a new leading axis (size = num_scan_groups) but its
-    # stored out_sharding is still the per-instance spec.  Prepend None so
-    # the optimizer's with_sharding_constraint sees the correct rank.
-    for _, var in nnx.iter_graph(self.scan_groups):
+    for _, var in nnx.iter_graph(self.unshared_scan_groups):
       if not isinstance(var, nnx.Param):
         continue
       spec = var.get_metadata("out_sharding", None)
       if isinstance(spec, tuple):
         var.set_metadata("out_sharding", (None,) + spec)
+
+    # Shared scan groups (if frac_shared_layers > 0)
+    if self.num_shared_groups > 0:
+      shared_hdim = (
+          config.override_kv_shared_ffw_hidden
+          if config.override_kv_shared_ffw_hidden is not None
+          else config.hidden_dim
+      )
+
+      @nnx.split_rngs(splits=self.num_shared_groups)
+      @nnx.vmap(axis_size=self.num_shared_groups)
+      def create_shared_group(rngs: nnx.Rngs) -> ScanLayerGroup:
+        return ScanLayerGroup(
+            config, pattern, hidden_dim=shared_hdim, rngs=rngs
+        )
+
+      self.shared_scan_groups = create_shared_group(rngs)
+
+      for _, var in nnx.iter_graph(self.shared_scan_groups):
+        if not isinstance(var, nnx.Param):
+          continue
+        spec = var.get_metadata("out_sharding", None)
+        if isinstance(spec, tuple):
+          var.set_metadata("out_sharding", (None,) + spec)
 
   def __call__(
       self,
@@ -1961,7 +2076,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
       x: jaxtyping.Array,
       positions: jaxtyping.Array,
       cache: Cache | StackedCache | None,
-      attention_mask: jaxtyping.Array,
+      attention_mask: jaxtyping.Array | None,
       per_layer_inputs: jaxtyping.Array | None,
       new_cache: Cache,
       transient_kvs: TransientKVs,
@@ -1993,6 +2108,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
 
       shared_idx = self.kv_cache_sharing_patterns[i]
       is_shared = shared_idx != i
+      kv_shared_cache: LayerKV | LayerCache | None
       if is_shared:
         assert shared_idx in self.shared_layer_origins
         layer_cache = None
@@ -2020,7 +2136,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
       if is_prefill and i in self.shared_layer_origins:
         transient_kvs[layer_name] = layers_kvs
       if not is_shared:
-        if layer_cache is not None:
+        if layer_cache is not None and "end_index" in layer_cache:
           new_cache[layer_name] = layer_cache
     return x, new_cache
 
@@ -2029,7 +2145,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
       x: jaxtyping.Array,
       positions: jaxtyping.Array,
       cache: Cache | StackedCache | None,
-      attention_mask: jaxtyping.Array,
+      attention_mask: jaxtyping.Array | None,
       per_layer_inputs: jaxtyping.Array | None,
       new_cache: Cache,
       transient_kvs: TransientKVs,
@@ -2110,13 +2226,13 @@ class Gemma4(BackendMappingMixin, nnx.Module):
                     jnp.zeros(end_idx_shape, dtype=end_idx_dtype)
                 )
 
-            shd_btnh = (None, *self.config.shd_config.act_btnh)
-            shd_b = (None, *self.config.shd_config.act_btnh[:1])
+            scan_shd_btnh = (None, *self.config.shd_config.act_btnh)
+            scan_shd_b = (None, *self.config.shd_config.act_btnh[:1])
             scan_cache_list.append({
-                "k": sharding_utils.shard(jnp.stack(ks, axis=0), shd_btnh),
-                "v": sharding_utils.shard(jnp.stack(vs, axis=0), shd_btnh),
+                "k": sharding_utils.shard(jnp.stack(ks, axis=0), scan_shd_btnh),
+                "v": sharding_utils.shard(jnp.stack(vs, axis=0), scan_shd_btnh),
                 "end_index": sharding_utils.shard(
-                    jnp.stack(end_indices, axis=0), shd_b
+                    jnp.stack(end_indices, axis=0), scan_shd_b
                 ),
             })
           else:
@@ -2148,6 +2264,8 @@ class Gemma4(BackendMappingMixin, nnx.Module):
             is_origin_per_group[origin_g, origin_idx % pattern_len] = True
             is_origin_sub[origin_idx % pattern_len] = True
 
+      is_shared_jax: jaxtyping.Array | None = None
+      is_origin_jax: jaxtyping.Array | None = None
       if has_sharing:
         is_shared_jax = jnp.array(is_shared_per_group)
         is_origin_jax = jnp.array(is_origin_per_group)
@@ -2214,7 +2332,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
           group: ScanLayerGroup,
           group_cache: tuple[LayerCache | None, ...],
           positions: jaxtyping.Array,
-          attn_mask: jaxtyping.Array,
+          attn_mask: jaxtyping.Array | None,
           sharing_meta: tuple[jaxtyping.Array, jaxtyping.Array] | None,
           group_per_layer_inputs: jaxtyping.Array | None,
           segment_ids: jaxtyping.Array | None,
@@ -2225,9 +2343,11 @@ class Gemma4(BackendMappingMixin, nnx.Module):
         is_origin_slice: jaxtyping.Array | None = None
         if has_sharing:
           assert sharing_meta is not None
+          assert isinstance(carry, tuple)
           x, origin_kv = carry
           is_shared_slice, is_origin_slice = sharing_meta
         else:
+          assert isinstance(carry, jaxtyping.Array)
           x = carry
           origin_kv = None
           is_shared_slice = None
@@ -2253,14 +2373,23 @@ class Gemma4(BackendMappingMixin, nnx.Module):
           assert origin_kv is not None
           # Update origin_kv carry: for sub-positions that are origins in
           # this group, write their updated caches into the carry.
-          updated_origin_kv = tuple(
+          updated_origin_kv: tuple[LayerCache, ...] = tuple(
               {
-                  key: jnp.where(
+                  "k": jnp.where(
                       is_origin_slice[s],
-                      new_group_cache[s][key],
-                      origin_kv[s][key],
-                  )
-                  for key in ("k", "v", "end_index")
+                      new_group_cache[s]["k"],
+                      origin_kv[s]["k"],
+                  ),
+                  "v": jnp.where(
+                      is_origin_slice[s],
+                      new_group_cache[s]["v"],
+                      origin_kv[s]["v"],
+                  ),
+                  "end_index": jnp.where(
+                      is_origin_slice[s],
+                      new_group_cache[s]["end_index"],
+                      origin_kv[s]["end_index"],
+                  ),
               }
               for s in range(pattern_len)
           )
@@ -2268,21 +2397,128 @@ class Gemma4(BackendMappingMixin, nnx.Module):
         else:
           return x, out_cache
 
-      result = scan_cache_body(
-          carry_init,
-          self.scan_groups,
-          scan_cache,
-          positions,
-          attention_mask,
-          sharing_metadata,
-          scan_per_layer_inputs,
-          segment_ids,
-      )
-
-      if has_sharing:
-        (x, _), updated_scan_cache = result
+      if self.num_shared_groups == 0:
+        result = scan_cache_body(
+            carry_init,
+            self.unshared_scan_groups,
+            scan_cache,
+            positions,
+            attention_mask,
+            sharing_metadata,
+            scan_per_layer_inputs,
+            segment_ids,
+        )
+        if has_sharing:
+          assert isinstance(result[0], tuple)
+          x_res_tuple: tuple[jaxtyping.Array, tuple[LayerCache, ...]] = result[
+              0
+          ]
+          x = x_res_tuple[0]
+          updated_scan_cache = result[1]
+        else:
+          assert isinstance(result[0], jaxtyping.Array)
+          x = result[0]
+          updated_scan_cache = result[1]
       else:
-        x, updated_scan_cache = result
+        unshared_scan_cache: tuple[LayerCache | None, ...] = tuple(
+            LayerCache(
+                k=c_s["k"][: self.num_unshared_groups],
+                v=c_s["v"][: self.num_unshared_groups],
+                end_index=c_s["end_index"][: self.num_unshared_groups],
+            )
+            if c_s is not None
+            else None
+            for c_s in scan_cache
+        )
+        shared_scan_cache: tuple[LayerCache | None, ...] = tuple(
+            LayerCache(
+                k=c_s["k"][self.num_unshared_groups :],
+                v=c_s["v"][self.num_unshared_groups :],
+                end_index=c_s["end_index"][self.num_unshared_groups :],
+            )
+            if c_s is not None
+            else None
+            for c_s in scan_cache
+        )
+        if has_sharing:
+          assert is_shared_jax is not None and is_origin_jax is not None
+          unshared_meta = (
+              is_shared_jax[: self.num_unshared_groups],
+              is_origin_jax[: self.num_unshared_groups],
+          )
+          shared_meta = (
+              is_shared_jax[self.num_unshared_groups :],
+              is_origin_jax[self.num_unshared_groups :],
+          )
+        else:
+          unshared_meta = None
+          shared_meta = None
+        unshared_pli = (
+            scan_per_layer_inputs[: self.num_unshared_groups]
+            if scan_per_layer_inputs is not None
+            else None
+        )
+        shared_pli = (
+            scan_per_layer_inputs[self.num_unshared_groups :]
+            if scan_per_layer_inputs is not None
+            else None
+        )
+
+        res_unshared = scan_cache_body(
+            carry_init,
+            self.unshared_scan_groups,
+            unshared_scan_cache,
+            positions,
+            attention_mask,
+            unshared_meta,
+            unshared_pli,
+            segment_ids,
+        )
+        carry_mid = res_unshared[0]
+        unshared_out_cache = res_unshared[1]
+
+        res_shared = scan_cache_body(
+            carry_mid,
+            self.shared_scan_groups,
+            shared_scan_cache,
+            positions,
+            attention_mask,
+            shared_meta,
+            shared_pli,
+            segment_ids,
+        )
+        carry_final = res_shared[0]
+        shared_out_cache = res_shared[1]
+
+        if has_sharing:
+          assert isinstance(carry_final, tuple)
+          x_final_tuple: tuple[jaxtyping.Array, tuple[LayerCache, ...]] = (
+              carry_final
+          )
+          x = x_final_tuple[0]
+        else:
+          assert isinstance(carry_final, jaxtyping.Array)
+          x = carry_final
+        updated_scan_cache: StackedCache = tuple(
+            LayerCache(
+                k=jnp.concatenate(
+                    [unshared_out_cache[s]["k"], shared_out_cache[s]["k"]],
+                    axis=0,
+                ),
+                v=jnp.concatenate(
+                    [unshared_out_cache[s]["v"], shared_out_cache[s]["v"]],
+                    axis=0,
+                ),
+                end_index=jnp.concatenate(
+                    [
+                        unshared_out_cache[s]["end_index"],
+                        shared_out_cache[s]["end_index"],
+                    ],
+                    axis=0,
+                ),
+            )
+            for s in range(pattern_len)
+        )
 
       if is_stacked_cache:
         out_cache = updated_scan_cache
@@ -2304,69 +2540,200 @@ class Gemma4(BackendMappingMixin, nnx.Module):
       return x, out_cache
 
     # --- True scan path (training, cache=None) ---
-    # KV cache sharing (frac_shared_layers > 0) is not supported in the
-    # scan training path because ScanLayerGroup does not forward
-    # kv_shared_cache to sub-layers.  Inference with shared layers works
-    # via the unrolled cache path above.
-    if self.config.frac_shared_layers > 0:
-      raise ValueError(
-          "use_scan_layers with frac_shared_layers > 0 is not supported "
-          "for training (cache=None).  Use the for-loop path or provide "
-          "a cache to use the unrolled inference path."
-      )
-
     pattern_len = len(self.scan_pattern)
-    num_scan_groups = self.config.num_layers // pattern_len
 
-    # Reshape per_layer_inputs: (B, T, N, D) -> (num_scan_groups, B, T, pattern_len, D)
-    scan_per_layer_inputs = None
-    if per_layer_inputs is not None:
-      b, t, _, d = per_layer_inputs.shape
-      reshaped = per_layer_inputs.reshape(
-          (b, t, num_scan_groups, pattern_len, d)
-      )
-      shd_b, shd_t, _, _ = self.config.shd_config.act_btnh
-      scan_per_layer_inputs = sharding_utils.shard(
-          jnp.transpose(reshaped, (2, 0, 1, 3, 4)),
-          (None, shd_b, shd_t, None, None),
-      )
+    if self.config.frac_shared_layers == 0.0:
+      # Single scan path for unshared models
+      num_scan_groups = self.config.num_layers // pattern_len
 
-    @nnx.scan(
-        in_axes=(
-            nnx.Carry,
-            0,
-            None,
-            None,
-            0 if scan_per_layer_inputs is not None else None,
-            None,
-        ),
-        out_axes=nnx.Carry,
-    )
-    def scan_body(
-        x: jaxtyping.Array,
-        group: ScanLayerGroup,
-        positions: jaxtyping.Array,
-        attn_mask: jaxtyping.Array,
-        group_per_layer_inputs: jaxtyping.Array | None,
-        segment_ids: jaxtyping.Array | None,
-    ) -> jaxtyping.Array:
-      return group(
+      scan_per_layer_inputs = None
+      if per_layer_inputs is not None:
+        b, t, _, d = per_layer_inputs.shape
+        reshaped = per_layer_inputs.reshape(
+            (b, t, num_scan_groups, pattern_len, d)
+        )
+        shd_b, shd_t, _, _ = self.config.shd_config.act_btnh
+        scan_per_layer_inputs = sharding_utils.shard(
+            jnp.transpose(reshaped, (2, 0, 1, 3, 4)),
+            (None, shd_b, shd_t, None, None),
+        )
+
+      @nnx.scan(
+          in_axes=(
+              nnx.Carry,
+              0,
+              None,
+              None,
+              0 if scan_per_layer_inputs is not None else None,
+              None,
+          ),
+          out_axes=nnx.Carry,
+      )
+      def scan_body(
+          x: jaxtyping.Array,
+          group: ScanLayerGroup,
+          positions: jaxtyping.Array,
+          attn_mask: jaxtyping.Array | None,
+          group_per_layer_inputs: jaxtyping.Array | None,
+          segment_ids: jaxtyping.Array | None,
+      ) -> jaxtyping.Array:
+        return group(
+            x,
+            positions,
+            attn_mask,
+            per_layer_inputs=group_per_layer_inputs,
+            segment_ids=segment_ids,
+        )
+
+      x = scan_body(
           x,
+          self.unshared_scan_groups,
           positions,
-          attn_mask,
-          per_layer_inputs=group_per_layer_inputs,
-          segment_ids=segment_ids,
+          attention_mask,
+          scan_per_layer_inputs,
+          segment_ids,
+      )
+      return x, None
+
+    else:
+      # 2-Scan path for KV cache sharing models
+      num_unshared_layers = int(
+          self.config.num_layers
+          - self.config.frac_shared_layers * self.config.num_layers
+      )
+      num_shared_layers = self.config.num_layers - num_unshared_layers
+      num_unshared_groups = num_unshared_layers // pattern_len
+      num_shared_groups = num_shared_layers // pattern_len
+
+      scan_unshared_pli = None
+      scan_shared_pli = None
+      if per_layer_inputs is not None:
+        b, t, _, d = per_layer_inputs.shape
+        unshared_pli = per_layer_inputs[:, :, :num_unshared_layers, :]
+        shared_pli = per_layer_inputs[:, :, num_unshared_layers:, :]
+
+        reshaped_u = unshared_pli.reshape(
+            (b, t, num_unshared_groups, pattern_len, d)
+        )
+        shd_b, shd_t, _, _ = self.config.shd_config.act_btnh
+        scan_unshared_pli = sharding_utils.shard(
+            jnp.transpose(reshaped_u, (2, 0, 1, 3, 4)),
+            (None, shd_b, shd_t, None, None),
+        )
+
+        reshaped_s = shared_pli.reshape(
+            (b, t, num_shared_groups, pattern_len, d)
+        )
+        scan_shared_pli = sharding_utils.shard(
+            jnp.transpose(reshaped_s, (2, 0, 1, 3, 4)),
+            (None, shd_b, shd_t, None, None),
+        )
+
+      global_sub_idx = (num_unshared_layers - 1) % pattern_len
+      local_sub_idx = (num_unshared_layers - 2) % pattern_len
+
+      @nnx.scan(
+          in_axes=(
+              nnx.Carry,
+              0,
+              None,
+              None,
+              0 if scan_unshared_pli is not None else None,
+              None,
+          ),
+          out_axes=(
+              nnx.Carry,
+              {
+                  "global_origin": {"k": 0, "v": 0},
+                  "local_origin": {"k": 0, "v": 0},
+              },
+          ),
+      )
+      def scan_body_unshared(
+          x: jaxtyping.Array,
+          group: ScanLayerGroup,
+          positions: jaxtyping.Array,
+          attn_mask: jaxtyping.Array | None,
+          group_per_layer_inputs: jaxtyping.Array | None,
+          segment_ids: jaxtyping.Array | None,
+      ) -> tuple[jaxtyping.Array, OriginKV]:
+        new_group_kvs: dict[int, LayerKV] = {}
+        x = group(
+            x,
+            positions,
+            attn_mask,
+            per_layer_inputs=group_per_layer_inputs,
+            new_group_kvs=new_group_kvs,
+            segment_ids=segment_ids,
+        )
+        return x, {
+            "global_origin": new_group_kvs[global_sub_idx],
+            "local_origin": new_group_kvs[local_sub_idx],
+        }
+
+      x, unshared_kvs = scan_body_unshared(
+          x,
+          self.unshared_scan_groups,
+          positions,
+          attention_mask,
+          scan_unshared_pli,
+          segment_ids,
       )
 
-    x = scan_body(
-        x,
-        self.scan_groups,
-        positions,
-        attention_mask,
-        scan_per_layer_inputs,
-        segment_ids,
-    )
-    return x, None
+      # Extract origin KVs from the last unshared group
+      origin_kv_global: LayerKV = {
+          "k": unshared_kvs["global_origin"]["k"][-1],
+          "v": unshared_kvs["global_origin"]["v"][-1],
+      }
+      origin_kv_local: LayerKV = {
+          "k": unshared_kvs["local_origin"]["k"][-1],
+          "v": unshared_kvs["local_origin"]["v"][-1],
+      }
+
+      @nnx.scan(
+          in_axes=(
+              nnx.Carry,
+              0,
+              None,
+              None,
+              None,
+              None,
+              0 if scan_shared_pli is not None else None,
+              None,
+          ),
+          out_axes=nnx.Carry,
+      )
+      def scan_body_shared(
+          x: jaxtyping.Array,
+          group: ScanLayerGroup,
+          positions: jaxtyping.Array,
+          attn_mask: jaxtyping.Array | None,
+          origin_kv_g: LayerKV,
+          origin_kv_l: LayerKV,
+          group_per_layer_inputs: jaxtyping.Array | None,
+          segment_ids: jaxtyping.Array | None,
+      ) -> jaxtyping.Array:
+        return group(
+            x,
+            positions,
+            attn_mask,
+            origin_kv_global=origin_kv_g,
+            origin_kv_local=origin_kv_l,
+            per_layer_inputs=group_per_layer_inputs,
+            segment_ids=segment_ids,
+        )
+
+      x = scan_body_shared(
+          x,
+          self.shared_scan_groups,
+          positions,
+          attention_mask,
+          origin_kv_global,
+          origin_kv_local,
+          scan_shared_pli,
+          segment_ids,
+      )
+      return x, None
 
   @nnx.jit(static_argnames=("batch_size", "max_seq_len", "dtype"))
   def init_cache(
@@ -2392,7 +2759,12 @@ class Gemma4(BackendMappingMixin, nnx.Module):
             None,
         )
         if proto_i is not None:
-          sub_layer = self.scan_groups.sub_layers[sub_idx]
+          scan_groups = (
+              self.unshared_scan_groups
+              if hasattr(self, "unshared_scan_groups")
+              else self.scan_groups
+          )
+          sub_layer = scan_groups.sub_layers[sub_idx]
           proto_cache = sub_layer.init_cache(batch_size, max_seq_len, dtype)
           shd_btnh = (None, *self.config.shd_config.act_btnh)
           shd_b = (None, *self.config.shd_config.act_btnh[:1])

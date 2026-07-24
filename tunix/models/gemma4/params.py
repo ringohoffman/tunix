@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import collections
 from collections.abc import Callable
+import contextlib
 import itertools
 import os
 import time
@@ -36,6 +37,7 @@ from flax import nnx
 import flax.typing
 import jax
 from jax import numpy as jnp
+from jax._src.mesh import use_abstract_mesh
 from orbax import checkpoint as ocp
 import sentencepiece as spm
 from tunix.models.gemma4 import model as gemma4_model
@@ -49,6 +51,16 @@ GEMMA4_E2B_IT = 'gs://gemma-data/checkpoints/gemma4-e2b-it'
 GEMMA4_E4B_IT = 'gs://gemma-data/checkpoints/gemma4-e4b-it'
 # Tokenizer
 GEMMA4_TOKENIZER = 'gs://gemma-data/tokenizers/tokenizer_gemma4.model'
+
+
+def _mesh_context(
+    mesh: jax.sharding.Mesh | jax.sharding.AbstractMesh | None,
+) -> contextlib.AbstractContextManager[Any]:
+  if isinstance(mesh, jax.sharding.Mesh):
+    return jax.set_mesh(mesh)
+  if isinstance(mesh, jax.sharding.AbstractMesh):
+    return use_abstract_mesh(mesh)
+  return contextlib.nullcontext()
 
 
 def create_tokenizer(
@@ -152,26 +164,32 @@ def _stack_layers_for_scan(
     params: flax.typing.PyTree[jax.Array],
     num_layers: int,
     pattern_len: int,
+    frac_shared_layers: float,
 ) -> flax.typing.PyTree[jax.Array]:
   """Restructure per-layer params into scan_groups/sub_layers with stacking.
 
   When use_scan_layers is True, the model uses vmapped scan groups instead
   of individual layer modules. This function takes the flat per-layer
   checkpoint layout (layers/0..N) and reorganizes it into the scan layout
-  (scan_groups/sub_layers/0..pattern_len) with an extra leading axis of
-  size num_groups = num_layers // pattern_len.
+  (scan_groups/sub_layers/0..pattern_len) with an extra leading axis.
 
   Args:
     params: Nested parameter dict from map_from_upstream_checkpoint.
     num_layers: Total number of layers in the model.
     pattern_len: Number of sub-layers per scan group.
+    frac_shared_layers: Fraction of shared layers in Gemma 4.
 
   Returns:
     Parameter dict with layers restructured into scan groups.
   """
-  num_groups = num_layers // pattern_len
+  num_unshared_layers = int(num_layers - frac_shared_layers * num_layers)
+  num_shared_layers = num_layers - num_unshared_layers
+  num_unshared_groups = num_unshared_layers // pattern_len
+  num_shared_groups = num_shared_layers // pattern_len
+
   flat = flax.traverse_util.flatten_dict(params)
   new_flat: flax.typing.FlatPyTree[jax.Array] = {}
+  collector_group_count: dict[flax.typing.PathParts, int] = {}
   collector: dict[flax.typing.PathParts, dict[int, jax.Array]] = (
       collections.defaultdict(dict)
   )
@@ -189,19 +207,36 @@ def _stack_layers_for_scan(
         layer_idx = int(layer_idx_str)
         param_path = path[1:]
 
-      sub_layer_idx = layer_idx % pattern_len
-      group_idx = layer_idx // pattern_len
-      target_path: flax.typing.PathParts = (
-          'scan_groups',
-          'sub_layers',
-          sub_layer_idx,
-      ) + param_path
-      collector[target_path][group_idx] = param
+      if layer_idx < num_unshared_layers:
+        sub_layer_idx = layer_idx % pattern_len
+        group_idx = layer_idx // pattern_len
+        group_name = (
+            'unshared_scan_groups' if frac_shared_layers > 0 else 'scan_groups'
+        )
+        target_path: flax.typing.PathParts = (
+            group_name,
+            'sub_layers',
+            sub_layer_idx,
+        ) + param_path
+        collector[target_path][group_idx] = param
+        collector_group_count[target_path] = num_unshared_groups
+      else:
+        rel_idx = layer_idx - num_unshared_layers
+        sub_layer_idx = rel_idx % pattern_len
+        group_idx = rel_idx // pattern_len
+        target_path: flax.typing.PathParts = (
+            'shared_scan_groups',
+            'sub_layers',
+            sub_layer_idx,
+        ) + param_path
+        collector[target_path][group_idx] = param
+        collector_group_count[target_path] = num_shared_groups
     else:
       new_flat[path] = param
 
   for target_path, slices in collector.items():
-    sorted_slices = [slices[i] for i in range(num_groups)]
+    g_count = collector_group_count[target_path]
+    sorted_slices = [slices[i] for i in range(g_count)]
     new_flat[target_path] = jnp.stack(sorted_slices, axis=0)
 
   return flax.traverse_util.unflatten_dict(new_flat)
@@ -212,7 +247,7 @@ def _build_sharded_restore_target(
     model_state: nnx.State[
         flax.typing.PathParts, nnx.Variable[jax.ShapeDtypeStruct]
     ],
-    mesh: jax.sharding.Mesh,
+    mesh: jax.sharding.Mesh | jax.sharding.AbstractMesh,
     model_config: gemma4_model.ModelConfig,
 ) -> tuple[flax.typing.PyTree[jax.ShapeDtypeStruct], ocp.PyTreeCheckpointer]:
   """Build a sharded restore target for direct-to-device DMA loading.
@@ -264,7 +299,7 @@ def _build_sharded_restore_target(
       )
   )
 
-  with jax.set_mesh(mesh):
+  with _mesh_context(mesh):
     shd_state = nnx.get_named_sharding(model_state, mesh)
     flat_shardings = flax.traverse_util.flatten_dict(
         nnx.to_pure_dict(shd_state)
@@ -289,11 +324,27 @@ def _build_sharded_restore_target(
       layer_idx = downstream_key[1]
       assert isinstance(layer_idx, int)
       param_path = downstream_key[2:]
-      sub_layer_idx = layer_idx % pattern_len
-      scan_key = ('scan_groups', 'sub_layers', sub_layer_idx) + param_path
+
+      num_unshared_layers = int(
+          model_config.num_layers
+          - model_config.frac_shared_layers * model_config.num_layers
+      )
+      if layer_idx < num_unshared_layers:
+        sub_layer_idx = layer_idx % pattern_len
+        group_name = (
+            'unshared_scan_groups'
+            if model_config.frac_shared_layers > 0
+            else 'scan_groups'
+        )
+      else:
+        rel_idx = layer_idx - num_unshared_layers
+        sub_layer_idx = rel_idx % pattern_len
+        group_name = 'shared_scan_groups'
+
+      scan_key = (group_name, 'sub_layers', sub_layer_idx) + param_path
       if scan_key not in flat_shardings:
-        if ('scan_groups',) + scan_key in flat_shardings:
-          scan_key = ('scan_groups',) + scan_key
+        if (group_name,) + scan_key in flat_shardings:
+          scan_key = (group_name,) + scan_key
         else:
           logging.info(
               'Skipping sharded restore target for pruned scan key: %s',
@@ -353,7 +404,7 @@ def _build_sharded_restore_target(
 def _try_restore_native_tunix(
     resolved_path: str,
     abs_model: gemma4_model.Gemma4,
-    mesh: jax.sharding.Mesh | None,
+    mesh: jax.sharding.Mesh | jax.sharding.AbstractMesh | None,
     t0: float,
 ) -> bool:
   """Attempt to restore from a native Tunix CheckpointManager checkpoint.
@@ -404,15 +455,14 @@ def _try_restore_native_tunix(
       )
     return x
 
-  with jax.set_mesh(mesh):
+  with _mesh_context(mesh):
     nnx.update(abs_model, jax.tree.map(_bind_mesh, nnx.state(abs_model)))
     mgr = tunix_ckpt_mgr.CheckpointManager(ckpt_root)
     mgr.maybe_restore(abs_model, step=step_num)
     mgr.close()
 
   logging.info(
-      'Restored native Tunix model from step %d via CheckpointManager in'
-      ' %.2fs',
+      'Restored native Tunix model from step %d via CheckpointManager in %.2fs',
       step_num,
       time.monotonic() - t0,
   )
@@ -422,7 +472,7 @@ def _try_restore_native_tunix(
 def create_model_from_checkpoint(
     checkpoint_path: str,
     model_config: gemma4_model.ModelConfig,
-    mesh: jax.sharding.Mesh | None = None,
+    mesh: jax.sharding.Mesh | jax.sharding.AbstractMesh | None = None,
     dtype: jnp.dtype = jnp.bfloat16,
 ) -> gemma4_model.Gemma4:
   """Load a Gemma4 model from an Orbax checkpoint.
@@ -456,7 +506,10 @@ def create_model_from_checkpoint(
   else:
     resolved_path = clean_path
 
-  with nnx.use_eager_sharding(True), jax.set_mesh(mesh):
+  with (
+      nnx.use_eager_sharding(True),
+      _mesh_context(mesh),
+  ):
     abs_model = nnx.eval_shape(
         lambda: gemma4_model.Gemma4(model_config, rngs=nnx.Rngs(0))
     )
@@ -496,6 +549,7 @@ def create_model_from_checkpoint(
         mapped,
         model_config.num_layers,
         len(model_config.attention_pattern),
+        model_config.frac_shared_layers,
     )
 
   pruned = _prune_to_model_keys(mapped, model_state)
@@ -504,7 +558,7 @@ def create_model_from_checkpoint(
   pure_state = nnx.to_pure_dict(model_state)
 
   if mesh is not None:
-    with jax.set_mesh(mesh):
+    with _mesh_context(mesh):
       shardings = nnx.to_pure_dict(nnx.get_named_sharding(model_state, mesh))
       # Fill missing leaves (e.g. vision weights absent from text-only ckpt)
       flat_pure = flax.traverse_util.flatten_dict(pure_state)
@@ -693,7 +747,15 @@ def map_from_upstream_checkpoint(
 
   # Already in NNX layout (e.g. from Tunix CheckpointManager) — nothing to remap.
   if any(
-      isinstance(k, tuple) and len(k) >= 2 and k[0] in ('layers', 'scan_groups')
+      isinstance(k, tuple)
+      and len(k) >= 2
+      and k[0]
+      in (
+          'layers',
+          'scan_groups',
+          'unshared_scan_groups',
+          'shared_scan_groups',
+      )
       for k in flat_params.keys()
   ):
     return params
