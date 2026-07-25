@@ -23,9 +23,9 @@ Tunix NNX implementation.
 from __future__ import annotations
 
 import collections
-import dataclasses
 from collections.abc import Callable
 import contextlib
+import dataclasses
 import itertools
 import os
 import time
@@ -525,7 +525,9 @@ def _try_restore_native_tunix(
     with _mesh_context(mesh):
       shardings = nnx.to_pure_dict(nnx.get_named_sharding(model_state, mesh))
       typed = jax.tree_util.tree_map_with_path(
-          lambda p, x, s: jnp.asarray(x, device=s, dtype=model_config.param_dtype),
+          lambda p, x, s: jnp.asarray(
+              x, device=s, dtype=model_config.param_dtype
+          ),
           pruned,
           shardings,
       )
@@ -545,7 +547,6 @@ def _try_restore_native_tunix(
       needs_restack,
   )
   return True
-
 
 
 def create_model_from_checkpoint(
@@ -824,7 +825,6 @@ def map_from_upstream_checkpoint(
   flat_params = flax.traverse_util.flatten_dict(params)
   raw_key_strings = set('/'.join(str(s) for s in k) for k in flat_params.keys())
 
-  # Already in NNX layout (e.g. from Tunix CheckpointManager) — nothing to remap.
   if any(
       isinstance(k, tuple)
       and len(k) >= 2
@@ -837,7 +837,19 @@ def map_from_upstream_checkpoint(
       )
       for k in flat_params.keys()
   ):
-    return params
+    # Already in NNX layout (e.g. from Tunix CheckpointManager).
+    # Orbax JSON metadata deserializes PyTree dictionary keys as strings ('0').
+    # Normalize digit string path components to int so downstream consumers
+    # (_build_sharded_restore_target, _stack_layers_for_scan) receive integer
+    # layer indices matching NNX model state.
+    normalized: flax.typing.FlatPyTree[LeafT] = {}
+    for k, v in flat_params.items():
+      norm_key = tuple(
+          int(part) if isinstance(part, str) and part.isdigit() else part
+          for part in k
+      )
+      normalized[norm_key] = v
+    return flax.traverse_util.unflatten_dict(normalized)
 
   for key_path, value in flat_params.items():
 
