@@ -750,6 +750,10 @@ class RLLearner(abc.ABC, Generic[TConfig]):
         if (
             eval_ds
             and not curr_eval_ds
+            and (
+                self.rl_cluster.actor_trainer.train_steps > 0
+                or self.rl_cluster.cluster_config.training_config.eval_at_start
+            )
             and self.rl_cluster.actor_trainer.train_steps
             % self.rl_cluster.cluster_config.training_config.eval_every_n_steps
             == 0

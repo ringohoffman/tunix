@@ -63,6 +63,7 @@ class TrainingConfig:
   eval_every_n_steps: int
   max_steps: int | None = None
   gradient_accumulation_steps: int | None = None
+  eval_at_start: bool = True
 
   # If set, the checkpoints will be saved to this path. Checkpoints
   # contains the model params and the train data iterator state.
@@ -525,7 +526,7 @@ class PeftTrainer:
       )
       self._jit_cache.add(cache_size)
 
-    if eval_ds:
+    if eval_ds and self.config.eval_at_start:
       self._run_eval(eval_ds, eval_step)
 
     for hook in self.training_hooks:
