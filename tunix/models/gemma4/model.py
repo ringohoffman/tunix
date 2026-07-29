@@ -990,6 +990,7 @@ class Attention(nnx.Module):
       kv_shared_cache: LayerKV | LayerCache | None = None,
       kv_override: LayerKV | LayerCache | None = None,
       use_kv_override: jaxtyping.Array | bool | None = None,
+      skip_kv_projection: bool = False,
       segment_ids: jaxtyping.Array | None = None,
   ) -> tuple[
       LayerKV | LayerCache | None,
@@ -1016,6 +1017,19 @@ class Attention(nnx.Module):
       assert cache is None
       key_proj = kv_shared_cache["k"]
       value_proj = kv_shared_cache["v"]
+    elif skip_kv_projection:
+      # Shared layer in scan path: skip KV einsum, norms, and RoPE entirely.
+      # Use zeros as placeholder — the jnp.where kv_override below will
+      # substitute the origin layer's real KV for both attention and cache
+      # output.  Avoids wasted decode FLOPs for models with
+      # frac_shared_layers > 0 (~0.9% of total for e2b, ~1.2% for e4b).
+      assert kv_override is not None, (
+          "skip_kv_projection requires kv_override to provide the "
+          "origin layer's KV values"
+      )
+      kv_shape = (x.shape[0], x.shape[1], self.num_kv_heads, self.head_dim)
+      key_proj = jnp.zeros(kv_shape, dtype=x.dtype)
+      value_proj = jnp.zeros(kv_shape, dtype=x.dtype)
     else:
       if hasattr(self, "k_einsum"):  # case where k_eq_v is True
         key_proj = self.k_einsum(x)
@@ -1381,6 +1395,7 @@ class Attention(nnx.Module):
       kv_shared_cache: LayerKV | LayerCache | None = None,
       kv_override: LayerKV | LayerCache | None = None,
       use_kv_override: jaxtyping.Array | bool | None = None,
+      skip_kv_projection: bool = False,
       segment_ids: jaxtyping.Array | None = None,
   ) -> tuple[
       LayerKV | LayerCache | None,
@@ -1404,6 +1419,7 @@ class Attention(nnx.Module):
           kv_shared_cache,
           kv_override,
           use_kv_override,
+          skip_kv_projection,
           segment_ids,
       )
     else:
@@ -1415,6 +1431,7 @@ class Attention(nnx.Module):
           kv_shared_cache=kv_shared_cache,
           kv_override=kv_override,
           use_kv_override=use_kv_override,
+          skip_kv_projection=skip_kv_projection,
           segment_ids=segment_ids,
       )
 
@@ -1624,6 +1641,7 @@ class DecoderLayer(nnx.Module):
       kv_shared_cache: LayerKV | LayerCache | None = None,
       kv_override: LayerKV | LayerCache | None = None,
       use_kv_override: jaxtyping.Array | bool | None = None,
+      skip_kv_projection: bool = False,
       segment_ids: jaxtyping.Array | None = None,
   ) -> tuple[
       LayerKV | LayerCache | None,
@@ -1640,6 +1658,7 @@ class DecoderLayer(nnx.Module):
         kv_shared_cache=kv_shared_cache,
         kv_override=kv_override,
         use_kv_override=use_kv_override,
+        skip_kv_projection=skip_kv_projection,
         segment_ids=segment_ids,
     )
     attn = self.post_attention_norm(attn)
@@ -1678,6 +1697,7 @@ class DecoderLayer(nnx.Module):
       kv_shared_cache: LayerKV | LayerCache | None = None,
       kv_override: LayerKV | LayerCache | None = None,
       use_kv_override: jaxtyping.Array | bool | None = None,
+      skip_kv_projection: bool = False,
       segment_ids: jaxtyping.Array | None = None,
   ) -> tuple[
       LayerKV | LayerCache | None,
@@ -1699,6 +1719,7 @@ class DecoderLayer(nnx.Module):
           kv_shared_cache,
           kv_override,
           use_kv_override,
+          skip_kv_projection,
           segment_ids,
       )
     else:
@@ -1711,6 +1732,7 @@ class DecoderLayer(nnx.Module):
           kv_shared_cache,
           kv_override=kv_override,
           use_kv_override=use_kv_override,
+          skip_kv_projection=skip_kv_projection,
           segment_ids=segment_ids,
       )
 
@@ -1736,10 +1758,12 @@ class ScanLayerGroup(nnx.Module):
       pattern: tuple[AttentionType, ...],
       *,
       hidden_dim: int | None = None,
+      skip_kv_projection: bool = False,
       rngs: nnx.Rngs,
   ) -> None:
     self.config = config
     self.pattern = pattern
+    self.skip_kv_projection = skip_kv_projection
     self.sub_layers = compat.ModuleList[DecoderLayer]()
     hidden_dim = hidden_dim if hidden_dim is not None else config.hidden_dim
     for attn_type in pattern:
@@ -1809,6 +1833,7 @@ class ScanLayerGroup(nnx.Module):
           per_layer_input=pli,
           kv_override=kv_override,
           use_kv_override=use_kv_override,
+          skip_kv_projection=self.skip_kv_projection,
           segment_ids=segment_ids,
       )
       if new_cache is not None and layer_cache is not None:
@@ -1967,7 +1992,11 @@ class Gemma4(BackendMappingMixin, nnx.Module):
       @nnx.vmap(axis_size=self.num_shared_groups)
       def create_shared_group(rngs: nnx.Rngs) -> ScanLayerGroup:
         return ScanLayerGroup(
-            config, pattern, hidden_dim=shared_hdim, rngs=rngs
+            config,
+            pattern,
+            hidden_dim=shared_hdim,
+            skip_kv_projection=True,
+            rngs=rngs,
         )
 
       self.shared_scan_groups = create_shared_group(rngs)

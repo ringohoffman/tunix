@@ -51,7 +51,7 @@ class ModelTest(absltest.TestCase):
 
     logits, _ = model(tokens, positions=positions, attention_mask=attn_mask)
     self.assertEqual(logits.shape, (2, 32, config.num_embed))
-    print(f"{logits.shape=}")
+    print(f'{logits.shape=}')
 
   def test_forward_pass_moe(self):
     config = model_lib.ModelConfig.gemma4_26b_a4b()
@@ -196,5 +196,209 @@ class ModelTest(absltest.TestCase):
     self.assertEqual(logits.shape, (2, 32, config.num_embed))
 
 
-if __name__ == "__main__":
+def _make_shared_scan_config() -> model_lib.ModelConfig:
+  """Minimal config with shared layers + scan for skip_kv_projection tests.
+
+  12 layers, pattern_len=6 → 2 groups.
+  frac_shared=0.5 → 6 unshared (1 group), 6 shared (1 group).
+  """
+  return model_lib.ModelConfig(
+      num_layers=12,
+      num_embed=128,
+      embed_dim=64,
+      hidden_dim=128,
+      num_heads=4,
+      head_dim=16,
+      num_kv_heads=2,
+      num_global_kv_heads=1,
+      global_key_size=32,
+      sliding_window_size=16,
+      k_eq_v_global=True,
+      frac_shared_layers=0.5,
+      use_scan_layers=True,
+      attention_pattern=(
+          model_lib.AttentionType.LOCAL_SLIDING,
+          model_lib.AttentionType.LOCAL_SLIDING,
+          model_lib.AttentionType.LOCAL_SLIDING,
+          model_lib.AttentionType.LOCAL_SLIDING,
+          model_lib.AttentionType.LOCAL_SLIDING,
+          model_lib.AttentionType.GLOBAL,
+      ),
+  )
+
+
+def _make_test_inputs(config, batch_size=2, seq_len=8):
+  tokens = jax.random.randint(
+      jax.random.PRNGKey(42), (batch_size, seq_len), 0, config.num_embed
+  )
+  positions = jnp.tile(jnp.arange(seq_len)[None, :], (batch_size, 1))
+  attn_mask = jnp.tril(jnp.ones((seq_len, seq_len), dtype=jnp.bool_))[None, ...]
+  return tokens, positions, attn_mask
+
+
+class SkipKVProjectionTest(absltest.TestCase):
+  """Numerical equivalence tests for the skip_kv_projection optimization.
+
+  Proves that skipping the KV einsum for shared layers in the two-scan
+  inference path produces bitwise-identical outputs to the baseline
+  (computing KV then discarding via jnp.where).
+  """
+
+  def _set_skip_kv(self, model, value):
+    self.assertTrue(hasattr(model, 'shared_scan_groups'))
+    model.shared_scan_groups.skip_kv_projection = value
+
+  def test_prefill_equivalence(self):
+    """Prefill logits must be identical with and without skip_kv_projection."""
+    config = _make_shared_scan_config()
+    model = model_lib.Gemma4(config, rngs=nnx.Rngs(0))
+    self.assertTrue(model.shared_scan_groups.skip_kv_projection)
+
+    tokens, positions, attn_mask = _make_test_inputs(config)
+
+    # Baseline: compute KV then discard via jnp.where.
+    self._set_skip_kv(model, False)
+    cache_b = model.init_cache(batch_size=2, max_seq_len=16, dtype=jnp.float32)
+    out_b = model(
+        tokens,
+        positions=positions,
+        cache=cache_b,
+        attention_mask=attn_mask,
+    )
+
+    # Optimized: skip KV einsum entirely.
+    self._set_skip_kv(model, True)
+    cache_o = model.init_cache(batch_size=2, max_seq_len=16, dtype=jnp.float32)
+    out_o = model(
+        tokens,
+        positions=positions,
+        cache=cache_o,
+        attention_mask=attn_mask,
+    )
+
+    max_diff = float(jnp.max(jnp.abs(out_b.logits - out_o.logits)))
+    self.assertEqual(
+        max_diff, 0.0, f'Prefill logits differ: max_diff={max_diff}'
+    )
+
+    # Non-shared layer caches must also be identical.
+    if isinstance(out_b.cache, dict):
+      for key in out_b.cache:
+        for field in ('k', 'v'):
+          cache_diff = float(
+              jnp.max(
+                  jnp.abs(out_b.cache[key][field] - out_o.cache[key][field])
+              )
+          )
+          self.assertEqual(
+              cache_diff,
+              0.0,
+              f'Cache {key}/{field} differs: max_diff={cache_diff}',
+          )
+
+  def test_decode_equivalence(self):
+    """Decode logits after prefill must be identical."""
+    config = _make_shared_scan_config()
+    model = model_lib.Gemma4(config, rngs=nnx.Rngs(0))
+    tokens, positions, attn_mask = _make_test_inputs(config, seq_len=8)
+
+    # Prefill with each setting.
+    self._set_skip_kv(model, False)
+    cache_b = model.init_cache(batch_size=2, max_seq_len=16, dtype=jnp.float32)
+    pfill_b = model(
+        tokens,
+        positions=positions,
+        cache=cache_b,
+        attention_mask=attn_mask,
+    )
+
+    self._set_skip_kv(model, True)
+    cache_o = model.init_cache(batch_size=2, max_seq_len=16, dtype=jnp.float32)
+    pfill_o = model(
+        tokens,
+        positions=positions,
+        cache=cache_o,
+        attention_mask=attn_mask,
+    )
+
+    # Decode step.
+    tok_dec = jax.random.randint(
+        jax.random.PRNGKey(1), (2, 1), 0, config.num_embed
+    )
+    pos_dec = jnp.full((2, 1), 8)
+    mask_dec = jnp.ones((2, 1, 16), dtype=jnp.bool_)
+
+    self._set_skip_kv(model, False)
+    dec_b = model(
+        tok_dec,
+        positions=pos_dec,
+        cache=pfill_b.cache,
+        attention_mask=mask_dec,
+    )
+
+    self._set_skip_kv(model, True)
+    dec_o = model(
+        tok_dec,
+        positions=pos_dec,
+        cache=pfill_o.cache,
+        attention_mask=mask_dec,
+    )
+
+    max_diff = float(jnp.max(jnp.abs(dec_b.logits - dec_o.logits)))
+    self.assertEqual(
+        max_diff, 0.0, f'Decode logits differ: max_diff={max_diff}'
+    )
+
+  def test_multi_decode_steps(self):
+    """Multiple consecutive decode steps must stay identical."""
+    config = _make_shared_scan_config()
+    model = model_lib.Gemma4(config, rngs=nnx.Rngs(0))
+    tokens, positions, attn_mask = _make_test_inputs(config, seq_len=8)
+
+    # Prefill.
+    self._set_skip_kv(model, False)
+    cache_b = model.init_cache(batch_size=2, max_seq_len=16, dtype=jnp.float32)
+    out_b = model(
+        tokens,
+        positions=positions,
+        cache=cache_b,
+        attention_mask=attn_mask,
+    )
+    cache_b = out_b.cache
+
+    self._set_skip_kv(model, True)
+    cache_o = model.init_cache(batch_size=2, max_seq_len=16, dtype=jnp.float32)
+    out_o = model(
+        tokens,
+        positions=positions,
+        cache=cache_o,
+        attention_mask=attn_mask,
+    )
+    cache_o = out_o.cache
+
+    # 4 decode steps.
+    for step in range(4):
+      tok = jax.random.randint(
+          jax.random.PRNGKey(step + 10), (2, 1), 0, config.num_embed
+      )
+      pos = jnp.full((2, 1), 8 + step)
+      mask = jnp.ones((2, 1, 16), dtype=jnp.bool_)
+
+      self._set_skip_kv(model, False)
+      dec_b = model(tok, positions=pos, cache=cache_b, attention_mask=mask)
+      cache_b = dec_b.cache
+
+      self._set_skip_kv(model, True)
+      dec_o = model(tok, positions=pos, cache=cache_o, attention_mask=mask)
+      cache_o = dec_o.cache
+
+      max_diff = float(jnp.max(jnp.abs(dec_b.logits - dec_o.logits)))
+      self.assertEqual(
+          max_diff,
+          0.0,
+          f'Decode step {step} logits differ: max_diff={max_diff}',
+      )
+
+
+if __name__ == '__main__':
   absltest.main()
