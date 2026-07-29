@@ -195,6 +195,37 @@ class ModelTest(absltest.TestCase):
     _, logits = compiled_decode(state)
     self.assertEqual(logits.shape, (2, 32, config.num_embed))
 
+  def test_forward_loop_shared_scan(self):
+    """Verify _forward_loop works on a scan model with shared layers."""
+    config = _make_shared_scan_config()
+    model = model_lib.Gemma4(config, rngs=nnx.Rngs(0))
+    tokens, positions, attn_mask = _make_test_inputs(config)
+
+    scan_out = model(tokens, positions=positions, attention_mask=attn_mask)
+    # Manually invoke _forward_loop on the scan model
+    x = model.embedder.encode(tokens)
+    per_layer_inputs = None
+    loop_x, _ = model._forward_loop(
+        x,
+        positions,
+        cache=None,
+        attention_mask=attn_mask,
+        per_layer_inputs=per_layer_inputs,
+        new_cache={},
+        transient_kvs={},
+        is_prefill=True,
+        segment_ids=None,
+    )
+    loop_logits = model.embedder.decode(model.final_norm(loop_x)).astype(
+        jnp.float32
+    )
+    max_diff = float(jnp.max(jnp.abs(scan_out.logits - loop_logits)))
+    self.assertLess(
+        max_diff,
+        1e-5,
+        msg=f'_forward_loop vs _forward_scan diff too large: {max_diff}',
+    )
+
 
 def _make_shared_scan_config() -> model_lib.ModelConfig:
   """Minimal config with shared layers + scan for skip_kv_projection tests.

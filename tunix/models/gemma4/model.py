@@ -67,11 +67,15 @@ def _compat_remat(
     *,
     graph_updates: bool = True,
     policy: CheckpointPolicy | None = None,
+    static_argnums: int | tuple[int, ...] | None = None,
 ) -> _F:
   """nnx.remat wrapper that drops graph_updates if Flax doesn't support it."""
+  kwargs = {}
+  if static_argnums is not None:
+    kwargs["static_argnums"] = static_argnums
   if _REMAT_SUPPORTS_GRAPH_UPDATES:
-    return nnx.remat(fn, graph_updates=graph_updates, policy=policy)
-  return nnx.remat(fn, policy=policy)
+    return nnx.remat(fn, graph_updates=graph_updates, policy=policy, **kwargs)
+  return nnx.remat(fn, policy=policy, **kwargs)
 
 
 class LayerKV(TypedDict):
@@ -1410,7 +1414,9 @@ class Attention(nnx.Module):
       # nnx.remat needs to be applied to the unbound function and take self
       # as the first argument. graph_updates=False prevents TraceContextError
       # when mutating params across jax transformation trace levels.
-      return _compat_remat(self.block.__func__, graph_updates=False)(
+      return _compat_remat(
+          self.block.__func__, graph_updates=False, static_argnums=(8,)
+      )(
           self,
           x,
           segment_pos,
@@ -1709,7 +1715,9 @@ class DecoderLayer(nnx.Module):
         remat_config == RematConfig.DECODER
         or remat_config == RematConfig.DECODER.value
     ):
-      return _compat_remat(self.block.__func__, graph_updates=False)(
+      return _compat_remat(
+          self.block.__func__, graph_updates=False, static_argnums=(9,)
+      )(
           self,
           x,
           segment_pos,
@@ -2117,24 +2125,38 @@ class Gemma4(BackendMappingMixin, nnx.Module):
     unrolled_layers: list[DecoderLayer] = []
     if self.config.use_scan_layers:
       pattern_len = len(self.scan_pattern)
-      sub_layer_splits = [
-          nnx.split(sub_layer) for sub_layer in self.scan_groups.sub_layers
+      num_unshared_layers = int(
+          num_layers - self.config.frac_shared_layers * num_layers
+      )
+      unshared_splits = [
+          nnx.split(sub_layer)
+          for sub_layer in self.unshared_scan_groups.sub_layers
       ]
+      shared_splits = (
+          [
+              nnx.split(sub_layer)
+              for sub_layer in self.shared_scan_groups.sub_layers
+          ]
+          if self.num_shared_groups > 0
+          else []
+      )
       for i in range(num_layers):
-        group_idx = i // pattern_len
-        sub_idx = i % pattern_len
-        graphdef, state = sub_layer_splits[sub_idx]
+        if i < num_unshared_layers:
+          group_idx = i // pattern_len
+          sub_idx = i % pattern_len
+          graphdef, state = unshared_splits[sub_idx]
+        else:
+          rel_i = i - num_unshared_layers
+          group_idx = rel_i // pattern_len
+          sub_idx = rel_i % pattern_len
+          graphdef, state = shared_splits[sub_idx]
         layer_state = jax.tree.map(lambda leaf: leaf[group_idx], state)
         unrolled_layers.append(nnx.merge(graphdef, layer_state))
+    else:
+      unrolled_layers = self.layers
 
-    for i in range(num_layers):
+    for i, layer in enumerate(unrolled_layers):
       layer_name = f"layer_{i}"
-
-      if self.config.use_scan_layers:
-        layer = unrolled_layers[i]
-      else:
-        layer = self.layers[i]
-
       shared_idx = self.kv_cache_sharing_patterns[i]
       is_shared = shared_idx != i
       kv_shared_cache: LayerKV | LayerCache | None
@@ -2788,12 +2810,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
             None,
         )
         if proto_i is not None:
-          scan_groups = (
-              self.unshared_scan_groups
-              if hasattr(self, "unshared_scan_groups")
-              else self.scan_groups
-          )
-          sub_layer = scan_groups.sub_layers[sub_idx]
+          sub_layer = self.unshared_scan_groups.sub_layers[sub_idx]
           proto_cache = sub_layer.init_cache(batch_size, max_seq_len, dtype)
           shd_btnh = (None, *self.config.shd_config.act_btnh)
           shd_b = (None, *self.config.shd_config.act_btnh[:1])
