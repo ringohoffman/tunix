@@ -1,0 +1,990 @@
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Tests for constrained generation integrated into the tunix sampler.
+
+Demonstrates the JIT'd FSM approach end-to-end: a regex pattern is compiled
+into a token-level DFA transition table, which is then used inside the
+sampler's ``jax.lax.while_loop`` to guarantee that the generated output
+conforms to the grammar.
+
+Uses the ``ToyTransformer`` / ``MockVocab`` micro-model setup from
+``tunix.tests.test_common`` to exercise real JIT compilation without
+requiring a full Gemma checkpoint.
+"""
+
+import re
+
+from absl.testing import absltest
+from absl.testing import parameterized
+from flax import nnx
+import jax
+import jax.numpy as jnp
+import numpy as np
+from tunix.generate import constrained
+from tunix.generate import sampler as sampler_lib
+from tunix.tests import test_common as tc
+
+# ---------------------------------------------------------------------------
+# Vocabulary for constrained generation testing
+# ---------------------------------------------------------------------------
+# We need a vocab that includes the structural and category tokens required
+# for JSON-list output, so we extend the default MockVocab mapping.
+
+_CONSTRAINED_VOCAB_MAPPING = {
+    "<pad>": 0,
+    "<s>": 1,
+    "</s>": 2,
+    "[": 3,
+    "]": 4,
+    '"': 5,
+    ", ": 6,
+    "none": 7,
+    "spam": 8,
+    "gore": 9,
+    "hello": 10,  # distractor — not a valid category
+    "world": 11,  # distractor
+    "input": 12,
+    "string": 13,
+    "no": 14,  # partial token (prefix of "none")
+    "ne": 15,  # partial token (suffix of "none")
+}
+
+_CATEGORIES = ["none", "spam", "gore"]
+
+# The regex pattern that constrains output to JSON category arrays.
+# e.g. ["none"], ["spam", "gore"], etc.
+_CATEGORY_REGEX = r'\["(none|spam|gore)"(, "(none|spam|gore)")*\]'
+
+
+def _build_token_id_to_str(
+    vocab: tc.MockVocab,
+) -> dict[int, str]:
+  """Build token_id → decoded_string mapping from a MockVocab."""
+  reverse = {v: k for k, v in vocab._mapping_text_to_id.items()}
+  result = {}
+  for tid, text in reverse.items():
+    if text in ("<pad>", "<s>"):
+      result[tid] = ""  # structural tokens — empty decode
+    elif text == "</s>":
+      result[tid] = ""  # EOS — handled specially
+    else:
+      result[tid] = text
+  return result
+
+
+class _ConcatVocab(tc.MockVocab):
+  """MockVocab that concatenates tokens without spaces for JSON output."""
+
+  def DecodeIds(self, ids):
+    reverse = {v: k for k, v in self._mapping_text_to_id.items()}
+    return "".join(
+        reverse[e]
+        for e in ids
+        if e in reverse and reverse[e] not in ("<pad>", "<s>", "</s>")
+    )
+
+
+class ConstrainedSamplerTest(parameterized.TestCase):
+  """Tests that constrained generation works inside the JIT'd sampler."""
+
+  @classmethod
+  def setUpClass(cls):
+    super().setUpClass()
+    cls._cached_vocab = _ConcatVocab(
+        mapping_text_to_id=_CONSTRAINED_VOCAB_MAPPING
+    )
+    cls._cached_transformer = tc.ToyTransformer(
+        config=tc.ModelConfig(vocab_size=cls._cached_vocab.GetPieceSize()),
+        rngs=nnx.Rngs(42),
+    )
+    cls._cached_sampler = sampler_lib.Sampler(
+        transformer=cls._cached_transformer,
+        tokenizer=cls._cached_vocab,
+        cache_config=sampler_lib.CacheConfig(
+            cache_size=128,
+            num_layers=4,
+            num_kv_heads=4,
+            head_dim=16,
+        ),
+    )
+    token_id_to_str = _build_token_id_to_str(cls._cached_vocab)
+    cls._cached_constraint = constrained.build_regex_constraint(
+        pattern=_CATEGORY_REGEX,
+        token_id_to_str=token_id_to_str,
+        vocab_size=cls._cached_vocab.GetPieceSize(),
+        eos_token_ids=[cls._cached_vocab.eos_id()],
+    )
+
+  def _make_sampler_and_constraint(self):
+    """Returns the cached sampler with ToyTransformer and pre-built constraint tables."""
+    return self._cached_sampler, self._cached_vocab, self._cached_constraint
+
+  def test_constrained_generation_produces_valid_output(self):
+    """Generated text matches the JSON category list regex."""
+    sampler, vocab, constraint = self._make_sampler_and_constraint()
+
+    result = sampler(
+        ["input string"],
+        max_generation_steps=20,
+        constraint_tables=constraint,
+    )
+
+    generated_text = result.text[0]
+    self.assertRegex(
+        generated_text,
+        _CATEGORY_REGEX,
+        f"Generated text {generated_text!r} does not match the constraint "
+        f"regex {_CATEGORY_REGEX!r}",
+    )
+
+  def test_constrained_generation_batch(self):
+    """Constraint works for batched inputs."""
+    sampler, vocab, constraint = self._make_sampler_and_constraint()
+
+    result = sampler(
+        ["input string", "hello world"],
+        max_generation_steps=20,
+        constraint_tables=constraint,
+    )
+
+    for i, text in enumerate(result.text):
+      self.assertRegex(
+          text,
+          _CATEGORY_REGEX,
+          f"Batch item {i}: {text!r} does not match regex",
+      )
+
+  def test_constrained_generation_with_temperature(self):
+    """Constraint holds under temperature sampling."""
+    sampler, vocab, constraint = self._make_sampler_and_constraint()
+
+    result = sampler(
+        ["input string"],
+        max_generation_steps=20,
+        temperature=1.0,
+        seed=42,
+        constraint_tables=constraint,
+    )
+
+    generated_text = result.text[0]
+    self.assertRegex(
+        generated_text,
+        _CATEGORY_REGEX,
+        f"With temperature=1.0: {generated_text!r} does not match regex",
+    )
+
+  def test_unconstrained_generation_differs(self):
+    """Without constraint, the micro-model does NOT produce valid JSON."""
+    sampler, vocab, constraint = self._make_sampler_and_constraint()
+
+    result_unconstrained = sampler(
+        ["input string"],
+        max_generation_steps=20,
+    )
+
+    # The unconstrained micro-model output should NOT match the regex.
+    unconstrained_text = result_unconstrained.text[0]
+    match = re.fullmatch(_CATEGORY_REGEX, unconstrained_text)
+    self.assertIsNone(
+        match,
+        "Unconstrained output unexpectedly matches regex: "
+        f"{unconstrained_text!r}",
+    )
+
+  def test_sampler_compile_constraint_pattern(self):
+    """Sampler.compile_constraint with pattern and automatic compile via constraint_pattern."""
+    sampler, vocab, _ = self._make_sampler_and_constraint()
+
+    # Test explicit compile_constraint
+    tables = sampler.compile_constraint(pattern=_CATEGORY_REGEX)
+    self.assertIsInstance(tables, constrained.ConstraintTables)
+    self.assertGreater(tables.num_states, 0)
+
+    # Test automatic compilation via constraint_pattern
+    result = sampler(
+        ["input string"],
+        max_generation_steps=20,
+        constraint_pattern=_CATEGORY_REGEX,
+    )
+    self.assertRegex(result.text[0], _CATEGORY_REGEX)
+
+  def test_sampler_compile_constraint_schema(self):
+    """Sampler.compile_constraint with JSON schema."""
+    sampler, vocab, _ = self._make_sampler_and_constraint()
+    schema = {
+        "type": "object",
+        "properties": {
+            "label": {"type": "string", "maxLength": 5},
+        },
+        "required": ["label"],
+    }
+
+    # Test explicit compile_constraint
+    tables = sampler.compile_constraint(schema=schema)
+    self.assertIsInstance(tables, constrained.ConstraintTables)
+    self.assertGreater(tables.num_states, 0)
+
+  def test_diagnose_constraint_tables(self):
+    """diagnose_constraint_tables produces valid metadata."""
+    sampler, vocab, constraint = self._make_sampler_and_constraint()
+    diag = constrained.diagnose_constraint_tables(
+        constraint, token_id_to_str=sampler.tokenizer.token_id_to_str
+    )
+    self.assertEqual(diag["num_states"], constraint.num_states)
+    self.assertEqual(diag["vocab_size"], vocab.GetPieceSize())
+    self.assertIsInstance(diag["per_state"], list)
+    self.assertIsInstance(diag["dead_end_states"], list)
+
+  def test_constraint_tables_metadata(self):
+    """Verify constraint tables have expected structure."""
+    _, vocab, constraint = self._make_sampler_and_constraint()
+
+    self.assertEqual(
+        constraint.token_transitions.shape,
+        (constraint.num_states, vocab.GetPieceSize()),
+    )
+    self.assertEqual(constraint.token_transitions.dtype, np.int32)
+    self.assertGreater(constraint.num_states, 0)
+    self.assertLen(constraint.accept_states, 1)  # single accept state
+
+  def test_deterministic_state_fast_forward_analysis(self):
+    """Verify DFA identifies deterministic (single valid token) states for fast forwarding."""
+    vocab = {0: "hello ", 1: "world", 2: "there", 3: ""}
+    tables = constrained.build_regex_constraint(
+        pattern="hello (world|there)",
+        token_id_to_str=vocab,
+        vocab_size=4,
+        eos_token_ids=[3],
+    )
+
+    valid_counts = (tables.token_transitions != constrained.INVALID_STATE).sum(
+        axis=1
+    )
+
+    # Initial state should only accept token 0 ('hello ') -> deterministic state
+    initial_valid = valid_counts[tables.initial_state]
+    self.assertEqual(initial_valid, 1)
+
+    next_state = tables.token_transitions[tables.initial_state, 0]
+    # State after 'hello ' should accept 2 tokens ('world' and 'there') -> branching state
+    branch_valid = valid_counts[next_state]
+    self.assertEqual(branch_valid, 2)
+
+  def test_shared_prefix_fast_forward_chain(self):
+    """Shared prefix literal forms a deterministic fast-forward chain."""
+    vocab = {0: "prefix_", 1: "choice_a", 2: "choice_b", 3: ""}
+    tables = constrained.build_regex_constraint(
+        pattern="prefix_(choice_a|choice_b)",
+        token_id_to_str=vocab,
+        vocab_size=4,
+        eos_token_ids=[3],
+    )
+
+    state = tables.initial_state
+    # State 0 must deterministically transition on token 0 ('prefix_')
+    valid_tids = np.where(
+        tables.token_transitions[state] != constrained.INVALID_STATE
+    )[0]
+    self.assertListEqual(list(valid_tids), [0])
+
+    next_state = tables.token_transitions[state, 0]
+    # Next state branches between token 1 and 2
+    branch_tids = sorted(
+        np.where(
+            tables.token_transitions[next_state] != constrained.INVALID_STATE
+        )[0]
+    )
+    self.assertListEqual(branch_tids, [1, 2])
+
+  def test_verify_shared_prefix_fast_forward_branching(self):
+    """Char-level DFA verifies deterministic shared prefix and post-branch deterministic fast-forward."""
+    pattern = "(hyperparameterization|hyperparameters)"
+    nfa_s, nfa_a = constrained._regex_to_nfa(pattern)
+    ct, init, acc, ns = constrained._nfa_to_dfa(nfa_s, nfa_a)
+    ct, init, acc, ns = constrained._minimize_dfa(ct, init, acc, ns)
+
+    # 1. Trace deterministic prefix 'hyperparameter'
+    state = init
+    det_prefix_chars = []
+    while True:
+      valid_chars = [
+          chr(b)
+          for b in range(256)
+          if (state, chr(b)) in ct
+          and ct[(state, chr(b))] != constrained.INVALID_STATE
+      ]
+      if len(valid_chars) == 1:
+        ch = valid_chars[0]
+        det_prefix_chars.append(ch)
+        state = ct[(state, ch)]
+      else:
+        branch_state = state
+        branch_chars = sorted(valid_chars)
+        break
+
+    self.assertEqual("".join(det_prefix_chars), "hyperparameter")
+    self.assertListEqual(branch_chars, ["i", "s"])
+
+    # 2. Branch choice 'i' -> deterministic suffix 'zation' -> accept state
+    state_i = ct[(branch_state, "i")]
+    suffix_i = []
+    curr = state_i
+    while True:
+      valid = [
+          chr(b)
+          for b in range(256)
+          if (curr, chr(b)) in ct
+          and ct[(curr, chr(b))] != constrained.INVALID_STATE
+      ]
+      if len(valid) == 1:
+        ch = valid[0]
+        suffix_i.append(ch)
+        curr = ct[(curr, ch)]
+      else:
+        break
+    self.assertEqual("".join(suffix_i), "zation")
+    self.assertIn(curr, acc)
+
+    # 3. Branch choice 's' -> immediate accept state
+    state_s = ct[(branch_state, "s")]
+    self.assertIn(state_s, acc)
+
+  def test_generate_from_tokens_constrained(self):
+    """Constraint works with generate_from_tokens API too."""
+    sampler, vocab, constraint = self._make_sampler_and_constraint()
+
+    # Manually tokenize and pad.
+    input_ids = np.array(vocab.EncodeAsIds("input string"), dtype=np.int32)
+    # Left-pad to length 4.
+    padded = np.full((1, 4), vocab.pad_id(), dtype=np.int32)
+    padded[0, -len(input_ids) :] = input_ids
+
+    result = sampler.generate_from_tokens(
+        input_ids=padded,
+        max_generation_steps=20,
+        constraint_tables=constraint,
+    )
+
+    generated_text = result.text[0]
+    self.assertRegex(
+        generated_text,
+        _CATEGORY_REGEX,
+        f"generate_from_tokens: {generated_text!r} does not match regex",
+    )
+
+
+class RegexEngineTest(absltest.TestCase):
+  """Tests for the regex → DFA → token-transitions pipeline in isolation."""
+
+  def test_simple_alternation(self):
+    """Pattern 'a|b' accepts 'a' and 'b' only."""
+    vocab = {0: "a", 1: "b", 2: "c", 3: ""}
+    tables = constrained.build_regex_constraint(
+        pattern="a|b",
+        token_id_to_str=vocab,
+        vocab_size=4,
+        eos_token_ids=[3],
+    )
+    tt = tables.token_transitions
+    s0 = tables.initial_state
+
+    # 'a' and 'b' should lead to accept states.
+    self.assertIn(tt[s0, 0], tables.accept_states)
+    self.assertIn(tt[s0, 1], tables.accept_states)
+    # 'c' should be invalid.
+    self.assertEqual(tt[s0, 2], constrained.INVALID_STATE)
+
+  def test_repetition_star(self):
+    """Pattern 'a*' accepts '', 'a', 'aa', etc."""
+    vocab = {0: "a", 1: "b", 2: ""}
+    tables = constrained.build_regex_constraint(
+        pattern="a*",
+        token_id_to_str=vocab,
+        vocab_size=3,
+        eos_token_ids=[2],
+    )
+    tt = tables.token_transitions
+    s0 = tables.initial_state
+
+    # Empty string (EOS from initial) should be valid since a* matches ''.
+    self.assertIn(s0, tables.accept_states)
+    # 'a' should lead to an accept state.
+    s1 = tt[s0, 0]
+    self.assertNotEqual(s1, constrained.INVALID_STATE)
+    self.assertIn(s1, tables.accept_states)
+
+  def test_json_category_pattern(self):
+    """The actual JSON category regex compiles and works."""
+    vocab = {
+        0: "[",
+        1: "]",
+        2: '"',
+        3: ", ",
+        4: "none",
+        5: "spam",
+        6: "gore",
+        7: "hello",  # invalid
+        8: "",  # EOS
+    }
+    tables = constrained.build_regex_constraint(
+        pattern=_CATEGORY_REGEX,
+        token_id_to_str=vocab,
+        vocab_size=9,
+        eos_token_ids=[8],
+    )
+    tt = tables.token_transitions
+
+    # Trace ["spam"] through the transition table.
+    state = tables.initial_state
+    for tok in [0, 2, 5, 2, 1]:  # [, ", spam, ", ]
+      state = tt[state, tok]
+      self.assertNotEqual(
+          state, constrained.INVALID_STATE, f"Failed at token {tok}"
+      )
+    self.assertIn(state, tables.accept_states)
+
+    # Trace ["none", "gore"] — multi-category.
+    state = tables.initial_state
+    for tok in [0, 2, 4, 2, 3, 2, 6, 2, 1]:
+      state = tt[state, tok]
+      self.assertNotEqual(
+          state, constrained.INVALID_STATE, f"Failed at token {tok}"
+      )
+    self.assertIn(state, tables.accept_states)
+
+    # 'hello' should be invalid from all states.
+    for s in range(tables.num_states):
+      self.assertEqual(tt[s, 7], constrained.INVALID_STATE)
+
+  def test_verify_fast_forward_multi_char_analysis(self):
+    """Verify multi-character fast-forward state identification and transitions."""
+    schema = {
+        "type": "object",
+        "properties": {
+            "severity": {"enum": ["low", "medium", "high", "critical"]},
+        },
+        "required": ["severity"],
+    }
+    pattern = constrained.json_schema_to_regex(schema)
+
+    # Mock vocabulary with multi-char syntax and category tokens
+    vocab_map = {
+        0: "<pad>",
+        1: "<s>",
+        2: "</s>",
+        3: '{\n  "severity": "',
+        4: "low",
+        5: "medium",
+        6: "high",
+        7: "critical",
+        8: '"\n}',
+        9: '": "',
+        10: "severity",
+    }
+    tables = constrained.build_regex_constraint(
+        pattern=pattern,
+        token_id_to_str=vocab_map,
+        vocab_size=11,
+        eos_token_ids=[2],
+    )
+
+    valid_mask = tables.token_transitions != constrained.INVALID_STATE
+    ff_map = {}
+    for state in range(tables.num_states):
+      valid_tids = np.where(valid_mask[state])[0]
+      multi_char = [t for t in valid_tids if len(vocab_map.get(int(t), "")) > 1]
+      if multi_char:
+        best_tid = max(multi_char, key=lambda t: len(vocab_map.get(int(t), "")))
+        ff_map[state] = int(best_tid)
+
+    # Asserts multi-char fast-forward states exist
+    self.assertGreater(len(ff_map), 0)
+    init_s = tables.initial_state
+    self.assertIn(init_s, ff_map)
+    # Fast forward from initial state advances DFA
+    next_s = tables.token_transitions[init_s, ff_map[init_s]]
+    self.assertNotEqual(next_s, constrained.INVALID_STATE)
+
+  def test_constrained_logits_jit(self):
+    """constrained_logits compiles under jax.jit."""
+    vocab = {0: "a", 1: "b", 2: ""}
+    tables = constrained.build_regex_constraint(
+        pattern="a|b",
+        token_id_to_str=vocab,
+        vocab_size=3,
+        eos_token_ids=[2],
+    )
+    jax_tt = jnp.array(tables.token_transitions)
+    logits = jnp.ones((1, 1, 3))
+    states = jnp.array([tables.initial_state], dtype=jnp.int32)
+
+    result = jax.jit(constrained.constrained_logits)(logits, states, jax_tt)
+    self.assertEqual(result.shape, (1, 1, 3))
+
+  def test_while_loop_compatible(self):
+    """Constraint ops work inside jax.lax.while_loop."""
+    vocab = {0: "a", 1: "b", 2: ""}
+    tables = constrained.build_regex_constraint(
+        pattern="ab",
+        token_id_to_str=vocab,
+        vocab_size=3,
+        eos_token_ids=[2],
+    )
+    jax_tt = jnp.array(tables.token_transitions)
+    target = jnp.array([0, 1, 2])  # a, b, EOS
+    n = len(target)
+
+    def body(carry):
+      state, step, buf = carry
+      tok = target[step]
+      new_state = constrained.advance_state(state[None], tok[None], jax_tt)[0]
+      buf = buf.at[step].set(tok)
+      return new_state, step + 1, buf
+
+    def cond(carry):
+      _, step, _ = carry
+      return step < n
+
+    init = (
+        jnp.int32(tables.initial_state),
+        jnp.int32(0),
+        jnp.zeros(n, dtype=jnp.int32),
+    )
+    final_state, _, final_buf = jax.jit(
+        lambda: jax.lax.while_loop(cond, body, init)
+    )()
+
+    self.assertIn(int(final_state), tables.accept_states)
+    np.testing.assert_array_equal(np.asarray(final_buf), np.asarray(target))
+
+  def test_bounded_until_helper(self):
+    """Test bounded_until helper creates correct regex and DFA bounds."""
+    pattern = (
+        constrained.bounded_until("</thought>", min_chars=2, max_chars=4)
+        + r'\["(none|spam)"\]'
+    )
+    vocab = {
+        0: "a",
+        1: "b",
+        2: "<",
+        3: "/",
+        4: "t",
+        5: "h",
+        6: "o",
+        7: "u",
+        8: "g",
+        9: "h",
+        10: "t",
+        11: ">",
+        12: "[",
+        13: '"',
+        14: "none",
+        15: "spam",
+        16: "]",
+        17: "",
+    }
+    tables = constrained.build_regex_constraint(
+        pattern=pattern,
+        token_id_to_str=vocab,
+        vocab_size=18,
+        eos_token_ids=[17],
+    )
+
+    tt = tables.token_transitions
+    s0 = tables.initial_state
+
+    # State 0: min_chars=2 not reached yet.
+    # Should accept 'a' (token 0) or 'b' (token 1).
+    s1 = tt[s0, 0]
+    self.assertNotEqual(s1, constrained.INVALID_STATE)
+
+    # After 2 chars ('a' + 'b'), min length is met, terminal string is allowed.
+    s2 = tt[s1, 1]
+    self.assertNotEqual(s2, constrained.INVALID_STATE)
+
+  def test_quantifier_unrolling_state_scaling_assertion(self):
+    """Assert state count & memory scaling of unrolled quantifiers vs
+
+    un-bounded structural DFA.
+    """
+    schema_unbounded = {
+        "type": "object",
+        "properties": {
+            "analysis": {"type": "string"},
+        },
+        "required": ["analysis"],
+    }
+    pattern_unbounded = (
+        constrained.bounded_until("</thought>")
+        + "\n"
+        + constrained.json_schema_to_regex(schema_unbounded)
+    )
+    nfa_s, nfa_a = constrained._regex_to_nfa(pattern_unbounded)
+    ct, init, acc, ns_unbounded = constrained._nfa_to_dfa(nfa_s, nfa_a)
+
+    # Build unrolled patterns for max_chars = 5, 10, 20
+    states_minimized = []
+    for max_len in [5, 10, 20]:
+      schema_bounded = {
+          "type": "object",
+          "properties": {
+              "analysis": {
+                  "type": "string",
+                  "minLength": 2,
+                  "maxLength": max_len,
+              },
+          },
+          "required": ["analysis"],
+      }
+      pattern_bounded = (
+          constrained.bounded_until(
+              "</thought>", min_chars=2, max_chars=max_len
+          )
+          + "\n"
+          + constrained.json_schema_to_regex(schema_bounded)
+      )
+      nfa_s, nfa_a = constrained._regex_to_nfa(pattern_bounded)
+      ct, init, acc, n_unmin = constrained._nfa_to_dfa(nfa_s, nfa_a)
+      _, _, _, n_min = constrained._minimize_dfa(ct, init, acc, n_unmin)
+      states_minimized.append(n_min)
+
+    # 1. Unrolled quantifier DFA states strictly increase with max_chars
+    self.assertLess(states_minimized[0], states_minimized[1])
+    self.assertLess(states_minimized[1], states_minimized[2])
+
+    # 2. Memory footprint scales with max_len (max_len=20 vs max_len=5)
+    mem_mb_5 = states_minimized[0] * 262144 * 4 / (1024**2)
+    mem_mb_20 = states_minimized[2] * 262144 * 4 / (1024**2)
+    self.assertGreater(mem_mb_20, mem_mb_5)
+
+  def test_json_schema_string_basic(self):
+    """Basic string schema produces bounded character class."""
+    pattern = constrained.json_schema_to_regex(
+        {"type": "string"}, max_string_chars=50
+    )
+    self.assertEqual(pattern, '"([^"]{0,50})"')
+    # Validate against DFA.
+    self._assert_dfa_accepts(pattern, '"hello"')
+    self._assert_dfa_accepts(pattern, '""')
+    self._assert_dfa_rejects(pattern, "hello")
+    self._assert_dfa_rejects(pattern, "42")
+
+  def test_json_schema_string_length(self):
+    """minLength / maxLength constrain the character class quantifier."""
+    pattern = constrained.json_schema_to_regex(
+        {"type": "string", "minLength": 2, "maxLength": 5}
+    )
+    self.assertEqual(pattern, '"([^"]{2,5})"')
+    self._assert_dfa_accepts(pattern, '"ab"')
+    self._assert_dfa_accepts(pattern, '"abcde"')
+    self._assert_dfa_rejects(pattern, '"a"')
+    self._assert_dfa_rejects(pattern, '"abcdef"')
+
+  def test_json_schema_string_pattern(self):
+    """Explicit pattern is passed through (anchors stripped)."""
+    pattern = constrained.json_schema_to_regex(
+        {"type": "string", "pattern": "^[a-z]+$"}
+    )
+    self.assertEqual(pattern, '"([a-z]+)"')
+    self._assert_dfa_accepts(pattern, '"abc"')
+    self._assert_dfa_rejects(pattern, '"ABC"')
+
+  def test_json_schema_string_format_date(self):
+    """Known format produces a built-in pattern."""
+    pattern = constrained.json_schema_to_regex(
+        {"type": "string", "format": "date"}
+    )
+    self._assert_dfa_accepts(pattern, '"2025-01-15"')
+    self._assert_dfa_rejects(pattern, '"not-a-date"')
+
+  def test_json_schema_integer(self):
+    pattern = constrained.json_schema_to_regex({"type": "integer"})
+    self.assertEqual(pattern, r"-?[0-9]+")
+    self._assert_dfa_accepts(pattern, "42")
+    self._assert_dfa_accepts(pattern, "-7")
+    self._assert_dfa_rejects(pattern, "3.14")
+
+  def test_json_schema_number(self):
+    pattern = constrained.json_schema_to_regex({"type": "number"})
+    self._assert_dfa_accepts(pattern, "42")
+    self._assert_dfa_accepts(pattern, "3.14")
+    self._assert_dfa_accepts(pattern, "-1.5")
+
+  def test_json_schema_boolean(self):
+    pattern = constrained.json_schema_to_regex({"type": "boolean"})
+    self._assert_dfa_accepts(pattern, "true")
+    self._assert_dfa_accepts(pattern, "false")
+    self._assert_dfa_rejects(pattern, "True")
+
+  def test_json_schema_null(self):
+    pattern = constrained.json_schema_to_regex({"type": "null"})
+    self._assert_dfa_accepts(pattern, "null")
+    self._assert_dfa_rejects(pattern, "None")
+
+  def test_json_schema_enum_strings(self):
+    pattern = constrained.json_schema_to_regex({"enum": ["low", "high"]})
+    self._assert_dfa_accepts(pattern, '"low"')
+    self._assert_dfa_accepts(pattern, '"high"')
+    self._assert_dfa_rejects(pattern, '"medium"')
+
+  def test_json_schema_enum_mixed(self):
+    """Mixed-type enum serializes each value to its JSON literal."""
+    pattern = constrained.json_schema_to_regex({"enum": [1, "x", True, None]})
+    self._assert_dfa_accepts(pattern, "1")
+    self._assert_dfa_accepts(pattern, '"x"')
+    self._assert_dfa_accepts(pattern, "true")
+    self._assert_dfa_accepts(pattern, "null")
+    self._assert_dfa_rejects(pattern, '"y"')
+
+  def test_json_schema_const(self):
+    pattern = constrained.json_schema_to_regex({"const": "fixed"})
+    self._assert_dfa_accepts(pattern, '"fixed"')
+    self._assert_dfa_rejects(pattern, '"other"')
+
+  def test_json_schema_object_simple(self):
+    schema = {
+        "type": "object",
+        "properties": {
+            "x": {"type": "integer"},
+            "y": {"type": "boolean"},
+        },
+        "required": ["x", "y"],
+    }
+    pattern = constrained.json_schema_to_regex(schema)
+    self._assert_dfa_accepts(pattern, '{\n  "x": 42,\n  "y": true\n}')
+    self._assert_dfa_rejects(pattern, "{}")
+
+  def test_json_schema_object_nested(self):
+    """Nested objects get correct multi-level indentation."""
+    schema = {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "maxLength": 10},
+            "inner": {
+                "type": "object",
+                "properties": {
+                    "val": {"type": "integer"},
+                },
+            },
+        },
+    }
+    pattern = constrained.json_schema_to_regex(schema)
+    expected_json = '{\n  "name": "hi",\n  "inner": {\n    "val": 99\n  }\n}'
+    self._assert_dfa_accepts(pattern, expected_json)
+
+  def test_json_schema_array_basic(self):
+    schema = {
+        "type": "array",
+        "items": {"type": "integer"},
+        "maxItems": 5,
+    }
+    pattern = constrained.json_schema_to_regex(schema)
+    self._assert_dfa_accepts(pattern, "[]")
+    self._assert_dfa_accepts(pattern, "[1]")
+    self._assert_dfa_accepts(pattern, "[1, 2, 3]")
+
+  def test_json_schema_array_bounds(self):
+    schema = {
+        "type": "array",
+        "items": {"type": "integer"},
+        "minItems": 2,
+        "maxItems": 3,
+    }
+    pattern = constrained.json_schema_to_regex(schema)
+    self._assert_dfa_accepts(pattern, "[1, 2]")
+    self._assert_dfa_accepts(pattern, "[1, 2, 3]")
+    self._assert_dfa_rejects(pattern, "[1]")
+
+  def test_json_schema_array_prefix_items(self):
+    """Tuple validation via prefixItems."""
+    schema = {
+        "type": "array",
+        "prefixItems": [
+            {"type": "string", "maxLength": 5},
+            {"type": "integer"},
+        ],
+    }
+    pattern = constrained.json_schema_to_regex(schema)
+    self._assert_dfa_accepts(pattern, '["hi", 42]')
+    self._assert_dfa_rejects(pattern, '[42, "hi"]')
+
+  def test_json_schema_anyof(self):
+    schema = {
+        "anyOf": [{"type": "string", "maxLength": 10}, {"type": "integer"}]
+    }
+    pattern = constrained.json_schema_to_regex(schema)
+    self._assert_dfa_accepts(pattern, '"hello"')
+    self._assert_dfa_accepts(pattern, "42")
+
+  def test_json_schema_oneof(self):
+    """oneOf is treated identically to anyOf at the regex level."""
+    schema = {"oneOf": [{"type": "boolean"}, {"type": "null"}]}
+    pattern = constrained.json_schema_to_regex(schema)
+    self._assert_dfa_accepts(pattern, "true")
+    self._assert_dfa_accepts(pattern, "null")
+
+  def test_json_schema_allof_merge(self):
+    """allOf merges constraints before converting."""
+    schema = {
+        "allOf": [
+            {"type": "string"},
+            {"maxLength": 5},
+        ]
+    }
+    pattern = constrained.json_schema_to_regex(schema)
+    self.assertEqual(pattern, '"([^"]{0,5})"')
+
+  def test_json_schema_multi_type_nullable(self):
+    """type as list (e.g. nullable) produces alternation."""
+    schema = {"type": ["string", "null"], "maxLength": 10}
+    pattern = constrained.json_schema_to_regex(schema)
+    self._assert_dfa_accepts(pattern, '"hi"')
+    self._assert_dfa_accepts(pattern, "null")
+    self._assert_dfa_rejects(pattern, "42")
+
+  def test_json_schema_empty_object(self):
+    """Object with no properties matches empty JSON object."""
+    schema = {"type": "object"}
+    pattern = constrained.json_schema_to_regex(schema)
+    self._assert_dfa_accepts(pattern, "{}")
+
+  def test_json_schema_unsupported_raises(self):
+    """Empty schema with no type raises ValueError."""
+    with self.assertRaises(ValueError):
+      constrained.json_schema_to_regex({})
+
+  def test_progressive_constrained_grammar_levels(self):
+    """Test progressive levels of regex grammar complexity (bare alternation -> full schema)."""
+    levels = [
+        {
+            "name": "Level 0: Bare alternation",
+            "pattern": "(low|medium|high|critical)",
+            "valid": ["low", "medium", "high", "critical"],
+            "invalid": ["hello", "LOW", "lo", ""],
+        },
+        {
+            "name": "Level 1: JSON category array",
+            "pattern": r'\["(none|spam|gore)"(, "(none|spam|gore)")*\]',
+            "valid": [
+                '["none"]',
+                '["spam", "gore"]',
+                '["none", "spam", "gore"]',
+            ],
+            "invalid": ["[]", '["hello"]', "none", '["none"'],
+        },
+        {
+            "name": "Level 2: Severity enum",
+            "pattern": r'\{"severity": "(low|medium|high|critical)"\}',
+            "valid": ['{"severity": "low"}', '{"severity": "critical"}'],
+            "invalid": ['{"severity": "none"}', '{"severity": low}'],
+        },
+        {
+            "name": "Level 3: Full schema pattern",
+            "pattern": (
+                constrained.bounded_until("</thought>")
+                + "\n"
+                + constrained.json_schema_to_regex({
+                    "type": "object",
+                    "properties": {
+                        "analysis": {"type": "string", "maxLength": 15},
+                        "severity": {
+                            "enum": ["low", "medium", "high", "critical"]
+                        },
+                    },
+                    "required": ["analysis", "severity"],
+                })
+            ),
+            "valid": [
+                '<thought>Reviewing.</thought>\n{\n  "analysis": "Insult",\n '
+                ' "severity": "high"\n}'
+            ],
+            "invalid": ['{"severity": "high"}', "just text"],
+        },
+    ]
+
+    for lvl in levels:
+      pattern = lvl["pattern"]
+      # Validate DFA string acceptance/rejection across all levels
+      for val in lvl["valid"]:
+        self._assert_dfa_accepts(pattern, val)
+      for inv in lvl["invalid"]:
+        self._assert_dfa_rejects(pattern, inv)
+
+  def test_token_surface_additivity_invariant(self):
+    """Assert token surface concatenation matches full sequence decode."""
+    vocab_map = {
+        0: "<pad>",
+        1: "<s>",
+        2: "</s>",
+        3: "{\n  ",
+        4: '"analysis": "',
+        5: "harmful",
+        6: '",\n  ',
+        7: '"severity": "',
+        8: "high",
+        9: '"\n}',
+    }
+    token_seq = [3, 4, 5, 6, 7, 8, 9]
+    concatenated = "".join(vocab_map[t] for t in token_seq)
+    expected = '{\n  "analysis": "harmful",\n  "severity": "high"\n}'
+    self.assertEqual(concatenated, expected)
+
+  def test_dfa_simulation_equivalence_across_token_boundaries(self):
+    """Assert token-by-token DFA simulation reaches same accept state as full string simulation."""
+    pattern = r'\{"severity": "(low|medium|high|critical)"\}'
+    nfa_s, nfa_a = constrained._regex_to_nfa(pattern)
+    ct, init, acc, ns = constrained._nfa_to_dfa(nfa_s, nfa_a)
+    ct, init, acc, ns = constrained._minimize_dfa(ct, init, acc, ns)
+
+    token_surfaces = ['{"severity": "', "high", '"}']
+
+    # 1. Full string char-by-char step
+    full_str = "".join(token_surfaces)
+    state_str = init
+    for ch in full_str:
+      state_str = constrained._dfa_step(ct, state_str, ch)
+
+    # 2. Token-by-token surface step
+    state_tok = init
+    for tok_surface in token_surfaces:
+      for ch in tok_surface:
+        state_tok = constrained._dfa_step(ct, state_tok, ch)
+
+    self.assertEqual(state_str, state_tok)
+    self.assertIn(state_tok, acc)
+
+  def _assert_dfa_accepts(self, pattern: str, text: str):
+    """Assert the DFA built from *pattern* accepts *text*."""
+    nfa_s, nfa_a = constrained._regex_to_nfa(pattern)
+    ct, init, acc, _ = constrained._nfa_to_dfa(nfa_s, nfa_a)
+    ct, init, acc, _ = constrained._minimize_dfa(ct, init, acc, _)
+    self.assertTrue(
+        constrained.validate_string(text, ct, init, acc),
+        f"DFA should accept {text!r} for pattern {pattern!r}",
+    )
+
+  def _assert_dfa_rejects(self, pattern: str, text: str):
+    """Assert the DFA built from *pattern* rejects *text*."""
+    nfa_s, nfa_a = constrained._regex_to_nfa(pattern)
+    ct, init, acc, _ = constrained._nfa_to_dfa(nfa_s, nfa_a)
+    ct, init, acc, _ = constrained._minimize_dfa(ct, init, acc, _)
+    self.assertFalse(
+        constrained.validate_string(text, ct, init, acc),
+        f"DFA should reject {text!r} for pattern {pattern!r}",
+    )
+
+
+if __name__ == "__main__":
+  absltest.main()

@@ -28,13 +28,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import qwix
+import sentencepiece as spm
 import tenacity
 from tunix.models.gemma3 import merge_embeddings as merge_embeddings_lib
 from tunix.models.gemma3 import utils as gemma_utils
 from tunix.rl import reshard
 from tunix.utils import env_utils
-
-import sentencepiece as spm
 
 env_utils.setup_sharding_environment()
 
@@ -276,8 +275,9 @@ class MockVocab(spm.SentencePieceProcessor):
   }
 
   def __init__(
-      self, mapping_text_to_id: dict[str, int] | None = None,
-      is_multimodal=False
+      self,
+      mapping_text_to_id: dict[str, int] | None = None,
+      is_multimodal=False,
   ):
     super().__init__()
     self._start_id = 3
@@ -302,6 +302,10 @@ class MockVocab(spm.SentencePieceProcessor):
 
   def GetPieceSize(self) -> int:  # pylint: disable=invalid-name
     return self._vocab_size
+
+  def IdToPiece(self, id: int) -> str:  # pylint: disable=invalid-name
+    reverse_mapping = {v: k for k, v in self._mapping_text_to_id.items()}
+    return reverse_mapping.get(id, '')
 
   def DecodeIds(self, ids: Iterable[int]) -> str:  # pylint: disable=invalid-name
     reverse_mapping = {v: k for k, v in self._mapping_text_to_id.items()}

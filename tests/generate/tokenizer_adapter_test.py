@@ -14,11 +14,10 @@
 
 #
 
-from absl.testing import absltest
 from unittest import mock
+from absl.testing import absltest
 import transformers
 from tunix.generate import tokenizer_adapter as adapter
-
 
 AutoTokenizer = transformers.AutoTokenizer
 
@@ -48,8 +47,10 @@ class TokenizerAdapterTest(absltest.TestCase):
       model = 'meta-llama/Meta-Llama-3-8B-Instruct'
     hf_tokenizer = AutoTokenizer.from_pretrained(model)
     tokenizer_adapter = adapter.TokenizerAdapter(hf_tokenizer)
-    self.assertEqual(
-        tokenizer_adapter._tokenizer_type, adapter.TokenizerType.HF
+    self.assertTrue(
+        isinstance(
+            tokenizer_adapter.tokenizer, transformers.PreTrainedTokenizerBase
+        )
     )
     self.assertIsNotNone(tokenizer_adapter.bos_id())
     self.assertIsNotNone(tokenizer_adapter.eos_id())
@@ -66,7 +67,6 @@ class TokenizerTest(absltest.TestCase):
   def test_default_tokenizer(self):
     tokenizer = adapter.Tokenizer()
     self.assertEqual(tokenizer.tokenizer_type, 'sentencepiece')
-    self.assertIsNotNone(tokenizer._tokenizer_type, adapter.TokenizerType.SP)
 
 
 if __name__ == '__main__':
