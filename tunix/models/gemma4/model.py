@@ -429,8 +429,9 @@ class ShardingConfig:
         exp_weight_efd=_prepend(self.exp_weight_efd),
         per_layer_input_gate=_prepend(self.per_layer_input_gate),
         per_layer_projection=_prepend(self.per_layer_projection),
-        # activation specs, embedder-level weights, and per-layer projection
-        # are NOT inside scan groups — leave them unchanged.
+        # activation specs and embedder-level weights
+        # (per_layer_model_projection, per_layer_input_embedding) are NOT
+        # inside scan groups — leave them unchanged.
     )
 
 
@@ -2271,6 +2272,11 @@ class Gemma4(BackendMappingMixin, nnx.Module):
                 vs.append(c["v"])
                 end_indices.append(c["end_index"])
               else:
+                # Shared-layer slots in the stacked cache are zero-initialized
+                # placeholders. The scan body writes to them, but the values
+                # are never read because the kv_override path swaps in the
+                # origin layer's real cache. Consumers must check
+                # kv_cache_sharing_patterns before reading scan cache slots.
                 ks.append(jnp.zeros(k_shape, dtype=k_dtype))
                 vs.append(jnp.zeros(v_shape, dtype=v_dtype))
                 end_indices.append(
@@ -2293,9 +2299,19 @@ class Gemma4(BackendMappingMixin, nnx.Module):
 
       # --- Compute sharing metadata for cross-group KV forwarding ---
       # origin_sub_indices: for each sub-layer position, which sub-position
-      # holds its origin cache.  Constant across groups.
-      origin_sub_indices = list(range(pattern_len))
-      is_origin_sub = [False] * pattern_len
+      # holds its origin cache. Since the attention pattern is periodic across
+      # scan groups, this is constant for all groups and can be inspected from
+      # the last scan group.
+      origin_sub_indices = [
+          self.kv_cache_sharing_patterns[
+              (num_scan_groups - 1) * pattern_len + s
+          ]
+          % pattern_len
+          for s in range(pattern_len)
+      ]
+      is_origin_sub = [
+          origin_sub_indices[s] != s for s in range(pattern_len)
+      ]
       is_shared_per_group = np.zeros(
           (num_scan_groups, pattern_len), dtype=np.bool_
       )
@@ -2310,14 +2326,17 @@ class Gemma4(BackendMappingMixin, nnx.Module):
           if origin_idx != layer_idx:
             has_sharing = True
             is_shared_per_group[g, s] = True
-            origin_sub_indices[s] = origin_idx % pattern_len
             origin_g = origin_idx // pattern_len
-            is_origin_per_group[origin_g, origin_idx % pattern_len] = True
-            is_origin_sub[origin_idx % pattern_len] = True
+            is_origin_per_group[origin_g, origin_sub_indices[s]] = True
 
       is_shared_jax: jaxtyping.Array | None = None
       is_origin_jax: jaxtyping.Array | None = None
       if has_sharing:
+        if np.any(is_shared_per_group[: self.num_unshared_groups]):
+          raise RuntimeError(
+              "Unshared scan groups contain shared layers. Shared layers are"
+              " only permitted in shared scan groups."
+          )
         is_shared_jax = jnp.array(is_shared_per_group)
         is_origin_jax = jnp.array(is_origin_per_group)
 
