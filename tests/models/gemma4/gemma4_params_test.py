@@ -931,7 +931,7 @@ class BuildShardedRestoreTargetTest(absltest.TestCase):
         }
     }
     stacked = params._stack_layers_for_scan(
-        dummy_params, num_layers=2, pattern_len=1
+        dummy_params, num_layers=2, pattern_len=1, frac_shared_layers=0.0
     )
     self.assertIn('scan_groups', stacked)
     self.assertIn('sub_layers', stacked['scan_groups'])
