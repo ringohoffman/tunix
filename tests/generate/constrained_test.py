@@ -725,12 +725,14 @@ class RegexEngineTest(absltest.TestCase):
     self.assertGreater(mem_mb_20, mem_mb_5)
 
   def test_json_schema_string_basic(self):
-    """Basic string schema produces character class."""
+    """Basic string schema produces character class with escaped quote support."""
     pattern = constrained.json_schema_to_regex({"type": "string"})
-    self.assertEqual(pattern, r'"([^"]*)"')
+    self.assertEqual(pattern, r'"([^"\\]|\\.)*"')
     # Validate against DFA.
     self._assert_dfa_accepts(pattern, '"hello"')
     self._assert_dfa_accepts(pattern, '""')
+    self._assert_dfa_accepts(pattern, r'"hello \"world\""')
+    self._assert_dfa_accepts(pattern, r'"back\\slash"')
     self._assert_dfa_rejects(pattern, "hello")
     self._assert_dfa_rejects(pattern, "42")
 
@@ -739,7 +741,7 @@ class RegexEngineTest(absltest.TestCase):
     pattern = constrained.json_schema_to_regex(
         {"type": "string", "minLength": 2, "maxLength": 5}
     )
-    self.assertEqual(pattern, '"([^"]{2,5})"')
+    self.assertEqual(pattern, r'"([^"\\]|\\.){2,5}"')
     self._assert_dfa_accepts(pattern, '"ab"')
     self._assert_dfa_accepts(pattern, '"abcde"')
     self._assert_dfa_rejects(pattern, '"a"')
@@ -1210,7 +1212,7 @@ class RegexEngineTest(absltest.TestCase):
         ]
     }
     pattern = constrained.json_schema_to_regex(schema)
-    self.assertEqual(pattern, '"([^"]{0,5})"')
+    self.assertEqual(pattern, r'"([^"\\]|\\.){0,5}"')
 
   def test_json_schema_multi_type_nullable(self):
     """type as list (e.g. nullable) produces alternation."""
@@ -1363,6 +1365,148 @@ class RegexEngineTest(absltest.TestCase):
     # Check that frozen key is hashable
     d = {frozen1: "value"}
     self.assertEqual(d[frozen2], "value")
+
+  def test_bounded_until_token_bounds(self):
+    """Test bounded_until helper creates correct {{min,max}} token quantifier
+
+    syntax.
+    """
+    pattern = constrained.bounded_until(
+        "</thought>", min_tokens=2, max_tokens=5
+    )
+    self.assertEqual(pattern, r"(.{{2,5}}</thought>)")
+
+    # Test error if both char and token bounds are provided
+    with self.assertRaises(ValueError):
+      constrained.bounded_until("</thought>", min_chars=1, min_tokens=1)
+
+  def test_extract_and_strip_token_quantifiers(self):
+    """Test extracting {{min,max}} token quantifiers."""
+    pattern = r"(.{{10,50}}</thought>)"
+    clean_pat, min_t, max_t = constrained._extract_and_strip_token_quantifiers(
+        pattern
+    )
+    self.assertEqual(clean_pat, r"(.*</thought>)")
+    self.assertEqual(min_t, 10)
+    self.assertEqual(max_t, 50)
+
+  def test_token_bounds_logits_masking(self):
+    """Test constrained_logits mask application for min_tokens and max_tokens using TokenBoundsLoopState."""
+    # 2 states: state 0 (non-accept), state 1 (accept)
+    # Vocab size 2: token 0 -> state 0, token 1 -> state 1 (accept)
+    tt = np.array([[0, 1], [1, 1]], dtype=np.int32)
+    tables = constrained.ConstraintTables(
+        token_transitions=tt,
+        initial_state=0,
+        num_states=2,
+        accept_states=frozenset([1]),
+        min_tokens=2,
+        max_tokens=4,
+    )
+    tables = constrained.prepare_token_bound_masks(tables)
+
+    logits = jnp.zeros((1, 1, 2), dtype=jnp.float32)
+    state = jnp.array([0], dtype=jnp.int32)
+
+    # Step 0 (< min_tokens=2): token 1 (accept transition) should be masked
+    bounds_state_0 = constrained.TokenBoundsLoopState(
+        count=jnp.array([0], dtype=jnp.int32),
+        accept_mask=jnp.array(tables.accept_mask, dtype=jnp.bool_),
+        force_accept_mask=jnp.array(tables.force_accept_mask, dtype=jnp.bool_),
+        min_tokens=2,
+        max_tokens=4,
+    )
+    masked_0 = constrained.constrained_logits(
+        logits, state, tt, token_bounds_state=bounds_state_0
+    )
+    self.assertTrue(jnp.isinf(masked_0[0, 0, 1]))
+    self.assertEqual(masked_0[0, 0, 0], 0.0)
+
+    # Step 4 (>= max_tokens=4): should force accept transition (token 1)
+    bounds_state_4 = constrained.TokenBoundsLoopState(
+        count=jnp.array([4], dtype=jnp.int32),
+        accept_mask=jnp.array(tables.accept_mask, dtype=jnp.bool_),
+        force_accept_mask=jnp.array(tables.force_accept_mask, dtype=jnp.bool_),
+        min_tokens=2,
+        max_tokens=4,
+    )
+    masked_4 = constrained.constrained_logits(
+        logits, state, tt, token_bounds_state=bounds_state_4
+    )
+    self.assertTrue(jnp.isinf(masked_4[0, 0, 0]))
+    self.assertEqual(masked_4[0, 0, 1], 0.0)
+
+  def test_token_bounds_exhaustive_simulation(self):
+    """Exhaustively traverse decoding paths to prove min_tokens and max_tokens bounds."""
+    # Pattern: .{{2,4}} followed by terminal '>'
+    pattern = r"(.{{2,4}}>)"
+    token_map = {0: "a", 1: "b", 2: ">"}
+    vocab_size = 3
+    tables = constrained.build_regex_constraint(
+        pattern, token_map, vocab_size, eos_token_ids=[99]
+    )
+
+    self.assertEqual(tables.min_tokens, 2)
+    self.assertEqual(tables.max_tokens, 4)
+
+    # Simulate generation paths
+    tt = jnp.array(tables.token_transitions, dtype=jnp.int32)
+    init_bounds = constrained.init_token_bounds_loop_state(tables, batch_size=1)
+    stack = [(tables.initial_state, init_bounds, [])]
+    accepted_histories = []
+
+    while stack:
+      curr_state, bounds_st, history = stack.pop()
+      if curr_state in tables.accept_states:
+        count = int(bounds_st.count[0])
+        accepted_histories.append((count, history))
+        continue
+      if bounds_st.count[0] > 10:  # safety ceiling
+        continue
+
+      logits = jnp.zeros((1, 1, vocab_size), dtype=jnp.float32)
+      c_state = jnp.array([curr_state], dtype=jnp.int32)
+
+      masked = constrained.constrained_logits(
+          logits,
+          c_state,
+          tt,
+          token_bounds_state=bounds_st,
+      )
+      valid_next_tokens = jnp.where(masked[0, 0] > -jnp.inf)[0].tolist()
+
+      next_bounds_st = constrained.advance_token_bounds_state(bounds_st)
+      for tok in valid_next_tokens:
+        next_state = int(tt[curr_state, tok])
+        stack.append((next_state, next_bounds_st, history + [tok]))
+
+    # PROOF 1: Every accepted path has at least min_tokens (2)
+    for count, hist in accepted_histories:
+      self.assertGreaterEqual(
+          count, 2, f"Path {hist} accepted early at step {count} < min_tokens=2"
+      )
+
+    # PROOF 2: Every accepted path has at most max_tokens + terminal length (4 + 1 = 5)
+    for count, hist in accepted_histories:
+      self.assertLessEqual(
+          count, 5, f"Path {hist} exceeded max_tokens bounds at step {count}"
+      )
+
+    # PROOF 3: A 6-token sequence is NEVER accepted (max_tokens=4 forces completion by step 5)
+    six_token_paths = [h for count, h in accepted_histories if count >= 6]
+    self.assertEqual(
+        len(six_token_paths),
+        0,
+        f"Found accepted 6-token paths: {six_token_paths}",
+    )
+
+    # PROOF 4: A 1-token sequence is NEVER accepted (min_tokens=2 forbids completion at step 1)
+    one_token_paths = [h for count, h in accepted_histories if count < 2]
+    self.assertEqual(
+        len(one_token_paths),
+        0,
+        f"Found accepted 1-token paths: {one_token_paths}",
+    )
 
 
 if __name__ == "__main__":

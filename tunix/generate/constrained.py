@@ -692,13 +692,19 @@ class ConstraintTables:
 
   Attributes:
       token_transitions: Array of shape ``(num_states, vocab_size)`` with dtype
-        ``int32``.  Entry ``[s, t]`` is the DFA state after processing token
+        ``int32``. Entry ``[s, t]`` is the DFA state after processing token
         ``t`` from state ``s``, or ``INVALID_STATE`` if the token is forbidden.
       initial_state: The DFA start state.
       num_states: Total number of DFA states.
       accept_states: Set of accepting DFA state ids.
       unique_items: Optional ``UniqueItemsConstraint`` auxiliary metadata when
         enforcing uniqueItems.
+      min_tokens: Minimum tokens to generate before accepting state is allowed.
+      max_tokens: Maximum tokens allowed after which accepting state is forced.
+      accept_mask: Optional boolean array [num_states, vocab_size] indicating
+        transitions that enter an accept state.
+      force_accept_mask: Optional boolean array [num_states, vocab_size]
+        indicating transitions that move closer to an accept state.
   """
 
   token_transitions: np.ndarray  # [num_states, vocab_size], int32
@@ -706,6 +712,97 @@ class ConstraintTables:
   num_states: int
   accept_states: frozenset[int]
   unique_items: UniqueItemsConstraint | None = None
+  min_tokens: int = 0
+  max_tokens: int | None = None
+  accept_mask: np.ndarray | None = None
+  force_accept_mask: np.ndarray | None = None
+
+
+_TOKEN_QUANTIFIER_RE = re.compile(r"\{\{(\d*)(?:,(\d*))?\}\}")
+
+
+def _extract_and_strip_token_quantifiers(
+    pattern: str,
+) -> tuple[str, int, int | None]:
+  """Parse token quantifier {{min,max}} from pattern, strip it, and return
+
+  bounds.
+  """
+  min_tokens = 0
+  max_tokens = None
+
+  def _repl(match: re.Match[str]) -> str:
+    nonlocal min_tokens, max_tokens
+    g1, g2 = match.group(1), match.group(2)
+    if g2 is None:  # {{n}}
+      val = int(g1) if g1 else 0
+      min_tokens = val
+      max_tokens = val
+    else:  # {{min,max}}, {{min,}}, or {{,max}}
+      min_tokens = int(g1) if g1 else 0
+      max_tokens = int(g2) if g2 else None
+    return "*"
+
+  clean_pattern = _TOKEN_QUANTIFIER_RE.sub(_repl, pattern)
+  return clean_pattern, min_tokens, max_tokens
+
+
+def prepare_token_bound_masks(tables: ConstraintTables) -> ConstraintTables:
+  """Precompute accept_mask and force_accept_mask for token bounded decoding."""
+  if tables.min_tokens <= 0 and tables.max_tokens is None:
+    return tables
+
+  num_states = tables.num_states
+  vocab_size = tables.token_transitions.shape[1]
+  tt = tables.token_transitions
+  accept_states = tables.accept_states
+
+  # 1. accept_mask: True for (state, token) transitions where target state is an
+  # accept_state
+  accept_mask = np.zeros((num_states, vocab_size), dtype=bool)
+  for s in range(num_states):
+    for v in range(vocab_size):
+      next_s = tt[s, v]
+      if next_s != INVALID_STATE and next_s in accept_states:
+        accept_mask[s, v] = True
+
+  # 2. force_accept_mask: True for transitions that strictly decrease distance
+  # to accept_state
+  dist = np.full(num_states, 999999, dtype=np.int32)
+  for acc in accept_states:
+    dist[acc] = 0
+
+  changed = True
+  while changed:
+    changed = False
+    for s in range(num_states):
+      if s in accept_states:
+        continue
+      min_d = dist[s]
+      for v in range(vocab_size):
+        next_s = tt[s, v]
+        if next_s != INVALID_STATE:
+          if dist[next_s] + 1 < min_d:
+            min_d = dist[next_s] + 1
+      if min_d < dist[s]:
+        dist[s] = min_d
+        changed = True
+
+  force_accept_mask = np.zeros((num_states, vocab_size), dtype=bool)
+  for s in range(num_states):
+    for v in range(vocab_size):
+      next_s = tt[s, v]
+      if next_s != INVALID_STATE:
+        if dist[next_s] < dist[s]:
+          force_accept_mask[s, v] = True
+        elif dist[s] == 0:
+          force_accept_mask[s, v] = True
+
+  return dataclasses.replace(
+      tables,
+      accept_mask=accept_mask,
+      force_accept_mask=force_accept_mask,
+  )
 
 
 def validate_string(
@@ -802,6 +899,8 @@ def bounded_until(
     terminal: str,
     min_chars: int = 0,
     max_chars: int | None = None,
+    min_tokens: int = 0,
+    max_tokens: int | None = None,
 ) -> str:
   """Build a regex pattern matching arbitrary text until ``terminal``.
 
@@ -817,17 +916,46 @@ def bounded_until(
     ``.{n}T`` (dot wildcard). The DFA naturally tracks the terminal
     prefix through distinct states.
 
+  Supports character bounds (``min_chars``/``max_chars`` using ``{n,m}``)
+  or token bounds (``min_tokens``/``max_tokens`` using ``{{n,m}}``).
+
   Args:
       terminal: Stop string (e.g. ``"</thought>"``, ``'"'``).
       min_chars: Minimum characters before ``terminal`` is allowed.
       max_chars: Maximum characters after which ``terminal`` is forced.
+      min_tokens: Minimum tokens before ``terminal`` is allowed.
+      max_tokens: Maximum tokens after which ``terminal`` is forced.
 
   Returns:
       Regex pattern string suitable for :func:`build_regex_constraint`.
   """
+  if (min_tokens > 0 or max_tokens is not None) and (
+      min_chars > 0 or max_chars is not None
+  ):
+    raise ValueError(
+        "Cannot specify both character bounds (min_chars/max_chars) and token"
+        " bounds (min_tokens/max_tokens)."
+    )
+
   t_escaped = "".join(
       f"\\{c}" if c in r"[]()*+?.\$^|{}" else c for c in terminal
   )
+
+  if min_tokens > 0 or max_tokens is not None:
+    if max_tokens is None:
+      quantifier = f"{{{{{min_tokens},}}}}"
+    else:
+      quantifier = f"{{{{{min_tokens},{max_tokens}}}}}"
+
+    if len(terminal) == 1:
+      first_char = terminal[0]
+      escaped_first = (
+          f"\\{first_char}" if first_char in r"[]()*+?.\$^|{}" else first_char
+      )
+      return f"([^{escaped_first}]{quantifier}{t_escaped})"
+    else:
+      return f"(.{quantifier}{t_escaped})"
+
   if max_chars is None:
     quantifier = f"{{{min_chars},}}"
   else:
@@ -865,6 +993,8 @@ class JsonSchema(TypedDict, total=False):
   uniqueItems: bool
   minLength: int
   maxLength: int
+  minTokens: int
+  maxTokens: int
   pattern: str
   format: str
   anyOf: list[JsonSchema]
@@ -934,14 +1064,25 @@ def _string_schema_to_regex(schema: JsonSchema) -> str:
     if fmt in _STRING_FORMAT_PATTERNS:
       return f'"({_STRING_FORMAT_PATTERNS[fmt]})"'
 
+  char_pattern = r'([^"\\]|\\.)'
+
+  if "maxTokens" in schema or schema.get("minTokens", 0) > 0:
+    min_tok = schema.get("minTokens", 0)
+    max_tok = schema.get("maxTokens")
+    if max_tok is None:
+      quantifier = f"{{{{{min_tok},}}}}"
+    else:
+      quantifier = f"{{{{{min_tok},{max_tok}}}}}"
+    return f'"{char_pattern}{quantifier}"'
+
   min_len = schema.get("minLength", 0)
   if "maxLength" in schema:
     max_len = schema["maxLength"]
-    return f'"([^"]{{{min_len},{max_len}}})"'
+    return f'"{char_pattern}{{{min_len},{max_len}}}"'
   elif min_len > 0:
-    return f'"([^"]{{{min_len},}})"'
+    return f'"{char_pattern}{{{min_len},}}"'
   else:
-    return r'"([^"]*)"'
+    return f'"{char_pattern}*"'
 
 
 def _object_schema_to_regex(
@@ -1163,6 +1304,71 @@ def init_unique_items_loop_state(
       completion_map=jnp.array(info.item_completion_map, dtype=jnp.int32),
       min_items=info.min_items,
       max_items=info.max_items,
+  )
+
+
+@flax.struct.dataclass
+class TokenBoundsLoopState:
+  """JAX-compatible state for token-level min/max bounds inside while_loop.
+
+  Bundles the dynamic ``count`` with the static lookup masks and limits so they
+  can be carried as a single field in the sampling state.
+
+  Attributes:
+      count: Shape ``[B]``, int32 token step count per batch element.
+      accept_mask: Shape ``[S, V]``, bool mask for accept-entering transitions.
+      force_accept_mask: Shape ``[S, V]``, bool mask for force-accept
+        transitions.
+      min_tokens: Minimum required tokens.
+      max_tokens: Maximum allowed tokens.
+  """
+
+  count: jnp.ndarray  # [B] int32 — dynamic
+  accept_mask: jnp.ndarray  # [S, V] bool — static
+  force_accept_mask: jnp.ndarray  # [S, V] bool — static
+  min_tokens: int = flax.struct.field(pytree_node=False, default=0)
+  max_tokens: int | None = flax.struct.field(pytree_node=False, default=None)
+
+
+def init_token_bounds_loop_state(
+    tables: ConstraintTables,
+    batch_size: int,
+) -> TokenBoundsLoopState | None:
+  """Create a ``TokenBoundsLoopState`` from compiled ConstraintTables metadata."""
+  if tables.min_tokens <= 0 and tables.max_tokens is None:
+    return None
+
+  num_states = tables.num_states
+  vocab_size = tables.token_transitions.shape[1]
+  accept_mask = (
+      jnp.array(tables.accept_mask, dtype=jnp.bool_)
+      if tables.accept_mask is not None
+      else jnp.zeros((num_states, vocab_size), dtype=jnp.bool_)
+  )
+  force_accept_mask = (
+      jnp.array(tables.force_accept_mask, dtype=jnp.bool_)
+      if tables.force_accept_mask is not None
+      else jnp.zeros((num_states, vocab_size), dtype=jnp.bool_)
+  )
+  return TokenBoundsLoopState(
+      count=jnp.zeros((batch_size,), dtype=jnp.int32),
+      accept_mask=accept_mask,
+      force_accept_mask=force_accept_mask,
+      min_tokens=tables.min_tokens,
+      max_tokens=tables.max_tokens,
+  )
+
+
+def advance_token_bounds_state(
+    state: TokenBoundsLoopState,
+) -> TokenBoundsLoopState:
+  """Increment token step count in TokenBoundsLoopState."""
+  return TokenBoundsLoopState(
+      count=state.count + 1,
+      accept_mask=state.accept_mask,
+      force_accept_mask=state.force_accept_mask,
+      min_tokens=state.min_tokens,
+      max_tokens=state.max_tokens,
   )
 
 
@@ -1644,13 +1850,22 @@ def chain_constraints(
           num_items=u_num,
       )
 
-  return ConstraintTables(
+  min_tokens = max((st.min_tokens for st in compiled_stages), default=0)
+  max_tokens_list = [
+      st.max_tokens for st in compiled_stages if st.max_tokens is not None
+  ]
+  max_tokens = min(max_tokens_list) if max_tokens_list else None
+
+  tables = ConstraintTables(
       token_transitions=combined_tt,
       initial_state=initial_state,
       num_states=total_states,
       accept_states=accept_states,
       unique_items=unique_info,
+      min_tokens=min_tokens,
+      max_tokens=max_tokens,
   )
+  return prepare_token_bound_masks(tables)
 
 
 ConstraintItem: TypeAlias = str | JsonSchema | ConstraintTables
@@ -1764,6 +1979,7 @@ def constrained_logits_unique(
     constraint_state: jnp.ndarray,
     token_transitions: jnp.ndarray,
     unique_state: UniqueItemsLoopState,
+    token_bounds_state: TokenBoundsLoopState | None = None,
 ) -> jnp.ndarray:
   """Mask logits enforcing both structural DFA and uniqueness constraints.
 
@@ -1774,6 +1990,8 @@ def constrained_logits_unique(
       constraint_state: Shape ``[B]``, current DFA state.
       token_transitions: Shape ``[S, V]``, structural DFA transitions.
       unique_state: Bundled unique-items loop state.
+      token_bounds_state: Optional TokenBoundsLoopState carrying dynamic step
+        counts and static masks.
 
   Returns:
       Masked logits, same shape as input.
@@ -1781,6 +1999,23 @@ def constrained_logits_unique(
   # 1. Structural DFA constraint (same as constrained_logits).
   allowed_next = token_transitions[constraint_state]  # [B, V]
   structural_mask = allowed_next != INVALID_STATE  # [B, V]
+
+  if token_bounds_state is not None:
+    if token_bounds_state.min_tokens > 0:
+      acc_mask_curr = token_bounds_state.accept_mask[constraint_state]
+      min_forbid = (
+          token_bounds_state.count[:, None] < token_bounds_state.min_tokens
+      ) & acc_mask_curr
+      structural_mask = structural_mask & (~min_forbid)
+
+    if token_bounds_state.max_tokens is not None:
+      force_mask_curr = token_bounds_state.force_accept_mask[constraint_state]
+      max_force = (
+          token_bounds_state.count[:, None] >= token_bounds_state.max_tokens
+      )
+      structural_mask = jnp.where(
+          max_force, structural_mask & force_mask_curr, structural_mask
+      )
 
   # 2. Uniqueness constraint at item boundaries.
   # Block tokens that can ONLY lead to already-seen items.
@@ -2047,7 +2282,10 @@ def build_regex_constraint(
   Raises:
       ValueError: If *pattern* is malformed.
   """
-  nfa_start, nfa_accept = _regex_to_nfa(pattern)
+  clean_pattern, min_tokens, max_tokens = _extract_and_strip_token_quantifiers(
+      pattern
+  )
+  nfa_start, nfa_accept = _regex_to_nfa(clean_pattern)
   char_transitions, initial_state, accept_states, num_states = _nfa_to_dfa(
       nfa_start, nfa_accept
   )
@@ -2062,18 +2300,22 @@ def build_regex_constraint(
       vocab_size,
       eos_token_ids,
   )
-  return ConstraintTables(
+  tables = ConstraintTables(
       token_transitions=token_transitions,
       initial_state=initial_state,
       num_states=num_states,
       accept_states=accept_states,
+      min_tokens=min_tokens,
+      max_tokens=max_tokens,
   )
+  return prepare_token_bound_masks(tables)
 
 
 def constrained_logits(
     logits: jnp.ndarray,
     constraint_state: jnp.ndarray,
     token_transitions: jnp.ndarray,
+    token_bounds_state: TokenBoundsLoopState | None = None,
 ) -> jnp.ndarray:
   """Mask logits to enforce a regex constraint.
 
@@ -2088,6 +2330,8 @@ def constrained_logits(
       constraint_state: Current DFA state per batch element, shape ``[B]``.
       token_transitions: Token-level transition table of shape ``[S, V]`` where
         ``S`` is the number of DFA states and ``V`` is vocab size.
+      token_bounds_state: Optional TokenBoundsLoopState carrying dynamic step
+        counts, static masks, and bounds.
 
   Returns:
       Masked logits of the same shape as *logits*.
@@ -2095,6 +2339,22 @@ def constrained_logits(
   # allowed_next: [B, V] — look up the transition row for each batch item.
   allowed_next = token_transitions[constraint_state]  # [B, V]
   mask = allowed_next != INVALID_STATE  # [B, V]
+
+  if token_bounds_state is not None:
+    if token_bounds_state.min_tokens > 0:
+      acc_mask_curr = token_bounds_state.accept_mask[constraint_state]
+      min_forbid = (
+          token_bounds_state.count[:, None] < token_bounds_state.min_tokens
+      ) & acc_mask_curr
+      mask = mask & (~min_forbid)
+
+    if token_bounds_state.max_tokens is not None:
+      force_mask_curr = token_bounds_state.force_accept_mask[constraint_state]
+      max_force = (
+          token_bounds_state.count[:, None] >= token_bounds_state.max_tokens
+      )
+      mask = jnp.where(max_force, mask & force_mask_curr, mask)
+
   return jnp.where(mask[:, None, :], logits, -jnp.inf)
 
 

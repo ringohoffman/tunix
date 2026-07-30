@@ -108,18 +108,20 @@ class _SamplingState:
       beam_search_lib._BeamSearchSamplingState | None
   ) = None
 
-  # Constraint DFA state per batch element, shape [B], int32.
-  # None when no constraint is active.
   constraint_state: jnp.ndarray | None = None
+  """Constraint DFA state per batch element, shape [B], int32."""
 
-  # Token-level constraint transition table, shape [S, V], int32.
-  # Constant across decode steps; carried in state so it is visible
-  # inside the jax.lax.while_loop.
   constraint_transitions: jnp.ndarray | None = None
+  """Token-level constraint transition table, shape [S, V], int32.
+  Constant across decode steps; carried in state so it is visible
+  inside the jax.lax.while_loop.
+  """
 
-  # --- Unique-items constraint side-channel ---
-  # None when no unique-items constraint is active.
   unique_state: constrained.UniqueItemsLoopState | None = None
+  """Unique items constraint side-channel."""
+
+  token_bounds_state: constrained.TokenBoundsLoopState | None = None
+  """Token-level min/max bounds side-channel."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -569,9 +571,10 @@ class Sampler(base_sampler.BaseSampler):
     constraint_tables = (
         self.compile_constraint(constraint) if constraint is not None else None
     )
-    constraint_state = None
-    constraint_transitions = None
-    unique_state = None
+    constraint_state: jnp.ndarray | None = None
+    constraint_transitions: jnp.ndarray | None = None
+    unique_state: constrained.UniqueItemsLoopState | None = None
+    token_bounds_state: constrained.TokenBoundsLoopState | None = None
     unique_items = (
         constraint_tables.unique_items
         if constraint_tables is not None
@@ -584,6 +587,10 @@ class Sampler(base_sampler.BaseSampler):
       constraint_transitions = jnp.array(
           constraint_tables.token_transitions, dtype=jnp.int32
       )
+      token_bounds_state = constrained.init_token_bounds_loop_state(
+          constraint_tables, batch_size
+      )
+
     if unique_items is not None:
       unique_state = constrained.init_unique_items_loop_state(
           unique_items, batch_size
@@ -608,6 +615,7 @@ class Sampler(base_sampler.BaseSampler):
         constraint_state=constraint_state,
         constraint_transitions=constraint_transitions,
         unique_state=unique_state,
+        token_bounds_state=token_bounds_state,
     )
 
   def tokenize(self, input_string: str) -> np.ndarray | list[int]:
@@ -644,12 +652,14 @@ class Sampler(base_sampler.BaseSampler):
             sampler_state.constraint_state,
             sampler_state.constraint_transitions,
             sampler_state.unique_state,
+            token_bounds_state=sampler_state.token_bounds_state,
         )
       else:
         logits = constrained.constrained_logits(
             logits,
             sampler_state.constraint_state,
             sampler_state.constraint_transitions,
+            token_bounds_state=sampler_state.token_bounds_state,
         )
 
     if sampler_state.sampling_mode == 'beam_search':
@@ -696,7 +706,12 @@ class Sampler(base_sampler.BaseSampler):
 
     constraint_state = sampler_state.constraint_state
     unique_state = sampler_state.unique_state
+    token_bounds_state = sampler_state.token_bounds_state
     if sampler_state.constraint_transitions is not None:
+      if sampler_state.token_bounds_state is not None:
+        token_bounds_state = constrained.advance_token_bounds_state(
+            sampler_state.token_bounds_state
+        )
       if sampler_state.unique_state is not None:
         constraint_state, unique_state = constrained.advance_state_unique(
             sampler_state.constraint_state,
@@ -731,6 +746,7 @@ class Sampler(base_sampler.BaseSampler):
         constraint_state=constraint_state,
         constraint_transitions=sampler_state.constraint_transitions,
         unique_state=unique_state,
+        token_bounds_state=token_bounds_state,
     )
 
   def _prefill_fn(
@@ -844,6 +860,7 @@ class Sampler(base_sampler.BaseSampler):
         constraint_state=sampler_state.constraint_state,
         constraint_transitions=sampler_state.constraint_transitions,
         unique_state=sampler_state.unique_state,
+        token_bounds_state=sampler_state.token_bounds_state,
     )
     updated_sampler_state = self._sample(
         logits=logits,
