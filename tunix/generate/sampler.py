@@ -18,8 +18,8 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 import dataclasses
-import functools
 import inspect
+import json
 import time
 from typing import Any, Literal, TypeGuard, TypedDict, overload
 import warnings
@@ -116,6 +116,10 @@ class _SamplingState:
   # Constant across decode steps; carried in state so it is visible
   # inside the jax.lax.while_loop.
   constraint_transitions: jnp.ndarray | None = None
+
+  # --- Unique-items constraint side-channel ---
+  # None when no unique-items constraint is active.
+  unique_state: constrained.UniqueItemsLoopState | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -333,38 +337,35 @@ class Sampler(base_sampler.BaseSampler):
 
   def compile_constraint(
       self,
-      pattern: str | None = None,
-      schema: dict | None = None,
-      **kwargs,
+      constraint: constrained.Constraint,
+      *,
+      indent: int = 2,
   ) -> constrained.ConstraintTables:
-    """Compiles a regex pattern or JSON Schema into token-level constraint tables.
+    """Compiles a constraint specification into token-level constraint tables.
 
     Args:
-      pattern: Regex pattern string.
-      schema: JSON Schema dictionary. Mutually exclusive with pattern.
-      **kwargs: Keyword arguments passed to json_schema_to_regex if schema is
-        provided.
+      constraint: A JSON Schema dict, regex pattern string, pre-compiled
+        ConstraintTables instance, or list of schemas/patterns/tables to chain
+        sequentially.
+      indent: JSON formatting indent level for schema conversion.
 
     Returns:
       ConstraintTables containing token transition tables.
     """
-    if pattern is None and schema is None:
-      raise ValueError('Either pattern or schema must be provided.')
-    if pattern is not None and schema is not None:
-      raise ValueError('Only one of pattern or schema should be provided.')
-    if schema is not None:
-      pattern = constrained.json_schema_to_regex(schema, **kwargs)
+    if isinstance(constraint, constrained.ConstraintTables):
+      return constraint
 
-    eos_ids = (
+    eos_ids = tuple(
         self.eos_tokens.tolist()
         if hasattr(self.eos_tokens, 'tolist')
         else list(self.eos_tokens)
     )
-    return constrained.build_regex_constraint(
-        pattern=pattern,
+    return constrained.cached_chain_constraints(
+        constraint,
         token_id_to_str=self.tokenizer.token_id_to_str,
         vocab_size=self.tokenizer.vocab_size,
         eos_token_ids=eos_ids,
+        indent=indent,
     )
 
   def model_def_and_state(self) -> tuple[graph.NodeDef, statelib.State]:
@@ -491,7 +492,7 @@ class Sampler(base_sampler.BaseSampler):
       seed: jax.Array,
       beam_size: int | None,
       include_logprobs: bool = False,
-      constraint_tables: constrained.ConstraintTables | None = None,
+      constraint: constrained.Constraint | None = None,
   ) -> _SamplingState:
     """Initializes the sampling state given input prompts."""
     batch_size, num_input_tokens, *_ = all_input_ids.shape
@@ -565,14 +566,27 @@ class Sampler(base_sampler.BaseSampler):
         beam_size=beam_size, top_p=top_p, top_k=top_k
     )
 
+    constraint_tables = (
+        self.compile_constraint(constraint) if constraint is not None else None
+    )
     constraint_state = None
     constraint_transitions = None
+    unique_state = None
+    unique_items = (
+        constraint_tables.unique_items
+        if constraint_tables is not None
+        else None
+    )
     if constraint_tables is not None:
       constraint_state = jnp.full(
           (batch_size,), constraint_tables.initial_state, dtype=jnp.int32
       )
       constraint_transitions = jnp.array(
           constraint_tables.token_transitions, dtype=jnp.int32
+      )
+    if unique_items is not None:
+      unique_state = constrained.init_unique_items_loop_state(
+          unique_items, batch_size
       )
 
     return _SamplingState(
@@ -593,6 +607,7 @@ class Sampler(base_sampler.BaseSampler):
         beam_search_sampling_state=None,
         constraint_state=constraint_state,
         constraint_transitions=constraint_transitions,
+        unique_state=unique_state,
     )
 
   def tokenize(self, input_string: str) -> np.ndarray | list[int]:
@@ -623,11 +638,19 @@ class Sampler(base_sampler.BaseSampler):
       logits = logits.at[:, :, sampler_state.forbidden_token_ids].set(-jnp.inf)
 
     if sampler_state.constraint_transitions is not None:
-      logits = constrained.constrained_logits(
-          logits,
-          sampler_state.constraint_state,
-          sampler_state.constraint_transitions,
-      )
+      if sampler_state.unique_state is not None:
+        logits = constrained.constrained_logits_unique(
+            logits,
+            sampler_state.constraint_state,
+            sampler_state.constraint_transitions,
+            sampler_state.unique_state,
+        )
+      else:
+        logits = constrained.constrained_logits(
+            logits,
+            sampler_state.constraint_state,
+            sampler_state.constraint_transitions,
+        )
 
     if sampler_state.sampling_mode == 'beam_search':
       beam_search_state, updated_args = beam_search_lib.beam_search_step(
@@ -672,12 +695,21 @@ class Sampler(base_sampler.BaseSampler):
         logprobs_buffer = logprobs_buffer.at[:, decoding_step + 1].set(logp)
 
     constraint_state = sampler_state.constraint_state
+    unique_state = sampler_state.unique_state
     if sampler_state.constraint_transitions is not None:
-      constraint_state = constrained.advance_state(
-          sampler_state.constraint_state,
-          next_token_candidate,
-          sampler_state.constraint_transitions,
-      )
+      if sampler_state.unique_state is not None:
+        constraint_state, unique_state = constrained.advance_state_unique(
+            sampler_state.constraint_state,
+            next_token_candidate,
+            sampler_state.constraint_transitions,
+            sampler_state.unique_state,
+        )
+      else:
+        constraint_state = constrained.advance_state(
+            sampler_state.constraint_state,
+            next_token_candidate,
+            sampler_state.constraint_transitions,
+        )
 
     done = done | jnp.isin(token_buffer[:, decoding_step + 1], self.eos_tokens)
     return _SamplingState(
@@ -698,6 +730,7 @@ class Sampler(base_sampler.BaseSampler):
         beam_search_sampling_state=beam_search_state,
         constraint_state=constraint_state,
         constraint_transitions=sampler_state.constraint_transitions,
+        unique_state=unique_state,
     )
 
   def _prefill_fn(
@@ -810,6 +843,7 @@ class Sampler(base_sampler.BaseSampler):
         beam_search_sampling_state=beam_search_sampling_state,
         constraint_state=sampler_state.constraint_state,
         constraint_transitions=sampler_state.constraint_transitions,
+        unique_state=sampler_state.unique_state,
     )
     updated_sampler_state = self._sample(
         logits=logits,
@@ -931,45 +965,9 @@ class Sampler(base_sampler.BaseSampler):
           | jnp.ndarray
           | None
       ) = None,
-      constraint_tables: constrained.ConstraintTables | None = None,
-      constraint_pattern: str | None = None,
-      constraint_schema: dict | None = None,
+      constraint: constrained.Constraint | None = None,
   ) -> base_sampler.SamplerOutput:
-    """Samples a completion of the input string.
-
-    If top_p is provided, the sampling mode will be top_p.
-    If beam_size is provided, the sampling mode will be beam_search.
-    If None of them are provided, the sampling mode will be greedy.
-
-    Args:
-      input_strings: input prompts to feed to the model for sampling.
-      max_generation_steps: number of generation steps. will correspond to the
-        longest prompt in the batch.
-      max_prompt_length: maximum length of the prompt. Specify to avoid
-        recompilation on different prompt lengths.
-      echo: whether to return the prompt as part of the output sample.
-      return_logits: whether to return per-step logits used during generation.
-      forbidden_tokens: Optional Iterable of token IDs that are disallowed.
-      temperature: temperature for sampling.
-      top_p: top-p sampling threshold.
-      top_k: top-k sampling threshold.
-      beam_size: beam size for beam search.
-      seed: random seed for sampling.
-      pad_output: whether to pad the output to maximum length. If this set as
-        True, the output len will be max_generation_steps if echo is False,
-        otherwise it will be max_generation_steps + max_prompt_length. The
-        padding now only supports right padding. Can modify to support left
-        padding if needed.
-      images: input images to process. Can be a string/array, list of
-        strings/arrays, or list of list of strings/arrays depending on whether
-        there is one, multiple, or varying number of images per batch.
-      constraint_tables: Pre-compiled ConstraintTables for guided decoding.
-      constraint_pattern: Regex pattern string to constrain output.
-      constraint_schema: JSON Schema dictionary to constrain output.
-
-    Returns:
-      sampler_output: A SamplerOutput object containing the generated samples.
-    """
+    """Samples a completion of the input string."""
     input_strings = (
         [input_strings] if isinstance(input_strings, str) else input_strings
     )
@@ -995,12 +993,9 @@ class Sampler(base_sampler.BaseSampler):
         for x in tokens
     ])
 
-    if constraint_tables is None and (
-        constraint_pattern is not None or constraint_schema is not None
-    ):
-      constraint_tables = self.compile_constraint(
-          pattern=constraint_pattern, schema=constraint_schema
-      )
+    compiled_tables = (
+        self.compile_constraint(constraint) if constraint is not None else None
+    )
 
     return self._generate_impl(
         all_input_ids=all_input_ids,
@@ -1017,7 +1012,7 @@ class Sampler(base_sampler.BaseSampler):
         seed=seed,
         pad_output=pad_output,
         processed_images=processed_images,
-        constraint_tables=constraint_tables,
+        constraint_tables=compiled_tables,
     )
 
   def generate_from_tokens(
@@ -1035,40 +1030,9 @@ class Sampler(base_sampler.BaseSampler):
       return_logits: bool = False,
       return_logprobs: bool = False,
       pad_output: bool = False,
-      constraint_tables: constrained.ConstraintTables | None = None,
-      constraint_pattern: str | None = None,
-      constraint_schema: dict | None = None,
+      constraint: constrained.Constraint | None = None,
   ) -> base_sampler.SamplerOutput:
-    """Generate from pre-tokenized, pre-padded token arrays.
-
-    Bypasses tokenize() and host-side padding. Callers are responsible for:
-      1. Tokenization (e.g. via BatchTokenizer or HuggingFace tokenizer)
-      2. Left-padding to uniform prompt length
-      3. Optionally transferring to device (arrays will be converted to
-         jax arrays if they aren't already)
-
-    This enables efficient pipelines where tokenization and device transfer
-    happen on a background thread (e.g. via PrefetchDataLoader), while the
-    accelerator is busy decoding the previous batch.
-
-    Args:
-      input_ids: Left-padded token IDs of shape [B, prompt_len]. Padding should
-        use the tokenizer's pad_id.
-      max_generation_steps: Maximum number of tokens to generate.
-      forbidden_tokens: Token IDs that are disallowed during generation.
-      temperature: Sampling temperature (0.0 = greedy).
-      top_p: Nucleus sampling threshold.
-      top_k: Top-k sampling threshold.
-      beam_size: Beam size for beam search.
-      seed: Random seed.
-      echo: Whether to include the prompt in the output.
-      return_logits: Whether to return per-step logits.
-      return_logprobs: Whether to return per-step log probabilities.
-      pad_output: Whether to pad output to maximum length.
-
-    Returns:
-      SamplerOutput with generated text, tokens, and optional logits/logprobs.
-    """
+    """Generate from pre-tokenized, pre-padded token arrays."""
     forbidden_token_ids = tuple(forbidden_tokens) if forbidden_tokens else None
 
     # Ensure we have a numpy array for padded_prompt_tokens in the output.
@@ -1076,12 +1040,9 @@ class Sampler(base_sampler.BaseSampler):
 
     max_prompt_length = input_ids.shape[1]
 
-    if constraint_tables is None and (
-        constraint_pattern is not None or constraint_schema is not None
-    ):
-      constraint_tables = self.compile_constraint(
-          pattern=constraint_pattern, schema=constraint_schema
-      )
+    compiled_tables = (
+        self.compile_constraint(constraint) if constraint is not None else None
+    )
 
     return self._generate_impl(
         all_input_ids=all_input_ids_np,
@@ -1098,7 +1059,7 @@ class Sampler(base_sampler.BaseSampler):
         seed=seed,
         pad_output=pad_output,
         processed_images=None,
-        constraint_tables=constraint_tables,
+        constraint_tables=compiled_tables,
     )
 
   def _generate_impl(
@@ -1162,7 +1123,7 @@ class Sampler(base_sampler.BaseSampler):
         seed=seed,
         beam_size=beam_size,
         include_logprobs=return_logprobs,
-        constraint_tables=constraint_tables,
+        constraint=constraint_tables,
     )
     if constraint_tables is not None:
       compiled_prefill_fn = nnx.jit(self._prefill_fn, static_argnames=('echo',))

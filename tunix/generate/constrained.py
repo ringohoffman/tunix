@@ -50,12 +50,15 @@ Not supported (intentionally): backreferences, lookahead/lookbehind, anchors.
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Mapping, Sequence
+from collections.abc import Hashable, Mapping, Sequence
 import dataclasses
+import functools
 import json
 import re
-from typing import Any, Optional, TypedDict
+from typing import Any, Literal, Optional, TypeAlias, TypedDict, overload
 
+import flax
+import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -694,12 +697,15 @@ class ConstraintTables:
       initial_state: The DFA start state.
       num_states: Total number of DFA states.
       accept_states: Set of accepting DFA state ids.
+      unique_items: Optional ``UniqueItemsConstraint`` auxiliary metadata when
+        enforcing uniqueItems.
   """
 
   token_transitions: np.ndarray  # [num_states, vocab_size], int32
   initial_state: int
   num_states: int
   accept_states: frozenset[int]
+  unique_items: UniqueItemsConstraint | None = None
 
 
 def validate_string(
@@ -856,6 +862,7 @@ class JsonSchema(TypedDict, total=False):
   prefixItems: list[JsonSchema]
   minItems: int
   maxItems: int
+  uniqueItems: bool
   minLength: int
   maxLength: int
   pattern: str
@@ -913,7 +920,7 @@ def _merge_allof(schemas: list[JsonSchema]) -> JsonSchema:
   return merged  # type: ignore[return-value]
 
 
-def _string_schema_to_regex(schema: JsonSchema, max_string_chars: int) -> str:
+def _string_schema_to_regex(schema: JsonSchema) -> str:
   """Regex for a ``{"type": "string"}`` schema."""
   # Explicit regex pattern takes priority.
   if "pattern" in schema:
@@ -928,15 +935,18 @@ def _string_schema_to_regex(schema: JsonSchema, max_string_chars: int) -> str:
       return f'"({_STRING_FORMAT_PATTERNS[fmt]})"'
 
   min_len = schema.get("minLength", 0)
-  max_len = schema.get("maxLength", max_string_chars)
-  return f'"([^"]{{{min_len},{max_len}}})"'
+  if "maxLength" in schema:
+    max_len = schema["maxLength"]
+    return f'"([^"]{{{min_len},{max_len}}})"'
+  elif min_len > 0:
+    return f'"([^"]{{{min_len},}})"'
+  else:
+    return r'"([^"]*)"'
 
 
 def _object_schema_to_regex(
     schema: JsonSchema,
     indent: int,
-    max_string_chars: int,
-    max_array_items: int,
     depth: int,
 ) -> str:
   """Regex for a ``{"type": "object"}`` schema.
@@ -955,107 +965,980 @@ def _object_schema_to_regex(
 
   field_lines = []
   for name, prop_schema in properties.items():
-    val_pat = _schema_to_regex(
-        prop_schema, indent, max_string_chars, max_array_items, depth + 1
-    )
+    val_pat = _schema_to_regex(prop_schema, indent, depth + 1)
     field_lines.append(f'"{_regex_escape(name)}": {val_pat}')
 
   body = (",\n" + inner).join(field_lines)
   return "{\n" + inner + body + "\n" + outer + "}"
 
 
+def _unique_choices_array_regex(
+    choices: list[str], min_items: int, max_items: int
+) -> str:
+  """Build regex matching a JSON array of unique choices from discrete enum
+
+  values.
+
+  The resulting DFA has O(2^n) states where n = len(choices), which is
+  inherent to enforcing uniqueness in a regular language.  The regex string
+  itself can grow factorially because shared sub-patterns are inlined by
+  value.  For large choice sets, prefer ``build_unique_items_constraint``
+  which uses a factored DFA + bitmask approach instead.
+  """
+  n = len(choices)
+  max_items = min(max_items, n)
+  min_items = min(min_items, n)
+
+  if max_items == 0:
+    if min_items > 0:
+      raise ValueError(f"Cannot satisfy minItems={min_items} with maxItems=0.")
+    return r"\[\]"
+
+  # Memoize by the *set* of remaining choices.  Since min_items and max_items
+  # are fixed for the whole call, and items_picked = n - len(rem), the values
+  # of ``still_needed`` and ``still_allowed`` are fully determined by the
+  # size of ``rem``.  Using frozenset (rather than tuple) avoids spurious
+  # key duplication from different element-removal orderings.
+  memo: dict[frozenset[str], str] = {}
+
+  def _rec(rem: frozenset[str]) -> str:
+    if rem in memo:
+      return memo[rem]
+
+    picked = n - len(rem)
+    still_needed = max(0, min_items - picked)
+    still_allowed = max_items - picked
+
+    if still_allowed <= 0 or not rem:
+      memo[rem] = ""
+      return ""
+
+    branches: list[str] = []
+    for choice in sorted(rem):  # sorted for deterministic regex output
+      sub = _rec(rem - {choice})
+      if sub:
+        if still_needed > 1:
+          # Must pick more items after this one to satisfy minItems.
+          branches.append(f"{choice}, (?:{sub})")
+        else:
+          # Already at or past minItems; remaining picks are optional.
+          branches.append(f"{choice}(?:, (?:{sub}))?")
+      else:
+        if still_needed > 1:
+          # Can't use this choice as terminal — not enough items yet.
+          continue
+        branches.append(choice)
+
+    if not branches:
+      memo[rem] = ""
+      return ""
+
+    res = f"(?:{'|'.join(branches)})"
+    memo[rem] = res
+    return res
+
+  inner = _rec(frozenset(choices))
+
+  if not inner:
+    if min_items == 0:
+      return r"\[\]"
+    raise ValueError(
+        f"Cannot build unique-items regex: minItems={min_items} cannot be "
+        f"satisfied with {n} choices and maxItems={max_items}."
+    )
+
+  if min_items == 0:
+    return f"(\\[\\]|\\[{inner}\\])"
+  return f"\\[{inner}\\]"
+
+
+# ---------------------------------------------------------------------------
+# Unique-items constraint: factored DFA + bitmask approach
+# ---------------------------------------------------------------------------
+# Instead of encoding uniqueness into the DFA (which requires O(2^n) states),
+# we split the constraint into:
+#   1. A small structural DFA (O(n×L) states) that matches [item, item, ...]
+#      without enforcing uniqueness, but tracks WHICH item is being matched.
+#   2. A bitmask side-channel (int32 per batch element) tracking which items
+#      have been generated, enforced at the sampler level.
+#
+# This reduces the DFA from O(2^n) to O(n×L) states while correctly
+# enforcing uniqueness, minItems, and maxItems.
+
+
+@dataclasses.dataclass(frozen=True)
+class UniqueItemsConstraint:
+  """Auxiliary tables for enforcing uniqueItems at the sampler level.
+
+  Used alongside a structural ``ConstraintTables`` that does NOT encode
+  uniqueness.  The sampler carries a ``seen_mask`` (int32 bitmask per batch
+  element) and uses these tables to apply additional token blocking.
+
+  Attributes:
+      item_completion_map: Shape ``[S]``, int32.  Maps each DFA state to the
+        item index (0..n-1) that was just completed upon entering that state, or
+        ``-1`` if the state is not an item-completion state.
+      can_lead_to_items: Shape ``[S, V]``, int32.  For each ``(state, token)``
+        pair, a bitmask of which items that token could lead to matching from
+        that state.  Zero means the token doesn't start any item from that
+        state.
+      is_item_boundary: Shape ``[S]``, bool.  True if the state is an item
+        boundary (expects the start of a new item).
+      is_after_item: Shape ``[S]``, bool.  True if the state is an after-item
+        state (just completed an item, expects ``,`` or ``]``).
+      leads_to_close: Shape ``[S, V]``, bool.  True if token ``v`` from state
+        ``s`` transitions toward closing the array (``]``).
+      leads_to_continue: Shape ``[S, V]``, bool.  True if token ``v`` from state
+        ``s`` transitions toward the separator (``,``).
+      min_items: Minimum items required.
+      max_items: Maximum items allowed.
+      num_items: Number of distinct enum choices.
+  """
+
+  item_completion_map: np.ndarray
+  can_lead_to_items: np.ndarray
+  is_item_boundary: np.ndarray
+  is_after_item: np.ndarray
+  leads_to_close: np.ndarray
+  leads_to_continue: np.ndarray
+  min_items: int
+  max_items: int
+  num_items: int
+
+
+@flax.struct.dataclass
+class UniqueItemsLoopState:
+  """JAX-compatible state for unique-items enforcement inside while_loop.
+
+  Bundles the dynamic ``seen_mask`` with the static lookup tables so they
+  can be carried as a single field in the sampling state.
+
+  Attributes:
+      seen_mask: Shape ``[B]``, int32 bitmask of consumed items per batch.
+      can_lead_to_items: Shape ``[S, V]``, int32 item-reachability bitmask.
+      is_item_boundary: Shape ``[S]``, bool.
+      is_after_item: Shape ``[S]``, bool.
+      leads_to_close: Shape ``[S, V]``, bool.
+      leads_to_continue: Shape ``[S, V]``, bool.
+      completion_map: Shape ``[S]``, int32, state → completed item or -1.
+      min_items: Minimum items required.
+      max_items: Maximum items allowed.
+  """
+
+  seen_mask: jnp.ndarray  # [B] int32 — dynamic
+  can_lead_to_items: jnp.ndarray  # [S, V] int32 — static
+  is_item_boundary: jnp.ndarray  # [S] bool — static
+  is_after_item: jnp.ndarray  # [S] bool — static
+  leads_to_close: jnp.ndarray  # [S, V] bool — static
+  leads_to_continue: jnp.ndarray  # [S, V] bool — static
+  completion_map: jnp.ndarray  # [S] int32 — static
+  min_items: int = flax.struct.field(pytree_node=False, default=0)
+  max_items: int = flax.struct.field(pytree_node=False, default=0)
+
+
+def init_unique_items_loop_state(
+    info: UniqueItemsConstraint,
+    batch_size: int,
+) -> UniqueItemsLoopState:
+  """Create a ``UniqueItemsLoopState`` from compiled constraint metadata.
+
+  Converts NumPy arrays in *info* to JAX arrays and initialises the
+  ``seen_mask`` to zeros.
+
+  Args:
+      info: Compiled unique-items metadata from
+        ``build_unique_items_constraint``.
+      batch_size: Number of sequences in the batch.
+
+  Returns:
+      A ``UniqueItemsLoopState`` ready for use in the decode loop.
+  """
+  return UniqueItemsLoopState(
+      seen_mask=jnp.zeros((batch_size,), dtype=jnp.int32),
+      can_lead_to_items=jnp.array(info.can_lead_to_items, dtype=jnp.int32),
+      is_item_boundary=jnp.array(info.is_item_boundary, dtype=jnp.bool_),
+      is_after_item=jnp.array(info.is_after_item, dtype=jnp.bool_),
+      leads_to_close=jnp.array(info.leads_to_close, dtype=jnp.bool_),
+      leads_to_continue=jnp.array(info.leads_to_continue, dtype=jnp.bool_),
+      completion_map=jnp.array(info.item_completion_map, dtype=jnp.int32),
+      min_items=info.min_items,
+      max_items=info.max_items,
+  )
+
+
+def _build_unique_items_char_dfa(
+    choice_strings: list[str],
+    min_items: int,
+    max_items: int,
+) -> tuple[
+    dict[tuple[int, str], int],
+    int,
+    frozenset[int],
+    int,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    dict[int, dict[str, int]],
+    dict[int, int],
+    int,
+    int,
+]:
+  """Build a character-level DFA for a JSON array of enum items (no uniqueness).
+
+  The DFA matches ``[item(, item)*]`` where ``item`` is any of the choice
+  strings, respecting the array structure but NOT enforcing uniqueness or
+  min/max bounds.  Those are enforced externally via a bitmask.
+
+  Internally builds a trie over the choice strings to handle shared prefixes
+  (all JSON strings start with ``"``).
+
+  Args:
+      choice_strings: JSON-serialized choice strings (e.g. ``['"apple"',
+        ...]``).
+      min_items: Minimum number of items (used only for empty-array handling).
+      max_items: Maximum number of items.
+
+  Returns:
+      A tuple of DFA components and trie metadata.
+  """
+  # --- Build trie over choice strings ---
+  # Each trie node is an int id.  Children are stored in trie_children.
+  # Terminal nodes are recorded in trie_terminal.
+  trie_children: dict[int, dict[str, int]] = {}  # node_id -> {char -> child_id}
+  trie_terminal: dict[int, int] = {}  # node_id -> item_index
+  next_trie_id = 0
+
+  def new_trie_node() -> int:
+    nonlocal next_trie_id
+    nid = next_trie_id
+    trie_children[nid] = {}
+    next_trie_id += 1
+    return nid
+
+  trie_root = new_trie_node()
+
+  for item_idx, cs in enumerate(choice_strings):
+    node = trie_root
+    for ch in cs:
+      if ch not in trie_children[node]:
+        trie_children[node][ch] = new_trie_node()
+      node = trie_children[node][ch]
+    trie_terminal[node] = item_idx
+
+  trie_size = next_trie_id
+
+  # --- Assign DFA state ids ---
+  n = len(choice_strings)
+  st_before = 0
+  st_boundary = 1
+  st_trie_base = 2
+  st_after_base = st_trie_base + trie_size
+  st_sep_comma = st_after_base + n
+  st_done = st_sep_comma + 1
+  num_states = st_done + 1
+
+  char_transitions: dict[tuple[int, str], int] = {}
+  char_transitions[(st_before, "[")] = st_boundary
+
+  # ITEM_BOUNDARY: transitions from trie root
+  for ch, child_trie_id in trie_children[trie_root].items():
+    char_transitions[(st_boundary, ch)] = st_trie_base + child_trie_id
+
+  # If min_items == 0, allow ']' from ITEM_BOUNDARY (empty array)
+  if min_items == 0:
+    char_transitions[(st_boundary, "]")] = st_done
+
+  # IN_ITEM (trie nodes): follow trie transitions
+  for trie_node_id in range(trie_size):
+    dfa_state = st_trie_base + trie_node_id
+    for ch, child_id in trie_children[trie_node_id].items():
+      char_transitions[(dfa_state, ch)] = st_trie_base + child_id
+
+  # Redirect transitions that land on terminal trie nodes to AFTER_ITEM_i.
+  for src_state_char, dst_state in list(char_transitions.items()):
+    if st_trie_base <= dst_state < st_trie_base + trie_size:
+      trie_node_id = dst_state - st_trie_base
+      if trie_node_id in trie_terminal and not trie_children[trie_node_id]:
+        item_idx = trie_terminal[trie_node_id]
+        char_transitions[src_state_char] = st_after_base + item_idx
+
+  # Redirect terminal nodes with children (prefix of another item)
+  for trie_node_id, item_idx in trie_terminal.items():
+    if trie_children[trie_node_id]:
+      dfa_state = st_trie_base + trie_node_id
+      char_transitions[(dfa_state, ",")] = st_sep_comma
+      char_transitions[(dfa_state, "]")] = st_done
+
+  # AFTER_ITEM_i: expect ',' or ']'
+  for i in range(n):
+    after_state = st_after_base + i
+    char_transitions[(after_state, ",")] = st_sep_comma
+    char_transitions[(after_state, "]")] = st_done
+
+  # IN_SEP_COMMA: expect ' '
+  char_transitions[(st_sep_comma, " ")] = st_boundary
+
+  # --- Build annotation arrays ---
+  item_completion_map = np.full(num_states, -1, dtype=np.int32)
+  for i in range(n):
+    item_completion_map[st_after_base + i] = i
+  for trie_node_id, item_idx in trie_terminal.items():
+    if trie_children[trie_node_id]:
+      item_completion_map[st_trie_base + trie_node_id] = item_idx
+
+  is_item_boundary = np.zeros(num_states, dtype=bool)
+  is_item_boundary[st_boundary] = True
+
+  is_after_item = np.zeros(num_states, dtype=bool)
+  for i in range(n):
+    is_after_item[st_after_base + i] = True
+  for trie_node_id in trie_terminal:
+    if trie_children[trie_node_id]:
+      is_after_item[st_trie_base + trie_node_id] = True
+
+  is_done = np.zeros(num_states, dtype=bool)
+  is_done[st_done] = True
+
+  accept_states = frozenset([st_done])
+
+  return (
+      char_transitions,
+      st_before,
+      accept_states,
+      num_states,
+      item_completion_map,
+      is_item_boundary,
+      is_after_item,
+      is_done,
+      trie_children,
+      trie_terminal,
+      next_trie_id,
+      st_trie_base,
+  )
+
+
+def build_unique_items_constraint(
+    choices: list[Any],
+    min_items: int,
+    max_items: int,
+    token_id_to_str: Mapping[int, str],
+    vocab_size: int,
+    eos_token_ids: Sequence[int],
+) -> ConstraintTables:
+  """Build constraint tables for a uniqueItems enum array.
+
+  Uses the factored DFA + bitmask approach: a small structural DFA
+  (O(n×L) states) handles syntax, while a bitmask side-channel enforces
+  uniqueness.  This avoids the O(2^n) state explosion of encoding
+  uniqueness into the DFA.
+
+  Args:
+      choices: Raw Python enum values.
+      min_items: Minimum items in the array.
+      max_items: Maximum items in the array.
+      token_id_to_str: Mapping from token id to decoded string.
+      vocab_size: Vocabulary size.
+      eos_token_ids: End-of-sequence token ids.
+
+  Returns:
+      A ``ConstraintTables`` object with ``unique_items`` set.
+  """
+  # Serialize choices to JSON strings.
+  choice_strings: list[str] = []
+  for v in choices:
+    if v is None:
+      choice_strings.append("null")
+    elif isinstance(v, bool):
+      choice_strings.append("true" if v else "false")
+    elif isinstance(v, (int, float)):
+      choice_strings.append(json.dumps(v))
+    elif isinstance(v, str):
+      choice_strings.append(f'"{v}"')
+    else:
+      choice_strings.append(json.dumps(v, separators=(",", ":")))
+
+  n = len(choice_strings)
+  max_items = min(max_items, n)
+  min_items = min(min_items, n)
+
+  # Build character-level DFA.
+  (
+      char_transitions,
+      initial_state,
+      accept_states,
+      num_states,
+      item_completion_map,
+      is_item_boundary,
+      is_after_item,
+      is_done,
+      trie_children,
+      trie_terminal,
+      next_trie_id,
+      st_trie_base,
+  ) = _build_unique_items_char_dfa(
+      choice_strings,
+      min_items,
+      max_items,
+  )
+
+  # Compile token-level transitions (reuse existing compiler).
+  token_transitions = _compile_token_transitions(
+      char_transitions,
+      num_states,
+      accept_states,
+      token_id_to_str,
+      vocab_size,
+      eos_token_ids,
+  )
+
+  # Build can_lead_to_items[state, token] -> bitmask of reachable items.
+  # For each (state, token) pair, simulate the token from the state and
+  # check which items the resulting state is "on the path" of.
+  #
+  # An item i is "reachable" from a DFA state s if there exists a sequence
+  # of characters starting from s that completes item i.  We compute this
+  # from the trie structure: for each DFA state corresponding to a trie
+  # node, the reachable items are those in the trie subtree.
+  #
+  # We compute reachable_items[dfa_state] as a bitmask.
+  reachable_items = np.zeros(num_states, dtype=np.int32)
+
+  # For AFTER_ITEM_i states, the item is already completed — mark it.
+  for s in range(num_states):
+    if item_completion_map[s] >= 0:
+      reachable_items[s] |= 1 << item_completion_map[s]
+
+  # For trie-based states, compute reachable items bottom-up.
+  # We need the trie structure — rebuild the subtree reachability.
+  # Process trie nodes in reverse order (children before parents).
+  # (This works because child IDs are always greater than parent IDs
+  # due to the order we created them.)
+  trie_reachable = np.zeros(next_trie_id, dtype=np.int32)
+  for trie_node_id, item_idx in trie_terminal.items():
+    trie_reachable[trie_node_id] |= 1 << item_idx
+  for trie_node_id in range(next_trie_id - 1, -1, -1):
+    for child_id in trie_children[trie_node_id].values():
+      trie_reachable[trie_node_id] |= trie_reachable[child_id]
+    # Map to DFA state (only if not redirected to AFTER_ITEM)
+    dfa_state = st_trie_base + trie_node_id
+    if dfa_state < num_states:
+      reachable_items[dfa_state] |= trie_reachable[trie_node_id]
+
+  # Now build can_lead_to_items[state, token] by looking up reachable_items
+  # of the next state.
+  can_lead_to_items = np.zeros((num_states, vocab_size), dtype=np.int32)
+  for s in range(num_states):
+    for v in range(vocab_size):
+      next_s = token_transitions[s, v]
+      if next_s != INVALID_STATE:
+        can_lead_to_items[s, v] = reachable_items[next_s]
+
+  # Build leads_to_close and leads_to_continue for AFTER_ITEM states.
+  leads_to_close = np.zeros((num_states, vocab_size), dtype=bool)
+  leads_to_continue = np.zeros((num_states, vocab_size), dtype=bool)
+  for s in range(num_states):
+    if is_after_item[s]:
+      for v in range(vocab_size):
+        next_s = token_transitions[s, v]
+        if next_s != INVALID_STATE:
+          if is_done[next_s]:
+            leads_to_close[s, v] = True
+          else:
+            leads_to_continue[s, v] = True
+
+  unique_info = UniqueItemsConstraint(
+      item_completion_map=item_completion_map,
+      can_lead_to_items=can_lead_to_items,
+      is_item_boundary=is_item_boundary,
+      is_after_item=is_after_item,
+      leads_to_close=leads_to_close,
+      leads_to_continue=leads_to_continue,
+      min_items=min_items,
+      max_items=max_items,
+      num_items=n,
+  )
+
+  return ConstraintTables(
+      token_transitions=token_transitions,
+      initial_state=initial_state,
+      num_states=num_states,
+      accept_states=accept_states,
+      unique_items=unique_info,
+  )
+
+
+def build_constraint_from_schema(
+    schema: JsonSchema,
+    token_id_to_str: Mapping[int, str],
+    vocab_size: int,
+    eos_token_ids: Sequence[int],
+    *,
+    indent: int = 2,
+) -> ConstraintTables:
+  """Build constraint tables from a JSON Schema dict."""
+  if (
+      schema.get("type") == "array"
+      and schema.get("uniqueItems", False)
+      and "enum" in schema.get("items", {})
+  ):
+    items_schema = schema["items"]
+    return build_unique_items_constraint(
+        choices=items_schema["enum"],
+        min_items=schema.get("minItems", 0),
+        max_items=schema.get("maxItems", len(items_schema["enum"])),
+        token_id_to_str=token_id_to_str,
+        vocab_size=vocab_size,
+        eos_token_ids=eos_token_ids,
+    )
+  pattern = json_schema_to_regex(
+      schema,
+      indent=indent,
+  )
+  return build_regex_constraint(
+      pattern=pattern,
+      token_id_to_str=token_id_to_str,
+      vocab_size=vocab_size,
+      eos_token_ids=eos_token_ids,
+  )
+
+
+def chain_constraints(
+    constraints: Constraint,
+    token_id_to_str: Mapping[int, str],
+    vocab_size: int,
+    eos_token_ids: Sequence[int],
+    *,
+    indent: int = 2,
+) -> ConstraintTables:
+  """Sequentially chains one or multiple schemas, regex patterns, or ConstraintTables together.
+
+  Transitions from the accept state(s) of constraint i directly into the initial
+  state of constraint i+1.  Preserves uniqueItems side-channel metadata for any
+  stages that have it.
+
+  Args:
+      constraints: A single constraint or sequence of JSON Schemas (dicts),
+        regex patterns (strs), or pre-compiled ConstraintTables to execute
+        sequentially.
+      token_id_to_str: Mapping from token id to decoded string.
+      vocab_size: Vocabulary size.
+      eos_token_ids: End-of-sequence token ids.
+      indent: JSON formatting indent level for schema conversion.
+
+  Returns:
+      A single chained ConstraintTables object.
+  """
+  if isinstance(constraints, (dict, str, ConstraintTables)):
+    constraints_seq = [constraints]
+  else:
+    constraints_seq = constraints
+
+  if not constraints_seq:
+    raise ValueError("constraints list cannot be empty.")
+
+  compiled_stages: list[ConstraintTables] = []
+  for c in constraints_seq:
+    if isinstance(c, ConstraintTables):
+      compiled_stages.append(c)
+    elif isinstance(c, dict):
+      compiled_stages.append(
+          build_constraint_from_schema(
+              c,
+              token_id_to_str,
+              vocab_size,
+              eos_token_ids,
+              indent=indent,
+          )
+      )
+    elif isinstance(c, str):
+      compiled_stages.append(
+          build_regex_constraint(c, token_id_to_str, vocab_size, eos_token_ids)
+      )
+    else:
+      raise TypeError(f"Unsupported constraint element type: {type(c)}")
+
+  if len(compiled_stages) == 1:
+    return compiled_stages[0]
+
+  total_states = sum(st.num_states for st in compiled_stages)
+  offsets = []
+  curr_off = 0
+  for st in compiled_stages:
+    offsets.append(curr_off)
+    curr_off += st.num_states
+
+  combined_tt = np.full(
+      (total_states, vocab_size), INVALID_STATE, dtype=np.int32
+  )
+
+  for i, st in enumerate(compiled_stages):
+    off = offsets[i]
+    for s in range(st.num_states):
+      for v in range(vocab_size):
+        next_s = st.token_transitions[s, v]
+        if next_s != INVALID_STATE:
+          combined_tt[off + s, v] = off + next_s
+
+  for i in range(len(compiled_stages) - 1):
+    curr_st = compiled_stages[i]
+    next_st = compiled_stages[i + 1]
+    curr_off = offsets[i]
+    next_off = offsets[i + 1]
+
+    for acc in curr_st.accept_states:
+      acc_global = curr_off + acc
+      for v in range(vocab_size):
+        if combined_tt[acc_global, v] == INVALID_STATE:
+          next_target = next_st.token_transitions[next_st.initial_state, v]
+          if next_target != INVALID_STATE:
+            combined_tt[acc_global, v] = next_off + next_target
+
+  initial_state = offsets[0] + compiled_stages[0].initial_state
+  last_st = compiled_stages[-1]
+  last_off = offsets[-1]
+  accept_states = frozenset([last_off + acc for acc in last_st.accept_states])
+
+  unique_info = None
+  for i, st in enumerate(compiled_stages):
+    if st.unique_items is not None:
+      u = st.unique_items
+      off = offsets[i]
+      if unique_info is None:
+        c_icm = np.full(total_states, -1, dtype=np.int32)
+        c_cli = np.zeros((total_states, vocab_size), dtype=np.int32)
+        c_ib = np.zeros(total_states, dtype=bool)
+        c_ia = np.zeros(total_states, dtype=bool)
+        c_ltc = np.zeros((total_states, vocab_size), dtype=bool)
+        c_ltk = np.zeros((total_states, vocab_size), dtype=bool)
+        u_min = u.min_items
+        u_max = u.max_items
+        u_num = u.num_items
+      else:
+        c_icm = unique_info.item_completion_map
+        c_cli = unique_info.can_lead_to_items
+        c_ib = unique_info.is_item_boundary
+        c_ia = unique_info.is_after_item
+        c_ltc = unique_info.leads_to_close
+        c_ltk = unique_info.leads_to_continue
+        u_min = u.min_items
+        u_max = u.max_items
+        u_num = u.num_items
+
+      c_icm[off : off + st.num_states] = u.item_completion_map
+      c_cli[off : off + st.num_states, :] = u.can_lead_to_items
+      c_ib[off : off + st.num_states] = u.is_item_boundary
+      c_ia[off : off + st.num_states] = u.is_after_item
+      c_ltc[off : off + st.num_states, :] = u.leads_to_close
+      c_ltk[off : off + st.num_states, :] = u.leads_to_continue
+
+      unique_info = UniqueItemsConstraint(
+          item_completion_map=c_icm,
+          can_lead_to_items=c_cli,
+          is_item_boundary=c_ib,
+          is_after_item=c_ia,
+          leads_to_close=c_ltc,
+          leads_to_continue=c_ltk,
+          min_items=u_min,
+          max_items=u_max,
+          num_items=u_num,
+      )
+
+  return ConstraintTables(
+      token_transitions=combined_tt,
+      initial_state=initial_state,
+      num_states=total_states,
+      accept_states=accept_states,
+      unique_items=unique_info,
+  )
+
+
+ConstraintItem: TypeAlias = str | JsonSchema | ConstraintTables
+Constraint: TypeAlias = ConstraintItem | Sequence[ConstraintItem]
+
+FrozenHashable: TypeAlias = tuple[Literal["hashable"], Hashable]
+FrozenDictPair: TypeAlias = tuple[str, "FrozenKey"]
+FrozenDict: TypeAlias = tuple[Literal["dict"], tuple[FrozenDictPair, ...]]
+FrozenSeq: TypeAlias = tuple[Literal["seq"], tuple["FrozenKey", ...]]
+FrozenTables: TypeAlias = tuple[Literal["tables"], int]
+FrozenId: TypeAlias = tuple[Literal["id"], int]
+FrozenKey: TypeAlias = (
+    FrozenHashable | FrozenDict | FrozenSeq | FrozenTables | FrozenId
+)
+
+
+@overload
+def _freeze(obj: Hashable) -> FrozenHashable:
+  ...
+
+
+@overload
+def _freeze(obj: JsonSchema) -> FrozenDict:
+  ...
+
+
+@overload
+def _freeze(obj: Sequence[ConstraintItem]) -> FrozenSeq:
+  ...
+
+
+@overload
+def _freeze(obj: ConstraintTables) -> FrozenTables:
+  ...
+
+
+def _freeze(obj: Any) -> FrozenKey:
+  """Recursively converts dicts, lists, and specs into hashable tuples for caching."""
+  try:
+    hash(obj)
+    return ("hashable", obj)
+  except TypeError:
+    pass
+
+  if isinstance(obj, Mapping):
+    return ("dict", tuple(sorted((k, _freeze(v)) for k, v in obj.items())))
+  elif isinstance(obj, Sequence) and not isinstance(obj, (str, bytes)):
+    return ("seq", tuple(_freeze(x) for x in obj))
+  elif isinstance(obj, ConstraintTables):
+    return ("tables", id(obj))
+  return ("id", id(obj))
+
+
+def _unfreeze(frozen: FrozenKey) -> Any:
+  """Reconstructs original objects from frozen representations."""
+  tag, payload = frozen[0], frozen[1]
+  if tag == "hashable":
+    return payload
+  elif tag == "dict":
+    return {k: _unfreeze(v) for k, v in payload}
+  elif tag == "seq":
+    return [_unfreeze(x) for x in payload]
+  return payload
+
+
+@functools.lru_cache(maxsize=128)
+def _cached_chain_constraints_impl(
+    frozen_constraints: FrozenKey,
+    frozen_tok_map: FrozenKey,
+    vocab_size: int,
+    eos_token_ids: tuple[int, ...],
+    indent: int,
+) -> ConstraintTables:
+  constraints = _unfreeze(frozen_constraints)
+  token_id_to_str = _unfreeze(frozen_tok_map)
+  return chain_constraints(
+      constraints,
+      token_id_to_str=token_id_to_str,
+      vocab_size=vocab_size,
+      eos_token_ids=eos_token_ids,
+      indent=indent,
+  )
+
+
+def cached_chain_constraints(
+    constraints: Constraint,
+    token_id_to_str: Mapping[int, str],
+    vocab_size: int,
+    eos_token_ids: Sequence[int],
+    *,
+    indent: int = 2,
+) -> ConstraintTables:
+  """Cached wrapper around chain_constraints."""
+  if isinstance(constraints, ConstraintTables):
+    return constraints
+
+  frozen_constraints = _freeze(constraints)
+  frozen_tok_map = _freeze(token_id_to_str)
+  eos_tuple = tuple(eos_token_ids)
+  return _cached_chain_constraints_impl(
+      frozen_constraints,
+      frozen_tok_map,
+      vocab_size,
+      eos_tuple,
+      indent,
+  )
+
+
+def constrained_logits_unique(
+    logits: jnp.ndarray,
+    constraint_state: jnp.ndarray,
+    token_transitions: jnp.ndarray,
+    unique_state: UniqueItemsLoopState,
+) -> jnp.ndarray:
+  """Mask logits enforcing both structural DFA and uniqueness constraints.
+
+  Pure JAX, safe for ``jax.lax.while_loop``.
+
+  Args:
+      logits: Shape ``[B, 1, V]``.
+      constraint_state: Shape ``[B]``, current DFA state.
+      token_transitions: Shape ``[S, V]``, structural DFA transitions.
+      unique_state: Bundled unique-items loop state.
+
+  Returns:
+      Masked logits, same shape as input.
+  """
+  # 1. Structural DFA constraint (same as constrained_logits).
+  allowed_next = token_transitions[constraint_state]  # [B, V]
+  structural_mask = allowed_next != INVALID_STATE  # [B, V]
+
+  # 2. Uniqueness constraint at item boundaries.
+  # Block tokens that can ONLY lead to already-seen items.
+  at_boundary = unique_state.is_item_boundary[constraint_state]  # [B]
+  cli = unique_state.can_lead_to_items[constraint_state]  # [B, V] bitmasks
+  # remaining = items this token can lead to that are NOT yet seen
+  remaining = cli & ~unique_state.seen_mask[:, None]  # [B, V]
+  # Block if: at boundary AND token leads to some item AND no unseen item
+  uniqueness_block = at_boundary[:, None] & (cli != 0) & (remaining == 0)
+
+  # 3. Min/max enforcement at after-item states.
+  at_after = unique_state.is_after_item[constraint_state]  # [B]
+  count = jax.lax.population_count(unique_state.seen_mask)  # [B]
+  ltc = unique_state.leads_to_close[constraint_state]  # [B, V]
+  ltk = unique_state.leads_to_continue[constraint_state]  # [B, V]
+  # Block ']' if count < min_items
+  close_block = (
+      at_after[:, None] & ltc & (count < unique_state.min_items)[:, None]
+  )
+  # Block ',' if count >= max_items
+  continue_block = (
+      at_after[:, None] & ltk & (count >= unique_state.max_items)[:, None]
+  )
+
+  # Combine all masks.
+  final_mask = (
+      structural_mask & ~uniqueness_block & ~close_block & ~continue_block
+  )
+  return jnp.where(final_mask[:, None, :], logits, -jnp.inf)
+
+
+def advance_state_unique(
+    constraint_state: jnp.ndarray,
+    next_token: jnp.ndarray,
+    token_transitions: jnp.ndarray,
+    unique_state: UniqueItemsLoopState,
+) -> tuple[jnp.ndarray, UniqueItemsLoopState]:
+  """Advance the DFA state and update the unique-items state.
+
+  Pure JAX, safe for ``jax.lax.while_loop``.
+
+  Args:
+      constraint_state: Shape ``[B]``, current DFA state.
+      next_token: Shape ``[B]``, selected token id.
+      token_transitions: Shape ``[S, V]``, DFA transition table.
+      unique_state: Bundled unique-items loop state.
+
+  Returns:
+      Tuple of (new_constraint_state, updated_unique_state).
+  """
+  new_state = token_transitions[constraint_state, next_token]  # [B]
+
+  # Check if the new state completes an item.
+  completed_item = unique_state.completion_map[new_state]  # [B], -1 if none
+  # Set the bit for the completed item (no-op if -1 since 1 << -1 is 0 in JAX)
+  item_bit = jnp.where(
+      completed_item >= 0,
+      jnp.int32(1) << completed_item,
+      jnp.int32(0),
+  )
+  new_seen = unique_state.seen_mask | item_bit
+
+  return new_state, unique_state.replace(seen_mask=new_seen)
+
+
 def _array_schema_to_regex(
     schema: JsonSchema,
     indent: int,
-    max_string_chars: int,
-    max_array_items: int,
     depth: int,
 ) -> str:
   """Regex for a ``{"type": "array"}`` schema (compact single-line format)."""
   # Tuple validation: prefixItems.
   if "prefixItems" in schema:
     item_pats = [
-        _schema_to_regex(s, indent, max_string_chars, max_array_items, depth)
-        for s in schema["prefixItems"]
+        _schema_to_regex(s, indent, depth) for s in schema["prefixItems"]
     ]
     return r"\[" + ", ".join(item_pats) + r"\]"
 
-  # List validation: items.
   items_schema = schema.get("items", {"type": "string"})
   min_items = schema.get("minItems", 0)
-  max_items = schema.get("maxItems", max_array_items)
 
-  item_pat = _schema_to_regex(
-      items_schema, indent, max_string_chars, max_array_items, depth
-  )
+  if schema.get("uniqueItems", False):
+    if "enum" in items_schema:
+      choices = [_value_to_regex(v) for v in items_schema["enum"]]
+      max_items = schema.get("maxItems", len(items_schema["enum"]))
+      return _unique_choices_array_regex(choices, min_items, max_items)
+    raise ValueError(
+        "uniqueItems: True in json_schema_to_regex is currently only "
+        "supported when items is an enum of discrete values."
+    )
 
-  if min_items == 0:
-    if max_items == 0:
-      return r"\[\]"
-    # Can be empty or have 1..max_items elements.
-    inner = f"{item_pat}(, {item_pat}){{0,{max_items - 1}}}"
-    return f"(\\[\\]|\\[{inner}\\])"
+  item_pat = _schema_to_regex(items_schema, indent, depth)
+
+  if "maxItems" in schema:
+    max_items = schema["maxItems"]
+    if min_items == 0:
+      if max_items == 0:
+        return r"\[\]"
+      # Can be empty or have 1..max_items elements.
+      inner = f"{item_pat}(, {item_pat}){{0,{max_items - 1}}}"
+      return f"(\\[\\]|\\[{inner}\\])"
+    else:
+      # First item mandatory, then (min-1) more mandatory, then optional.
+      mandatory_extra = min_items - 1
+      optional_extra = max_items - min_items
+      parts = item_pat
+      if mandatory_extra > 0:
+        parts += f"(, {item_pat}){{{mandatory_extra}}}"
+      if optional_extra > 0:
+        parts += f"(, {item_pat}){{0,{optional_extra}}}"
+      return f"\\[{parts}\\]"
   else:
-    # First item mandatory, then (min-1) more mandatory, then optional.
-    mandatory_extra = min_items - 1
-    optional_extra = max_items - min_items
-    parts = item_pat
-    if mandatory_extra > 0:
-      parts += f"(, {item_pat}){{{mandatory_extra}}}"
-    if optional_extra > 0:
-      parts += f"(, {item_pat}){{0,{optional_extra}}}"
-    return f"\\[{parts}\\]"
+    if min_items == 0:
+      inner = f"{item_pat}(, {item_pat})*"
+      return f"(\\[\\]|\\[{inner}\\])"
+    else:
+      mandatory_extra = min_items - 1
+      parts = item_pat
+      if mandatory_extra > 0:
+        parts += f"(, {item_pat}){{{mandatory_extra}}}"
+      parts += f"(, {item_pat})*"
+      return f"\\[{parts}\\]"
 
 
 def _schema_to_regex(
     schema: JsonSchema,
     indent: int,
-    max_string_chars: int,
-    max_array_items: int,
     depth: int,
 ) -> str:
   """Recursive core: convert a JSON Schema dict to a regex pattern."""
 
-  # --- const: single allowed value ---
   if "const" in schema:
     return _value_to_regex(schema["const"])
 
-  # --- enum: alternation of allowed values ---
   if "enum" in schema:
     alts = [_value_to_regex(v) for v in schema["enum"]]
     return f'({"|".join(alts)})'
 
-  # --- allOf: merge schemas, then recurse ---
   if "allOf" in schema:
     merged = _merge_allof(schema["allOf"])
     # Carry over any top-level keys not in the sub-schemas.
     for k, v in schema.items():
       if k != "allOf" and k not in merged:
         merged[k] = v  # type: ignore[literal-required]
-    return _schema_to_regex(
-        merged, indent, max_string_chars, max_array_items, depth
-    )
+    return _schema_to_regex(merged, indent, depth)
 
-  # --- anyOf / oneOf: alternation ---
   for keyword in ("anyOf", "oneOf"):
     if keyword in schema:
-      alts = [
-          _schema_to_regex(s, indent, max_string_chars, max_array_items, depth)
-          for s in schema[keyword]
-      ]
+      alts = [_schema_to_regex(s, indent, depth) for s in schema[keyword]]
       return f'({"|".join(alts)})'
 
-  # --- type dispatch ---
   schema_type = schema.get("type")
 
-  # Multi-type: {"type": ["string", "null"]} → anyOf
   if isinstance(schema_type, list):
     alts = [
         _schema_to_regex(
             {**{k: v for k, v in schema.items() if k != "type"}, "type": t},
             indent,
-            max_string_chars,
-            max_array_items,
             depth,
         )
         for t in schema_type
@@ -1063,7 +1946,7 @@ def _schema_to_regex(
     return f'({"|".join(alts)})'
 
   if schema_type == "string":
-    return _string_schema_to_regex(schema, max_string_chars)
+    return _string_schema_to_regex(schema)
 
   if schema_type == "integer":
     return r"-?[0-9]+"
@@ -1078,20 +1961,13 @@ def _schema_to_regex(
     return "null"
 
   if schema_type == "object":
-    return _object_schema_to_regex(
-        schema, indent, max_string_chars, max_array_items, depth
-    )
+    return _object_schema_to_regex(schema, indent, depth)
 
   if schema_type == "array":
-    return _array_schema_to_regex(
-        schema, indent, max_string_chars, max_array_items, depth
-    )
+    return _array_schema_to_regex(schema, indent, depth)
 
-  # No type but has properties → treat as object.
   if "properties" in schema:
-    return _object_schema_to_regex(
-        schema, indent, max_string_chars, max_array_items, depth
-    )
+    return _object_schema_to_regex(schema, indent, depth)
 
   raise ValueError(f"Cannot convert schema to regex: {schema!r}")
 
@@ -1100,8 +1976,6 @@ def json_schema_to_regex(
     schema: JsonSchema,
     *,
     indent: int = 2,
-    max_string_chars: int = 200,
-    max_array_items: int = 20,
 ) -> str:
   """Convert a JSON Schema dict into a regex for constrained decoding.
 
@@ -1128,10 +2002,6 @@ def json_schema_to_regex(
         keyword subset.
       indent: Number of spaces per indentation level in the formatted JSON
         output.
-      max_string_chars: Default upper bound on string character length when the
-        schema omits ``maxLength``.
-      max_array_items: Default upper bound on array length when the schema omits
-        ``maxItems``.
 
   Returns:
       A regex pattern string.
@@ -1140,9 +2010,7 @@ def json_schema_to_regex(
       ValueError: If the schema contains constructs that cannot be
           expressed as a regex.
   """
-  return _schema_to_regex(
-      schema, indent, max_string_chars, max_array_items, depth=0
-  )
+  return _schema_to_regex(schema, indent, depth=0)
 
 
 def build_regex_constraint(

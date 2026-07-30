@@ -59,6 +59,9 @@ _CONSTRAINED_VOCAB_MAPPING = {
     "string": 13,
     "no": 14,  # partial token (prefix of "none")
     "ne": 15,  # partial token (suffix of "none")
+    "apple": 16,
+    "banana": 17,
+    "pear": 18,
 }
 
 _CATEGORIES = ["none", "spam", "gore"]
@@ -138,7 +141,7 @@ class ConstrainedSamplerTest(parameterized.TestCase):
     result = sampler(
         ["input string"],
         max_generation_steps=20,
-        constraint_tables=constraint,
+        constraint=constraint,
     )
 
     generated_text = result.text[0]
@@ -156,7 +159,7 @@ class ConstrainedSamplerTest(parameterized.TestCase):
     result = sampler(
         ["input string", "hello world"],
         max_generation_steps=20,
-        constraint_tables=constraint,
+        constraint=constraint,
     )
 
     for i, text in enumerate(result.text):
@@ -175,7 +178,7 @@ class ConstrainedSamplerTest(parameterized.TestCase):
         max_generation_steps=20,
         temperature=1.0,
         seed=42,
-        constraint_tables=constraint,
+        constraint=constraint,
     )
 
     generated_text = result.text[0]
@@ -184,6 +187,32 @@ class ConstrainedSamplerTest(parameterized.TestCase):
         _CATEGORY_REGEX,
         f"With temperature=1.0: {generated_text!r} does not match regex",
     )
+
+  def test_constrained_generation_unique_items_end_to_end(self):
+    """End-to-end generation with uniqueItems array schema produces unique enum items."""
+    sampler, vocab, _ = self._make_sampler_and_constraint()
+    schema = {
+        "type": "array",
+        "uniqueItems": True,
+        "items": {"enum": ["apple", "banana", "pear"]},
+    }
+
+    result = sampler(
+        ["input string"],
+        max_generation_steps=20,
+        constraint=schema,
+    )
+
+    generated_text = result.text[0]
+    import json
+
+    items = json.loads(generated_text)
+    self.assertIsInstance(items, list)
+    self.assertEqual(
+        len(items), len(set(items)), f"Duplicates found in {generated_text!r}"
+    )
+    for item in items:
+      self.assertIn(item, ["apple", "banana", "pear"])
 
   def test_unconstrained_generation_differs(self):
     """Without constraint, the micro-model does NOT produce valid JSON."""
@@ -204,19 +233,19 @@ class ConstrainedSamplerTest(parameterized.TestCase):
     )
 
   def test_sampler_compile_constraint_pattern(self):
-    """Sampler.compile_constraint with pattern and automatic compile via constraint_pattern."""
+    """Sampler.compile_constraint with pattern and automatic compile via constraint."""
     sampler, vocab, _ = self._make_sampler_and_constraint()
 
     # Test explicit compile_constraint
-    tables = sampler.compile_constraint(pattern=_CATEGORY_REGEX)
+    tables = sampler.compile_constraint(_CATEGORY_REGEX)
     self.assertIsInstance(tables, constrained.ConstraintTables)
     self.assertGreater(tables.num_states, 0)
 
-    # Test automatic compilation via constraint_pattern
+    # Test automatic compilation via constraint
     result = sampler(
         ["input string"],
         max_generation_steps=20,
-        constraint_pattern=_CATEGORY_REGEX,
+        constraint=_CATEGORY_REGEX,
     )
     self.assertRegex(result.text[0], _CATEGORY_REGEX)
 
@@ -232,9 +261,35 @@ class ConstrainedSamplerTest(parameterized.TestCase):
     }
 
     # Test explicit compile_constraint
-    tables = sampler.compile_constraint(schema=schema)
+    tables = sampler.compile_constraint(schema)
     self.assertIsInstance(tables, constrained.ConstraintTables)
     self.assertGreater(tables.num_states, 0)
+
+  def test_sampler_compile_unique_items_constraint(self):
+    """compile_constraint with uniqueItems enum array schema."""
+    sampler, vocab, _ = self._make_sampler_and_constraint()
+    schema = {
+        "type": "array",
+        "uniqueItems": True,
+        "items": {"enum": ["apple", "banana", "pear"]},
+    }
+    tables = sampler.compile_constraint(schema)
+    self.assertIsInstance(tables, constrained.ConstraintTables)
+    self.assertIsNotNone(tables.unique_items)
+    self.assertIsInstance(
+        tables.unique_items, constrained.UniqueItemsConstraint
+    )
+    self.assertGreater(tables.num_states, 0)
+
+  def test_cached_chain_constraints(self):
+    """cached_chain_constraints caches results across identical calls."""
+    sampler, vocab, _ = self._make_sampler_and_constraint()
+    schema = {"type": "integer"}
+
+    tables1 = sampler.compile_constraint(schema)
+    tables2 = sampler.compile_constraint(schema)
+
+    self.assertIs(tables1, tables2)
 
   def test_diagnose_constraint_tables(self):
     """diagnose_constraint_tables produces valid metadata."""
@@ -374,7 +429,7 @@ class ConstrainedSamplerTest(parameterized.TestCase):
     result = sampler.generate_from_tokens(
         input_ids=padded,
         max_generation_steps=20,
-        constraint_tables=constraint,
+        constraint=constraint,
     )
 
     generated_text = result.text[0]
@@ -670,11 +725,9 @@ class RegexEngineTest(absltest.TestCase):
     self.assertGreater(mem_mb_20, mem_mb_5)
 
   def test_json_schema_string_basic(self):
-    """Basic string schema produces bounded character class."""
-    pattern = constrained.json_schema_to_regex(
-        {"type": "string"}, max_string_chars=50
-    )
-    self.assertEqual(pattern, '"([^"]{0,50})"')
+    """Basic string schema produces character class."""
+    pattern = constrained.json_schema_to_regex({"type": "string"})
+    self.assertEqual(pattern, r'"([^"]*)"')
     # Validate against DFA.
     self._assert_dfa_accepts(pattern, '"hello"')
     self._assert_dfa_accepts(pattern, '""')
@@ -819,6 +872,319 @@ class RegexEngineTest(absltest.TestCase):
     pattern = constrained.json_schema_to_regex(schema)
     self._assert_dfa_accepts(pattern, '["hi", 42]')
     self._assert_dfa_rejects(pattern, '[42, "hi"]')
+
+  def test_unique_items_char_dfa_construction(self):
+    """Test factored character-level DFA for uniqueItems enum array."""
+    choices = ['"apple"', '"banana"', '"cherry"']
+    (
+        char_trans,
+        initial,
+        accept,
+        num_states,
+        comp_map,
+        is_bound,
+        is_after,
+        is_done,
+        *_,
+    ) = constrained._build_unique_items_char_dfa(
+        choices, min_items=1, max_items=3
+    )
+    # The structural DFA should be compact (~O(n*L) states, not O(2^n))
+    self.assertEqual(num_states, 29)
+    self.assertEqual(initial, 0)
+    self.assertIn(28, accept)
+
+    # Verify item completion tracking for completed items
+    completion_entries = [
+        (s, comp_map[s]) for s in range(num_states) if comp_map[s] >= 0
+    ]
+    self.assertEqual(
+        sorted(completion_entries),
+        [(24, 0), (25, 1), (26, 2)],
+    )
+
+    # Simulate matching valid array strings through char_trans
+    for test_str in [
+        '["apple"]',
+        '["apple", "banana"]',
+        '["cherry", "apple", "banana"]',
+    ]:
+      state = initial
+      for ch in test_str:
+        self.assertIn((state, ch), char_trans)
+        state = char_trans[(state, ch)]
+      self.assertIn(state, accept)
+
+  def test_unique_items_constraint_enforcement(self):
+    """Test factored DFA + bitmask unique-items enforcement at token level."""
+    token_map = {
+        0: "[",
+        1: "]",
+        2: ",",
+        3: " ",
+        4: '"apple"',
+        5: '"banana"',
+        6: '"cherry"',
+    }
+    vocab_size = 8
+
+    tables = constrained.build_unique_items_constraint(
+        choices=["apple", "banana", "cherry"],
+        min_items=2,
+        max_items=3,
+        token_id_to_str=token_map,
+        vocab_size=vocab_size,
+        eos_token_ids=[7],
+    )
+    unique = tables.unique_items
+    self.assertEqual(tables.num_states, 29)
+
+    tt = jnp.array(tables.token_transitions, dtype=jnp.int32)
+    unique_state = constrained.init_unique_items_loop_state(
+        unique, batch_size=1
+    )
+    state = jnp.array([tables.initial_state], dtype=jnp.int32)
+
+    # Generate ["apple", and advance state + seen_mask
+    for tok in [0, 4, 2, 3]:  # [, "apple", ,, ' '
+      state, unique_state = constrained.advance_state_unique(
+          state, jnp.array([tok]), tt, unique_state
+      )
+    self.assertEqual(int(unique_state.seen_mask[0]), 0b001)
+
+    # Check logits at the item boundary: "apple" (4) should be blocked,
+    # "banana" (5) & "cherry" (6) valid
+    logits = jnp.zeros((1, 1, vocab_size))
+    masked = constrained.constrained_logits_unique(
+        logits, state, tt, unique_state
+    )
+    valid = jnp.where(masked[0, 0] > -jnp.inf)[0].tolist()
+    self.assertNotIn(4, valid)
+    self.assertIn(5, valid)
+    self.assertIn(6, valid)
+
+    # Pick "banana", check that at after-item, ] is allowed (count=2 >= min=2)
+    state, unique_state = constrained.advance_state_unique(
+        state, jnp.array([5]), tt, unique_state
+    )
+    self.assertEqual(int(unique_state.seen_mask[0]), 0b011)
+    masked2 = constrained.constrained_logits_unique(
+        jnp.zeros((1, 1, vocab_size)),
+        state,
+        tt,
+        unique_state,
+    )
+    valid2 = jnp.where(masked2[0, 0] > -jnp.inf)[0].tolist()
+    self.assertIn(1, valid2)
+    self.assertIn(2, valid2)
+
+    # Continue with "," and " ", check at next boundary only "cherry" (6) is
+    # valid
+    state, unique_state = constrained.advance_state_unique(
+        state, jnp.array([2]), tt, unique_state
+    )
+    state, unique_state = constrained.advance_state_unique(
+        state, jnp.array([3]), tt, unique_state
+    )
+    masked3 = constrained.constrained_logits_unique(
+        jnp.zeros((1, 1, vocab_size)),
+        state,
+        tt,
+        unique_state,
+    )
+    valid3 = jnp.where(masked3[0, 0] > -jnp.inf)[0].tolist()
+    self.assertEqual(valid3, [6])
+
+  def test_unique_items_min_max_bounds_blocking(self):
+    """Test explicit blocking of ']' when count < minItems and ',' when count >= maxItems."""
+    token_map = {
+        0: "[",
+        1: "]",
+        2: ",",
+        3: " ",
+        4: '"apple"',
+        5: '"banana"',
+        6: '"cherry"',
+        7: '"durian"',
+    }
+    vocab_size = 9
+
+    tables = constrained.build_unique_items_constraint(
+        choices=["apple", "banana", "cherry", "durian"],
+        min_items=2,
+        max_items=2,
+        token_id_to_str=token_map,
+        vocab_size=vocab_size,
+        eos_token_ids=[8],
+    )
+    unique = tables.unique_items
+    tt = jnp.array(tables.token_transitions, dtype=jnp.int32)
+    unique_state = constrained.init_unique_items_loop_state(
+        unique, batch_size=1
+    )
+    state = jnp.array([tables.initial_state], dtype=jnp.int32)
+
+    # 1. Advance through "[" and '"apple"' -> count = 1 (< min_items=2)
+    for tok in [0, 4]:
+      state, unique_state = constrained.advance_state_unique(
+          state, jnp.array([tok]), tt, unique_state
+      )
+    self.assertEqual(int(unique_state.seen_mask[0]), 0b0001)
+
+    # At count=1, ']' (1) must be BLOCKED because min_items=2; ',' (2) must be allowed
+    masked1 = constrained.constrained_logits_unique(
+        jnp.zeros((1, 1, vocab_size)), state, tt, unique_state
+    )
+    valid1 = jnp.where(masked1[0, 0] > -jnp.inf)[0].tolist()
+    self.assertNotIn(1, valid1, "']' should be blocked when count < min_items")
+    self.assertIn(2, valid1, "',' should be allowed when count < max_items")
+
+    # 2. Advance through "," and " " and '"banana"' -> count = 2 (== max_items=2)
+    for tok in [2, 3, 5]:
+      state, unique_state = constrained.advance_state_unique(
+          state, jnp.array([tok]), tt, unique_state
+      )
+    self.assertEqual(int(unique_state.seen_mask[0]), 0b0011)
+
+    # At count=2, ']' (1) must be ALLOWED (min_items satisfied); ',' (2) must be BLOCKED (max_items reached)
+    masked2 = constrained.constrained_logits_unique(
+        jnp.zeros((1, 1, vocab_size)), state, tt, unique_state
+    )
+    valid2 = jnp.where(masked2[0, 0] > -jnp.inf)[0].tolist()
+    self.assertIn(1, valid2, "']' should be allowed when count >= min_items")
+    self.assertNotIn(2, valid2, "',' should be blocked when count >= max_items")
+
+  def test_unique_items_exhaustive_language_simulation(self):
+    """Exhaustively traverse all paths in the constraint state-space to prove language equivalence."""
+    choices = ["apple", "banana", "cherry"]
+    min_items = 1
+    max_items = 3
+
+    # Ground truth: all permutations of choices for length 1..3
+    import itertools
+    import json
+
+    expected_strings = set()
+    for k in range(min_items, max_items + 1):
+      for perm in itertools.permutations(choices, k):
+        expected_strings.add(json.dumps(list(perm)))
+
+    token_map = {
+        0: "[",
+        1: "]",
+        2: ",",
+        3: " ",
+        4: '"apple"',
+        5: '"banana"',
+        6: '"cherry"',
+    }
+    vocab_size = 7
+
+    tables = constrained.build_unique_items_constraint(
+        choices=choices,
+        min_items=min_items,
+        max_items=max_items,
+        token_id_to_str=token_map,
+        vocab_size=vocab_size,
+        eos_token_ids=[],
+    )
+    tt = jnp.array(tables.token_transitions, dtype=jnp.int32)
+    init_unique = constrained.init_unique_items_loop_state(
+        tables.unique_items, batch_size=1
+    )
+    accept_states = tables.accept_states
+
+    accepted_strings = set()
+    stack = [(tables.initial_state, init_unique, [])]
+
+    while stack:
+      dfa_st, u_state, tok_history = stack.pop()
+
+      if dfa_st in accept_states:
+        gen_str = "".join(token_map[t] for t in tok_history)
+        accepted_strings.add(gen_str)
+
+      logits = jnp.zeros((1, 1, vocab_size))
+      dfa_st_arr = jnp.array([dfa_st], dtype=jnp.int32)
+      masked = constrained.constrained_logits_unique(
+          logits, dfa_st_arr, tt, u_state
+      )
+      valid_tokens = jnp.where(masked[0, 0] > -jnp.inf)[0].tolist()
+
+      for next_tok in valid_tokens:
+        next_dfa_arr, next_u_state = constrained.advance_state_unique(
+            dfa_st_arr, jnp.array([next_tok]), tt, u_state
+        )
+        stack.append(
+            (int(next_dfa_arr[0]), next_u_state, tok_history + [next_tok])
+        )
+
+    self.assertEqual(accepted_strings, expected_strings)
+
+  def test_unique_items_enum_20_with_thinking(self):
+    """Test 20-item enum array with uniqueItems and thinking_terminal prefix."""
+    choices_20 = [f"item_{i}" for i in range(20)]
+    schema = {
+        "type": "array",
+        "uniqueItems": True,
+        "minItems": 1,
+        "maxItems": 20,
+        "items": {"enum": choices_20},
+    }
+
+    token_map = {0: "<", 1: "/", 2: "t", 3: ">", 4: "\n", 5: "[", 6: "]"}
+    for i, item in enumerate(choices_20):
+      token_map[7 + i] = f'"{item}"'
+
+    tables = constrained.chain_constraints(
+        constraints=[constrained.bounded_until("> ") + "\n", schema],
+        token_id_to_str=token_map,
+        vocab_size=len(token_map),
+        eos_token_ids=[99],
+    )
+    self.assertIsNotNone(tables.unique_items)
+    self.assertEqual(tables.unique_items.num_items, 20)
+    self.assertGreater(tables.num_states, 0)
+
+  def test_chain_constraints_multi_stage(self):
+    """Test chaining multiple schemas and regex patterns sequentially."""
+    stage1 = constrained.bounded_until("> ") + "\n"
+    stage2 = {
+        "type": "array",
+        "uniqueItems": True,
+        "minItems": 1,
+        "maxItems": 3,
+        "items": {"enum": ["apple", "banana", "cherry"]},
+    }
+    stage3 = "\nEnd"
+
+    token_map = {
+        0: "<",
+        1: "/",
+        2: "t",
+        3: ">",
+        4: "\n",
+        5: "[",
+        6: "]",
+        7: '"apple"',
+        8: '"banana"',
+        9: '"cherry"',
+        10: "E",
+        11: "n",
+        12: "d",
+    }
+
+    tables = constrained.chain_constraints(
+        constraints=[stage1, stage2, stage3],
+        token_id_to_str=token_map,
+        vocab_size=len(token_map),
+        eos_token_ids=[99],
+    )
+
+    self.assertIsNotNone(tables.unique_items)
+    self.assertEqual(tables.unique_items.num_items, 3)
+    self.assertGreater(tables.num_states, 0)
+    self.assertGreater(len(tables.accept_states), 0)
 
   def test_json_schema_anyof(self):
     schema = {
@@ -984,6 +1350,19 @@ class RegexEngineTest(absltest.TestCase):
         constrained.validate_string(text, ct, init, acc),
         f"DFA should reject {text!r} for pattern {pattern!r}",
     )
+
+  def test_freeze_helper(self):
+    """_freeze converts mutable dicts/lists into hashable tuples."""
+    schema = {
+        "b": 2,
+        "a": [1, {"c": 3}],
+    }
+    frozen1 = constrained._freeze(schema)
+    frozen2 = constrained._freeze({"a": [1, {"c": 3}], "b": 2})
+    self.assertEqual(frozen1, frozen2)
+    # Check that frozen key is hashable
+    d = {frozen1: "value"}
+    self.assertEqual(d[frozen2], "value")
 
 
 if __name__ == "__main__":
