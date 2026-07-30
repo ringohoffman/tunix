@@ -55,9 +55,9 @@ import dataclasses
 import functools
 import json
 import re
-from typing import Any, Literal, Optional, TypeAlias, TypedDict, overload
+from typing import Any, Literal, Optional, TypeAlias, TypedDict, cast, overload
 
-import flax
+import flax.struct
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -686,7 +686,7 @@ def _compile_token_transitions(
   return table
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, eq=False)
 class ConstraintTables:
   """Pre-compiled constraint tables for regex-guided decoding.
 
@@ -1037,17 +1037,18 @@ def _value_to_regex(value: Any) -> str:
 
 def _merge_allof(schemas: list[JsonSchema]) -> JsonSchema:
   """Merge a list of schemas for ``allOf`` (intersection of constraints)."""
-  merged: dict[str, Any] = {}
-  for s in schemas:
-    for k, v in s.items():
-      if k == "properties":
-        merged.setdefault("properties", {}).update(v)
-      elif k == "required":
-        existing = merged.setdefault("required", [])
-        existing.extend(r for r in v if r not in existing)
-      else:
-        merged[k] = v
-  return merged  # type: ignore[return-value]
+  merged: JsonSchema = {}
+  for schema in schemas:
+    schema_copy = schema.copy()
+    if properties := schema_copy.pop("properties", None):
+      merged.setdefault("properties", {}).update(properties)
+    if required := schema_copy.pop("required", None):
+      already_required = merged.setdefault("required", [])
+      already_required.extend(
+          field for field in required if field not in already_required
+      )
+    merged.update(schema_copy)
+  return merged
 
 
 def _string_schema_to_regex(schema: JsonSchema) -> str:
@@ -1686,9 +1687,9 @@ def build_constraint_from_schema(
   if (
       schema.get("type") == "array"
       and schema.get("uniqueItems", False)
-      and "enum" in schema.get("items", {})
+      and "items" in schema
+      and "enum" in (items_schema := schema["items"])
   ):
-    items_schema = schema["items"]
     return build_unique_items_constraint(
         choices=items_schema["enum"],
         min_items=schema.get("minItems", 0),
@@ -1707,6 +1708,22 @@ def build_constraint_from_schema(
       vocab_size=vocab_size,
       eos_token_ids=eos_token_ids,
   )
+
+
+def _flatten_constraints(constraints: Constraint) -> list[ConstraintItem]:
+  """Recursively flatten nested constraint sequences into a flat list, merging adjacent string patterns."""
+  if isinstance(constraints, (dict, str, ConstraintTables)):
+    return [constraints]
+  if isinstance(constraints, Sequence):
+    flat: list[ConstraintItem] = []
+    for item in constraints:
+      for sub in _flatten_constraints(item):
+        if isinstance(sub, str) and flat and isinstance(flat[-1], str):
+          flat[-1] = flat[-1] + sub
+        else:
+          flat.append(sub)
+    return flat
+  raise TypeError(f"Unsupported constraint type: {type(constraints)}")
 
 
 def chain_constraints(
@@ -1735,129 +1752,161 @@ def chain_constraints(
   Returns:
       A single chained ConstraintTables object.
   """
-  if isinstance(constraints, (dict, str, ConstraintTables)):
-    constraints_seq = [constraints]
-  else:
-    constraints_seq = constraints
+  constraint_items = _flatten_constraints(constraints)
 
-  if not constraints_seq:
+  if not constraint_items:
     raise ValueError("constraints list cannot be empty.")
 
   compiled_stages: list[ConstraintTables] = []
-  for c in constraints_seq:
-    if isinstance(c, ConstraintTables):
-      compiled_stages.append(c)
-    elif isinstance(c, dict):
+  for constraint_item in constraint_items:
+    if isinstance(constraint_item, ConstraintTables):
+      compiled_stages.append(constraint_item)
+    elif isinstance(constraint_item, dict):
       compiled_stages.append(
           build_constraint_from_schema(
-              c,
+              constraint_item,
               token_id_to_str,
               vocab_size,
               eos_token_ids,
               indent=indent,
           )
       )
-    elif isinstance(c, str):
+    elif isinstance(constraint_item, str):
       compiled_stages.append(
-          build_regex_constraint(c, token_id_to_str, vocab_size, eos_token_ids)
+          build_regex_constraint(
+              constraint_item, token_id_to_str, vocab_size, eos_token_ids
+          )
       )
     else:
-      raise TypeError(f"Unsupported constraint element type: {type(c)}")
+      raise TypeError(
+          f"Unsupported constraint element type: {type(constraint_item)}"
+      )
 
   if len(compiled_stages) == 1:
     return compiled_stages[0]
 
-  total_states = sum(st.num_states for st in compiled_stages)
+  total_states = sum(stage.num_states for stage in compiled_stages)
   offsets = []
-  curr_off = 0
-  for st in compiled_stages:
-    offsets.append(curr_off)
-    curr_off += st.num_states
+  current_offset = 0
+  for stage in compiled_stages:
+    offsets.append(current_offset)
+    current_offset += stage.num_states
 
-  combined_tt = np.full(
+  combined_token_transitions = np.full(
       (total_states, vocab_size), INVALID_STATE, dtype=np.int32
   )
 
-  for i, st in enumerate(compiled_stages):
-    off = offsets[i]
-    for s in range(st.num_states):
-      for v in range(vocab_size):
-        next_s = st.token_transitions[s, v]
-        if next_s != INVALID_STATE:
-          combined_tt[off + s, v] = off + next_s
+  for stage_index, stage in enumerate(compiled_stages):
+    offset = offsets[stage_index]
+    for state_id in range(stage.num_states):
+      for token_id in range(vocab_size):
+        next_state = stage.token_transitions[state_id, token_id]
+        if next_state != INVALID_STATE:
+          combined_token_transitions[offset + state_id, token_id] = (
+              offset + next_state
+          )
 
-  for i in range(len(compiled_stages) - 1):
-    curr_st = compiled_stages[i]
-    next_st = compiled_stages[i + 1]
-    curr_off = offsets[i]
-    next_off = offsets[i + 1]
+  for stage_index in range(len(compiled_stages) - 1):
+    current_stage = compiled_stages[stage_index]
+    next_stage = compiled_stages[stage_index + 1]
+    current_offset = offsets[stage_index]
+    next_offset = offsets[stage_index + 1]
 
-    for acc in curr_st.accept_states:
-      acc_global = curr_off + acc
-      for v in range(vocab_size):
-        if combined_tt[acc_global, v] == INVALID_STATE:
-          next_target = next_st.token_transitions[next_st.initial_state, v]
+    for accept_state in current_stage.accept_states:
+      global_accept_state = current_offset + accept_state
+      for token_id in range(vocab_size):
+        if (
+            combined_token_transitions[global_accept_state, token_id]
+            == INVALID_STATE
+        ):
+          next_target = next_stage.token_transitions[
+              next_stage.initial_state, token_id
+          ]
           if next_target != INVALID_STATE:
-            combined_tt[acc_global, v] = next_off + next_target
+            combined_token_transitions[global_accept_state, token_id] = (
+                next_offset + next_target
+            )
 
   initial_state = offsets[0] + compiled_stages[0].initial_state
-  last_st = compiled_stages[-1]
-  last_off = offsets[-1]
-  accept_states = frozenset([last_off + acc for acc in last_st.accept_states])
+  last_stage = compiled_stages[-1]
+  last_offset = offsets[-1]
+  accept_states = frozenset(
+      [last_offset + accept_state for accept_state in last_stage.accept_states]
+  )
 
   unique_info = None
-  for i, st in enumerate(compiled_stages):
-    if st.unique_items is not None:
-      u = st.unique_items
-      off = offsets[i]
+  for stage_index, stage in enumerate(compiled_stages):
+    if stage.unique_items is not None:
+      unique_items = stage.unique_items
+      offset = offsets[stage_index]
       if unique_info is None:
-        c_icm = np.full(total_states, -1, dtype=np.int32)
-        c_cli = np.zeros((total_states, vocab_size), dtype=np.int32)
-        c_ib = np.zeros(total_states, dtype=bool)
-        c_ia = np.zeros(total_states, dtype=bool)
-        c_ltc = np.zeros((total_states, vocab_size), dtype=bool)
-        c_ltk = np.zeros((total_states, vocab_size), dtype=bool)
-        u_min = u.min_items
-        u_max = u.max_items
-        u_num = u.num_items
+        chained_completion_map = np.full(total_states, -1, dtype=np.int32)
+        chained_can_lead_to_items = np.zeros(
+            (total_states, vocab_size), dtype=np.int32
+        )
+        chained_is_item_boundary = np.zeros(total_states, dtype=bool)
+        chained_is_after_item = np.zeros(total_states, dtype=bool)
+        chained_leads_to_close = np.zeros(
+            (total_states, vocab_size), dtype=bool
+        )
+        chained_leads_to_continue = np.zeros(
+            (total_states, vocab_size), dtype=bool
+        )
+        unique_min_items = unique_items.min_items
+        unique_max_items = unique_items.max_items
+        unique_num_items = unique_items.num_items
       else:
-        c_icm = unique_info.item_completion_map
-        c_cli = unique_info.can_lead_to_items
-        c_ib = unique_info.is_item_boundary
-        c_ia = unique_info.is_after_item
-        c_ltc = unique_info.leads_to_close
-        c_ltk = unique_info.leads_to_continue
-        u_min = u.min_items
-        u_max = u.max_items
-        u_num = u.num_items
+        chained_completion_map = unique_info.item_completion_map
+        chained_can_lead_to_items = unique_info.can_lead_to_items
+        chained_is_item_boundary = unique_info.is_item_boundary
+        chained_is_after_item = unique_info.is_after_item
+        chained_leads_to_close = unique_info.leads_to_close
+        chained_leads_to_continue = unique_info.leads_to_continue
+        unique_min_items = unique_items.min_items
+        unique_max_items = unique_items.max_items
+        unique_num_items = unique_items.num_items
 
-      c_icm[off : off + st.num_states] = u.item_completion_map
-      c_cli[off : off + st.num_states, :] = u.can_lead_to_items
-      c_ib[off : off + st.num_states] = u.is_item_boundary
-      c_ia[off : off + st.num_states] = u.is_after_item
-      c_ltc[off : off + st.num_states, :] = u.leads_to_close
-      c_ltk[off : off + st.num_states, :] = u.leads_to_continue
-
-      unique_info = UniqueItemsConstraint(
-          item_completion_map=c_icm,
-          can_lead_to_items=c_cli,
-          is_item_boundary=c_ib,
-          is_after_item=c_ia,
-          leads_to_close=c_ltc,
-          leads_to_continue=c_ltk,
-          min_items=u_min,
-          max_items=u_max,
-          num_items=u_num,
+      chained_completion_map[offset : offset + stage.num_states] = (
+          unique_items.item_completion_map
+      )
+      chained_can_lead_to_items[offset : offset + stage.num_states, :] = (
+          unique_items.can_lead_to_items
+      )
+      chained_is_item_boundary[offset : offset + stage.num_states] = (
+          unique_items.is_item_boundary
+      )
+      chained_is_after_item[offset : offset + stage.num_states] = (
+          unique_items.is_after_item
+      )
+      chained_leads_to_close[offset : offset + stage.num_states, :] = (
+          unique_items.leads_to_close
+      )
+      chained_leads_to_continue[offset : offset + stage.num_states, :] = (
+          unique_items.leads_to_continue
       )
 
-  min_tokens = max((st.min_tokens for st in compiled_stages), default=0)
+      unique_info = UniqueItemsConstraint(
+          item_completion_map=chained_completion_map,
+          can_lead_to_items=chained_can_lead_to_items,
+          is_item_boundary=chained_is_item_boundary,
+          is_after_item=chained_is_after_item,
+          leads_to_close=chained_leads_to_close,
+          leads_to_continue=chained_leads_to_continue,
+          min_items=unique_min_items,
+          max_items=unique_max_items,
+          num_items=unique_num_items,
+      )
+
+  min_tokens = max((stage.min_tokens for stage in compiled_stages), default=0)
   max_tokens_list = [
-      st.max_tokens for st in compiled_stages if st.max_tokens is not None
+      stage.max_tokens
+      for stage in compiled_stages
+      if stage.max_tokens is not None
   ]
   max_tokens = min(max_tokens_list) if max_tokens_list else None
 
   tables = ConstraintTables(
-      token_transitions=combined_tt,
+      token_transitions=combined_token_transitions,
       initial_state=initial_state,
       num_states=total_states,
       accept_states=accept_states,
@@ -1869,36 +1918,27 @@ def chain_constraints(
 
 
 ConstraintItem: TypeAlias = str | JsonSchema | ConstraintTables
-Constraint: TypeAlias = ConstraintItem | Sequence[ConstraintItem]
+Constraint: TypeAlias = ConstraintItem | Sequence["Constraint"]
 
 FrozenHashable: TypeAlias = tuple[Literal["hashable"], Hashable]
 FrozenDictPair: TypeAlias = tuple[str, "FrozenKey"]
 FrozenDict: TypeAlias = tuple[Literal["dict"], tuple[FrozenDictPair, ...]]
 FrozenSeq: TypeAlias = tuple[Literal["seq"], tuple["FrozenKey", ...]]
-FrozenTables: TypeAlias = tuple[Literal["tables"], int]
-FrozenId: TypeAlias = tuple[Literal["id"], int]
-FrozenKey: TypeAlias = (
-    FrozenHashable | FrozenDict | FrozenSeq | FrozenTables | FrozenId
-)
+FrozenKey: TypeAlias = FrozenHashable | FrozenDict | FrozenSeq
+
+
+@overload
+def _freeze(obj: Mapping[Any, Any]) -> FrozenDict:
+  ...
+
+
+@overload
+def _freeze(obj: list[ConstraintItem]) -> FrozenSeq:
+  ...
 
 
 @overload
 def _freeze(obj: Hashable) -> FrozenHashable:
-  ...
-
-
-@overload
-def _freeze(obj: JsonSchema) -> FrozenDict:
-  ...
-
-
-@overload
-def _freeze(obj: Sequence[ConstraintItem]) -> FrozenSeq:
-  ...
-
-
-@overload
-def _freeze(obj: ConstraintTables) -> FrozenTables:
   ...
 
 
@@ -1914,33 +1954,45 @@ def _freeze(obj: Any) -> FrozenKey:
     return ("dict", tuple(sorted((k, _freeze(v)) for k, v in obj.items())))
   elif isinstance(obj, Sequence) and not isinstance(obj, (str, bytes)):
     return ("seq", tuple(_freeze(x) for x in obj))
-  elif isinstance(obj, ConstraintTables):
-    return ("tables", id(obj))
-  return ("id", id(obj))
+  raise TypeError(f"Unsupported type for freezing: {type(obj)}")
+
+
+@overload
+def _unfreeze(frozen: FrozenHashable) -> Hashable:
+  ...
+
+
+@overload
+def _unfreeze(frozen: FrozenSeq) -> Sequence[ConstraintItem]:
+  ...
+
+
+@overload
+def _unfreeze(frozen: FrozenDict) -> JsonSchema:
+  ...
 
 
 def _unfreeze(frozen: FrozenKey) -> Any:
   """Reconstructs original objects from frozen representations."""
-  tag, payload = frozen[0], frozen[1]
-  if tag == "hashable":
-    return payload
-  elif tag == "dict":
-    return {k: _unfreeze(v) for k, v in payload}
-  elif tag == "seq":
-    return [_unfreeze(x) for x in payload]
-  return payload
+  if frozen[0] == "hashable":
+    return frozen[1]
+  elif frozen[0] == "dict":
+    return {k: _unfreeze(v) for k, v in frozen[1]}
+  elif frozen[0] == "seq":
+    return [_unfreeze(item) for item in frozen[1]]
+  return frozen[1]
 
 
 @functools.lru_cache(maxsize=128)
-def _cached_chain_constraints_impl(
+def _cached_chain_constraints(
     frozen_constraints: FrozenKey,
     frozen_tok_map: FrozenKey,
     vocab_size: int,
     eos_token_ids: tuple[int, ...],
     indent: int,
 ) -> ConstraintTables:
-  constraints = _unfreeze(frozen_constraints)
-  token_id_to_str = _unfreeze(frozen_tok_map)
+  constraints = cast(Constraint, _unfreeze(frozen_constraints))
+  token_id_to_str = cast(Mapping[int, str], _unfreeze(frozen_tok_map))
   return chain_constraints(
       constraints,
       token_id_to_str=token_id_to_str,
@@ -1965,7 +2017,7 @@ def cached_chain_constraints(
   frozen_constraints = _freeze(constraints)
   frozen_tok_map = _freeze(token_id_to_str)
   eos_tuple = tuple(eos_token_ids)
-  return _cached_chain_constraints_impl(
+  return _cached_chain_constraints(
       frozen_constraints,
       frozen_tok_map,
       vocab_size,
@@ -2078,7 +2130,7 @@ def advance_state_unique(
   )
   new_seen = unique_state.seen_mask | item_bit
 
-  return new_state, unique_state.replace(seen_mask=new_seen)
+  return new_state, dataclasses.replace(unique_state, seen_mask=new_seen)
 
 
 def _array_schema_to_regex(
@@ -2159,23 +2211,18 @@ def _schema_to_regex(
     # Carry over any top-level keys not in the sub-schemas.
     for k, v in schema.items():
       if k != "allOf" and k not in merged:
-        merged[k] = v  # type: ignore[literal-required]
+        merged[k] = v
     return _schema_to_regex(merged, indent, depth)
 
-  for keyword in ("anyOf", "oneOf"):
-    if keyword in schema:
-      alts = [_schema_to_regex(s, indent, depth) for s in schema[keyword]]
-      return f'({"|".join(alts)})'
+  if sub_schema := schema.get("anyOf") or schema.get("oneOf"):
+    alts = [_schema_to_regex(s, indent, depth) for s in sub_schema]
+    return f'({"|".join(alts)})'
 
   schema_type = schema.get("type")
 
   if isinstance(schema_type, list):
     alts = [
-        _schema_to_regex(
-            {**{k: v for k, v in schema.items() if k != "type"}, "type": t},
-            indent,
-            depth,
-        )
+        _schema_to_regex({**schema, "type": t}, indent, depth)
         for t in schema_type
     ]
     return f'({"|".join(alts)})'
