@@ -308,6 +308,11 @@ def _regex_to_nfa(pattern: str) -> tuple[_NfaNode, _NfaNode]:
 
     if ch == "(":
       advance()  # consume '('
+      # Skip non-capturing group prefix '?:' — functionally identical
+      # to a regular group since the NFA does not capture.
+      if peek() == "?" and pos + 1 < len(pattern) and pattern[pos + 1] == ":":
+        advance()  # consume '?'
+        advance()  # consume ':'
       start, accept = parse_regex()
       if peek() != ")":
         raise ValueError("Missing closing parenthesis")
@@ -1216,31 +1221,32 @@ class UniqueItemsConstraint:
   uniqueness.  The sampler carries a ``seen_mask`` (int32 bitmask per batch
   element) and uses these tables to apply additional token blocking.
 
+  All token-level tables are indexed by ``(state, token)`` to correctly
+  handle multi-character tokens that span item boundaries.  Earlier versions
+  used state-level metadata (``is_item_boundary[state]``,
+  ``is_after_item[state]``, ``item_completion_map[state]``) which failed when
+  subword tokens (e.g. ``\",\"``) jumped over completion or boundary states.
+
   Attributes:
-      item_completion_map: Shape ``[S]``, int32.  Maps each DFA state to the
-        item index (0..n-1) that was just completed upon entering that state, or
-        ``-1`` if the state is not an item-completion state.
+      token_completions: Shape ``[S, V]``, int32.  Bitmask of items completed
+        during the character-by-character simulation of token ``v`` from state
+        ``s``.  Captures intermediate completions that are invisible to the
+        final-state-only ``item_completion_map``.
       can_lead_to_items: Shape ``[S, V]``, int32.  For each ``(state, token)``
         pair, a bitmask of which items that token could lead to matching from
         that state.  Zero means the token doesn't start any item from that
         state.
-      is_item_boundary: Shape ``[S]``, bool.  True if the state is an item
-        boundary (expects the start of a new item).
-      is_after_item: Shape ``[S]``, bool.  True if the state is an after-item
-        state (just completed an item, expects ``,`` or ``]``).
       leads_to_close: Shape ``[S, V]``, bool.  True if token ``v`` from state
-        ``s`` transitions toward closing the array (``]``).
+        ``s`` transitions through or toward closing the array (``]``).
       leads_to_continue: Shape ``[S, V]``, bool.  True if token ``v`` from state
-        ``s`` transitions toward the separator (``,``).
+        ``s`` transitions through or toward the separator (``,``).
       min_items: Minimum items required.
       max_items: Maximum items allowed.
       num_items: Number of distinct enum choices.
   """
 
-  item_completion_map: np.ndarray
+  token_completions: np.ndarray
   can_lead_to_items: np.ndarray
-  is_item_boundary: np.ndarray
-  is_after_item: np.ndarray
   leads_to_close: np.ndarray
   leads_to_continue: np.ndarray
   min_items: int
@@ -1257,23 +1263,20 @@ class UniqueItemsLoopState:
 
   Attributes:
       seen_mask: Shape ``[B]``, int32 bitmask of consumed items per batch.
+      token_completions: Shape ``[S, V]``, int32 bitmask of items completed
+        during intermediate character states for each (state, token) pair.
       can_lead_to_items: Shape ``[S, V]``, int32 item-reachability bitmask.
-      is_item_boundary: Shape ``[S]``, bool.
-      is_after_item: Shape ``[S]``, bool.
       leads_to_close: Shape ``[S, V]``, bool.
       leads_to_continue: Shape ``[S, V]``, bool.
-      completion_map: Shape ``[S]``, int32, state → completed item or -1.
       min_items: Minimum items required.
       max_items: Maximum items allowed.
   """
 
   seen_mask: jnp.ndarray  # [B] int32 — dynamic
+  token_completions: jnp.ndarray  # [S, V] int32 — static
   can_lead_to_items: jnp.ndarray  # [S, V] int32 — static
-  is_item_boundary: jnp.ndarray  # [S] bool — static
-  is_after_item: jnp.ndarray  # [S] bool — static
   leads_to_close: jnp.ndarray  # [S, V] bool — static
   leads_to_continue: jnp.ndarray  # [S, V] bool — static
-  completion_map: jnp.ndarray  # [S] int32 — static
   min_items: int = flax.struct.field(pytree_node=False, default=0)
   max_items: int = flax.struct.field(pytree_node=False, default=0)
 
@@ -1297,12 +1300,10 @@ def init_unique_items_loop_state(
   """
   return UniqueItemsLoopState(
       seen_mask=jnp.zeros((batch_size,), dtype=jnp.int32),
+      token_completions=jnp.array(info.token_completions, dtype=jnp.int32),
       can_lead_to_items=jnp.array(info.can_lead_to_items, dtype=jnp.int32),
-      is_item_boundary=jnp.array(info.is_item_boundary, dtype=jnp.bool_),
-      is_after_item=jnp.array(info.is_after_item, dtype=jnp.bool_),
       leads_to_close=jnp.array(info.leads_to_close, dtype=jnp.bool_),
       leads_to_continue=jnp.array(info.leads_to_continue, dtype=jnp.bool_),
-      completion_map=jnp.array(info.item_completion_map, dtype=jnp.int32),
       min_items=info.min_items,
       max_items=info.max_items,
   )
@@ -1641,24 +1642,70 @@ def build_unique_items_constraint(
       if next_s != INVALID_STATE:
         can_lead_to_items[s, v] = reachable_items[next_s]
 
-  # Build leads_to_close and leads_to_continue for AFTER_ITEM states.
+  # Build token_completions[state, token] -> bitmask of items completed
+  # during intermediate character states when processing token v from state s.
+  # This correctly handles multi-character tokens like '","' that span
+  # item-completion states.  Without this, completions at intermediate
+  # character positions are invisible to the final-state-only lookup.
+  char_table = np.full((num_states, 256), INVALID_STATE, dtype=np.int32)
+  for state in range(num_states):
+    for b in range(256):
+      ch = chr(b)
+      if (state, ch) in char_transitions:
+        char_table[state, b] = char_transitions[(state, ch)]
+      elif (state, _ANY_CHAR) in char_transitions:
+        char_table[state, b] = char_transitions[(state, _ANY_CHAR)]
+
+  eos_set = set(eos_token_ids)
+  token_completions = np.zeros((num_states, vocab_size), dtype=np.int32)
+  for token_id in range(vocab_size):
+    if token_id in eos_set:
+      continue
+    token_str = token_id_to_str.get(token_id)
+    if not token_str:
+      continue
+    token_bytes = token_str.encode("utf-8", errors="replace")
+    # Simulate character-by-character from each starting state
+    for s in range(num_states):
+      cur = s
+      completions = np.int32(0)
+      for byte_val in token_bytes:
+        if cur == INVALID_STATE:
+          break
+        next_cur = int(char_table[cur, byte_val])
+        if next_cur != INVALID_STATE and item_completion_map[next_cur] >= 0:
+          completions |= np.int32(1) << np.int32(item_completion_map[next_cur])
+        cur = next_cur
+      if cur != INVALID_STATE:
+        token_completions[s, token_id] = completions
+
+  # Build leads_to_close and leads_to_continue at token level.
+  # These are computed for ALL states, not just after-item states, because
+  # multi-character tokens can span from mid-item through completion to the
+  # separator or closing bracket.
   leads_to_close = np.zeros((num_states, vocab_size), dtype=bool)
   leads_to_continue = np.zeros((num_states, vocab_size), dtype=bool)
   for s in range(num_states):
-    if is_after_item[s]:
-      for v in range(vocab_size):
-        next_s = token_transitions[s, v]
-        if next_s != INVALID_STATE:
+    for v in range(vocab_size):
+      next_s = token_transitions[s, v]
+      if next_s != INVALID_STATE:
+        # A token needs min/max enforcement if:
+        # (a) The current state is an after-item state (item was completed
+        #     by a previous token, seen_mask already recorded it), OR
+        # (b) This token itself completes an item during its character
+        #     simulation (token_completions captures this).
+        needs_enforcement = (
+            is_after_item[s] or token_completions[s, v] != 0
+        )
+        if needs_enforcement:
           if is_done[next_s]:
             leads_to_close[s, v] = True
-          else:
+          elif next_s != s:
             leads_to_continue[s, v] = True
 
   unique_info = UniqueItemsConstraint(
-      item_completion_map=item_completion_map,
+      token_completions=token_completions,
       can_lead_to_items=can_lead_to_items,
-      is_item_boundary=is_item_boundary,
-      is_after_item=is_after_item,
       leads_to_close=leads_to_close,
       leads_to_continue=leads_to_continue,
       min_items=min_items,
@@ -1840,12 +1887,12 @@ def chain_constraints(
       unique_items = stage.unique_items
       offset = offsets[stage_index]
       if unique_info is None:
-        chained_completion_map = np.full(total_states, -1, dtype=np.int32)
+        chained_token_completions = np.zeros(
+            (total_states, vocab_size), dtype=np.int32
+        )
         chained_can_lead_to_items = np.zeros(
             (total_states, vocab_size), dtype=np.int32
         )
-        chained_is_item_boundary = np.zeros(total_states, dtype=bool)
-        chained_is_after_item = np.zeros(total_states, dtype=bool)
         chained_leads_to_close = np.zeros(
             (total_states, vocab_size), dtype=bool
         )
@@ -1856,27 +1903,19 @@ def chain_constraints(
         unique_max_items = unique_items.max_items
         unique_num_items = unique_items.num_items
       else:
-        chained_completion_map = unique_info.item_completion_map
+        chained_token_completions = unique_info.token_completions
         chained_can_lead_to_items = unique_info.can_lead_to_items
-        chained_is_item_boundary = unique_info.is_item_boundary
-        chained_is_after_item = unique_info.is_after_item
         chained_leads_to_close = unique_info.leads_to_close
         chained_leads_to_continue = unique_info.leads_to_continue
         unique_min_items = unique_items.min_items
         unique_max_items = unique_items.max_items
         unique_num_items = unique_items.num_items
 
-      chained_completion_map[offset : offset + stage.num_states] = (
-          unique_items.item_completion_map
+      chained_token_completions[offset : offset + stage.num_states, :] = (
+          unique_items.token_completions
       )
       chained_can_lead_to_items[offset : offset + stage.num_states, :] = (
           unique_items.can_lead_to_items
-      )
-      chained_is_item_boundary[offset : offset + stage.num_states] = (
-          unique_items.is_item_boundary
-      )
-      chained_is_after_item[offset : offset + stage.num_states] = (
-          unique_items.is_after_item
       )
       chained_leads_to_close[offset : offset + stage.num_states, :] = (
           unique_items.leads_to_close
@@ -1886,10 +1925,8 @@ def chain_constraints(
       )
 
       unique_info = UniqueItemsConstraint(
-          item_completion_map=chained_completion_map,
+          token_completions=chained_token_completions,
           can_lead_to_items=chained_can_lead_to_items,
-          is_item_boundary=chained_is_item_boundary,
-          is_after_item=chained_is_after_item,
           leads_to_close=chained_leads_to_close,
           leads_to_continue=chained_leads_to_continue,
           min_items=unique_min_items,
@@ -2035,6 +2072,10 @@ def constrained_logits_unique(
 ) -> jnp.ndarray:
   """Mask logits enforcing both structural DFA and uniqueness constraints.
 
+  All uniqueness metadata is token-level ``[S, V]`` to correctly handle
+  multi-character tokens that span item boundaries.  No state-level gates
+  are used.
+
   Pure JAX, safe for ``jax.lax.while_loop``.
 
   Args:
@@ -2069,28 +2110,22 @@ def constrained_logits_unique(
           max_force, structural_mask & force_mask_curr, structural_mask
       )
 
-  # 2. Uniqueness constraint at item boundaries.
+  # 2. Uniqueness constraint — token-level, no state-level gates.
   # Block tokens that can ONLY lead to already-seen items.
-  at_boundary = unique_state.is_item_boundary[constraint_state]  # [B]
   cli = unique_state.can_lead_to_items[constraint_state]  # [B, V] bitmasks
   # remaining = items this token can lead to that are NOT yet seen
   remaining = cli & ~unique_state.seen_mask[:, None]  # [B, V]
-  # Block if: at boundary AND token leads to some item AND no unseen item
-  uniqueness_block = at_boundary[:, None] & (cli != 0) & (remaining == 0)
+  # Block if: token leads to some item AND no unseen item reachable
+  uniqueness_block = (cli != 0) & (remaining == 0)
 
-  # 3. Min/max enforcement at after-item states.
-  at_after = unique_state.is_after_item[constraint_state]  # [B]
+  # 3. Min/max enforcement — token-level, no state-level gates.
   count = jax.lax.population_count(unique_state.seen_mask)  # [B]
   ltc = unique_state.leads_to_close[constraint_state]  # [B, V]
   ltk = unique_state.leads_to_continue[constraint_state]  # [B, V]
-  # Block ']' if count < min_items
-  close_block = (
-      at_after[:, None] & ltc & (count < unique_state.min_items)[:, None]
-  )
-  # Block ',' if count >= max_items
-  continue_block = (
-      at_after[:, None] & ltk & (count >= unique_state.max_items)[:, None]
-  )
+  # Block close-path tokens if count < min_items
+  close_block = ltc & (count < unique_state.min_items)[:, None]
+  # Block continue-path tokens if count >= max_items
+  continue_block = ltk & (count >= unique_state.max_items)[:, None]
 
   # Combine all masks.
   final_mask = (
@@ -2105,7 +2140,11 @@ def advance_state_unique(
     token_transitions: jnp.ndarray,
     unique_state: UniqueItemsLoopState,
 ) -> tuple[jnp.ndarray, UniqueItemsLoopState]:
-  """Advance the DFA state and update the unique-items state.
+  """Advance the DFA state and update the unique-items seen_mask.
+
+  Uses ``token_completions[state, token]`` to capture item completions
+  that occur at intermediate character positions within multi-character
+  tokens.
 
   Pure JAX, safe for ``jax.lax.while_loop``.
 
@@ -2120,15 +2159,12 @@ def advance_state_unique(
   """
   new_state = token_transitions[constraint_state, next_token]  # [B]
 
-  # Check if the new state completes an item.
-  completed_item = unique_state.completion_map[new_state]  # [B], -1 if none
-  # Set the bit for the completed item (no-op if -1 since 1 << -1 is 0 in JAX)
-  item_bit = jnp.where(
-      completed_item >= 0,
-      jnp.int32(1) << completed_item,
-      jnp.int32(0),
-  )
-  new_seen = unique_state.seen_mask | item_bit
+  # Look up the bitmask of items completed during this token's character
+  # simulation (including intermediate states).
+  completed_bitmask = unique_state.token_completions[
+      constraint_state, next_token
+  ]  # [B]
+  new_seen = unique_state.seen_mask | completed_bitmask
 
   return new_state, dataclasses.replace(unique_state, seen_mask=new_seen)
 

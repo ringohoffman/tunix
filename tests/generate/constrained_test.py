@@ -1056,6 +1056,159 @@ class RegexEngineTest(absltest.TestCase):
     self.assertIn(1, valid2, "']' should be allowed when count >= min_items")
     self.assertNotIn(2, valid2, "',' should be blocked when count >= max_items")
 
+  def test_unique_items_multi_char_tokens_spanning_boundaries(self):
+    """Regression: multi-char tokens like '\",' must not bypass uniqueness.
+
+    Subword tokenizers routinely produce tokens that span item boundaries.
+    For example, token '\",' contains the closing quote (completing an item)
+    and the separator comma.  Token ' \"' contains the space and the opening
+    quote of the next item.  The uniqueness enforcement must correctly track
+    completions at intermediate character positions within such tokens.
+    """
+    # Vocabulary with boundary-spanning multi-char tokens.
+    token_map = {
+        0: "[",
+        1: "]",
+        2: ",",
+        3: " ",
+        4: '"',
+        5: '",',       # closing quote + comma — spans item completion
+        6: ' "',       # space + opening quote — spans separator + boundary
+        7: "apple",
+        8: "banana",
+        9: "cherry",
+    }
+    vocab_size = 10
+
+    tables = constrained.build_unique_items_constraint(
+        choices=["apple", "banana", "cherry"],
+        min_items=1,
+        max_items=3,
+        token_id_to_str=token_map,
+        vocab_size=vocab_size,
+        eos_token_ids=[],
+    )
+    tt = jnp.array(tables.token_transitions, dtype=jnp.int32)
+    unique = tables.unique_items
+    init_u = constrained.init_unique_items_loop_state(unique, batch_size=1)
+
+    # Simulate: ["apple", "banana", ...
+    # Using multi-char tokens: [, ", apple, ",  (token 5 = '",'), ' "' (token 6), banana, ",
+    state = jnp.array([tables.initial_state], dtype=jnp.int32)
+    u = init_u
+
+    # [ " apple ",  <-- tokens 0, 4, 7, 5 (the last one spans completion+comma)
+    for tok in [0, 4, 7, 5]:
+      state, u = constrained.advance_state_unique(
+          state, jnp.array([tok]), tt, u
+      )
+    # "apple" should be marked as seen even though completion happened mid-token
+    self.assertNotEqual(
+        int(u.seen_mask[0]), 0,
+        "seen_mask must be updated by multi-char token that spans completion"
+    )
+    self.assertEqual(
+        int(u.seen_mask[0]) & 1, 1,
+        "apple (item 0) should be marked as seen"
+    )
+
+    # ' "' (token 6) then banana (token 8) then '",' (token 5)
+    for tok in [6, 8, 5]:
+      state, u = constrained.advance_state_unique(
+          state, jnp.array([tok]), tt, u
+      )
+    self.assertEqual(
+        int(u.seen_mask[0]) & 0b011, 0b011,
+        "both apple and banana should be seen"
+    )
+
+    # At this point, only "cherry" should be valid.  Verify via logits masking.
+    # After '",' we need ' "' (token 6) to start the next item.
+    state, u = constrained.advance_state_unique(
+        state, jnp.array([6]), tt, u
+    )
+    logits = jnp.zeros((1, 1, vocab_size))
+    masked = constrained.constrained_logits_unique(logits, state, tt, u)
+    valid = jnp.where(masked[0, 0] > -jnp.inf)[0].tolist()
+
+    # "cherry" (9) should be allowed; "apple" (7) and "banana" (8) should be blocked
+    self.assertIn(9, valid, "cherry should be allowed (not yet seen)")
+    self.assertNotIn(7, valid, "apple should be blocked (already seen)")
+    self.assertNotIn(8, valid, "banana should be blocked (already seen)")
+
+  def test_unique_items_exhaustive_with_multi_char_tokens(self):
+    """Exhaustive language test with multi-char tokens spanning boundaries."""
+    import itertools
+    import json
+
+    choices = ["apple", "banana", "cherry"]
+    min_items = 1
+    max_items = 3
+
+    expected_strings = set()
+    for k in range(min_items, max_items + 1):
+      for perm in itertools.permutations(choices, k):
+        expected_strings.add(json.dumps(list(perm)))
+
+    # Vocabulary includes boundary-spanning tokens alongside single-char ones.
+    token_map = {
+        0: "[",
+        1: "]",
+        2: ",",
+        3: " ",
+        4: '"',
+        5: '",',       # multi-char: completion + separator
+        6: ' "',       # multi-char: separator + boundary
+        7: '"apple"',
+        8: '"banana"',
+        9: '"cherry"',
+        10: "apple",
+        11: "banana",
+        12: "cherry",
+        13: '", "',    # multi-char: completion + separator + space + boundary
+    }
+    vocab_size = 14
+
+    tables = constrained.build_unique_items_constraint(
+        choices=choices,
+        min_items=min_items,
+        max_items=max_items,
+        token_id_to_str=token_map,
+        vocab_size=vocab_size,
+        eos_token_ids=[],
+    )
+    tt = jnp.array(tables.token_transitions, dtype=jnp.int32)
+    init_unique = constrained.init_unique_items_loop_state(
+        tables.unique_items, batch_size=1
+    )
+
+    accepted_strings = set()
+    stack = [(tables.initial_state, init_unique, [])]
+
+    while stack:
+      dfa_st, u_state, tok_history = stack.pop()
+
+      if dfa_st in tables.accept_states:
+        gen_str = "".join(token_map[t] for t in tok_history)
+        accepted_strings.add(gen_str)
+
+      logits = jnp.zeros((1, 1, vocab_size))
+      dfa_st_arr = jnp.array([dfa_st], dtype=jnp.int32)
+      masked = constrained.constrained_logits_unique(
+          logits, dfa_st_arr, tt, u_state
+      )
+      valid_tokens = jnp.where(masked[0, 0] > -jnp.inf)[0].tolist()
+
+      for next_tok in valid_tokens:
+        next_dfa_arr, next_u_state = constrained.advance_state_unique(
+            dfa_st_arr, jnp.array([next_tok]), tt, u_state
+        )
+        stack.append(
+            (int(next_dfa_arr[0]), next_u_state, tok_history + [next_tok])
+        )
+
+    self.assertEqual(accepted_strings, expected_strings)
+
   def test_unique_items_exhaustive_language_simulation(self):
     """Exhaustively traverse all paths in the constraint state-space to prove language equivalence."""
     choices = ["apple", "banana", "cherry"]
