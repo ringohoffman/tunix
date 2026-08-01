@@ -87,14 +87,14 @@ def _gcsfuse_mount_points() -> tuple[tuple[str, str], ...]:
         if len(parts) >= 3:
           device, mount_point_str, fstype, *_ = parts
           if "gcsfuse" in fstype or "gcsfuse" in device or "fuse" in fstype:
-            mount_point = str(Path(mount_point_str).resolve())
+            mount_point = os.path.normpath(mount_point_str)
             bucket_name = device.split(":")[-1].strip("/")
             if (
                 not bucket_name
                 or "/" in bucket_name
                 or bucket_name in ("gcsfuse", "fuse", "/dev/fuse")
             ):
-              bucket_name = Path(mount_point_str).name
+              bucket_name = os.path.basename(mount_point_str)
             mounts.append((mount_point, bucket_name))
   except (OSError, UnicodeDecodeError) as e:
     logging.warning("Could not read /proc/mounts for GCSFuse detection: %s", e)
@@ -154,8 +154,8 @@ def gcsfuse_to_gs_path(path: str) -> str:
     return path
 
   mount_point, bucket_name = mount
-  abs_path = Path(path).resolve()
-  rel_path = abs_path.relative_to(mount_point)
+  abs_path = os.path.abspath(path)
+  rel_path = os.path.relpath(abs_path, mount_point)
   gs_path = f"gs://{bucket_name}/{rel_path}".rstrip("/")
   logging.info(
       "[Checkpointing] Translated GCSFuse path %r -> %r",
