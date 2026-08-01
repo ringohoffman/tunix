@@ -87,7 +87,7 @@ def _gcsfuse_mount_points() -> tuple[tuple[str, str], ...]:
         if len(parts) >= 3:
           device, mount_point_str, fstype, *_ = parts
           if "gcsfuse" in fstype or "gcsfuse" in device or "fuse" in fstype:
-            mount_point = os.path.normpath(mount_point_str)
+            mount_point = os.path.normpath(os.path.realpath(mount_point_str))
             bucket_name = device.split(":")[-1].strip("/")
             if (
                 not bucket_name
@@ -118,7 +118,7 @@ def _find_gcsfuse_mount(path: str) -> tuple[str, str] | None:
     return None
   # Build a dict for O(1) lookups (tiny — typically 1-3 mounts).
   mount_map = {mp: bn for mp, bn in mounts}
-  current = os.path.normpath(os.path.abspath(path))
+  current = os.path.normpath(os.path.realpath(path))
   while True:
     if current in mount_map:
       return (current, mount_map[current])
