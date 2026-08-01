@@ -1694,9 +1694,7 @@ def build_unique_items_constraint(
         #     by a previous token, seen_mask already recorded it), OR
         # (b) This token itself completes an item during its character
         #     simulation (token_completions captures this).
-        needs_enforcement = (
-            is_after_item[s] or token_completions[s, v] != 0
-        )
+        needs_enforcement = is_after_item[s] or token_completions[s, v] != 0
         if needs_enforcement:
           if is_done[next_s]:
             leads_to_close[s, v] = True
@@ -1862,17 +1860,13 @@ def chain_constraints(
     for accept_state in current_stage.accept_states:
       global_accept_state = current_offset + accept_state
       for token_id in range(vocab_size):
-        if (
-            combined_token_transitions[global_accept_state, token_id]
-            == INVALID_STATE
-        ):
-          next_target = next_stage.token_transitions[
-              next_stage.initial_state, token_id
-          ]
-          if next_target != INVALID_STATE:
-            combined_token_transitions[global_accept_state, token_id] = (
-                next_offset + next_target
-            )
+        next_target = next_stage.token_transitions[
+            next_stage.initial_state, token_id
+        ]
+        if next_target != INVALID_STATE:
+          combined_token_transitions[global_accept_state, token_id] = (
+              next_offset + next_target
+          )
 
   initial_state = offsets[0] + compiled_stages[0].initial_state
   last_stage = compiled_stages[-1]

@@ -1072,8 +1072,8 @@ class RegexEngineTest(absltest.TestCase):
         2: ",",
         3: " ",
         4: '"',
-        5: '",',       # closing quote + comma — spans item completion
-        6: ' "',       # space + opening quote — spans separator + boundary
+        5: '",',  # closing quote + comma — spans item completion
+        6: ' "',  # space + opening quote — spans separator + boundary
         7: "apple",
         8: "banana",
         9: "cherry",
@@ -1104,12 +1104,12 @@ class RegexEngineTest(absltest.TestCase):
       )
     # "apple" should be marked as seen even though completion happened mid-token
     self.assertNotEqual(
-        int(u.seen_mask[0]), 0,
-        "seen_mask must be updated by multi-char token that spans completion"
+        int(u.seen_mask[0]),
+        0,
+        "seen_mask must be updated by multi-char token that spans completion",
     )
     self.assertEqual(
-        int(u.seen_mask[0]) & 1, 1,
-        "apple (item 0) should be marked as seen"
+        int(u.seen_mask[0]) & 1, 1, "apple (item 0) should be marked as seen"
     )
 
     # ' "' (token 6) then banana (token 8) then '",' (token 5)
@@ -1118,15 +1118,14 @@ class RegexEngineTest(absltest.TestCase):
           state, jnp.array([tok]), tt, u
       )
     self.assertEqual(
-        int(u.seen_mask[0]) & 0b011, 0b011,
-        "both apple and banana should be seen"
+        int(u.seen_mask[0]) & 0b011,
+        0b011,
+        "both apple and banana should be seen",
     )
 
     # At this point, only "cherry" should be valid.  Verify via logits masking.
     # After '",' we need ' "' (token 6) to start the next item.
-    state, u = constrained.advance_state_unique(
-        state, jnp.array([6]), tt, u
-    )
+    state, u = constrained.advance_state_unique(state, jnp.array([6]), tt, u)
     logits = jnp.zeros((1, 1, vocab_size))
     masked = constrained.constrained_logits_unique(logits, state, tt, u)
     valid = jnp.where(masked[0, 0] > -jnp.inf)[0].tolist()
@@ -1157,15 +1156,15 @@ class RegexEngineTest(absltest.TestCase):
         2: ",",
         3: " ",
         4: '"',
-        5: '",',       # multi-char: completion + separator
-        6: ' "',       # multi-char: separator + boundary
+        5: '",',  # multi-char: completion + separator
+        6: ' "',  # multi-char: separator + boundary
         7: '"apple"',
         8: '"banana"',
         9: '"cherry"',
         10: "apple",
         11: "banana",
         12: "cherry",
-        13: '", "',    # multi-char: completion + separator + space + boundary
+        13: '", "',  # multi-char: completion + separator + space + boundary
     }
     vocab_size = 14
 
@@ -1660,6 +1659,41 @@ class RegexEngineTest(absltest.TestCase):
         0,
         f"Found accepted 1-token paths: {one_token_paths}",
     )
+
+  def test_chain_bounded_until_with_json_schema(self):
+    """Test chaining bounded_until with a JSON Schema array connects stages."""
+    vocab_map = {
+        0: "a",
+        1: "b",
+        2: "<thought>",
+        3: "</thought>",
+        4: "\n",
+        5: "[",
+        6: "]",
+        7: '"',
+        8: ",",
+    }
+    token_id_to_str = {i: vocab_map.get(i, "") for i in range(10)}
+    thought_pattern = (
+        "<thought>"
+        + constrained.bounded_until("</thought>", max_tokens=5)
+        + "\n"
+    )
+    schema = {
+        "type": "array",
+        "items": {"type": "string", "enum": ["a", "b"]},
+    }
+    tables = constrained.chain_constraints(
+        [thought_pattern, schema],
+        token_id_to_str=token_id_to_str,
+        vocab_size=10,
+        eos_token_ids=[9],
+    )
+    self.assertIsNotNone(tables.force_accept_mask)
+    # Ensure no unreachable/dead states in the thought stage have 0 force-accept tokens
+    has_force = np.any(tables.force_accept_mask, axis=1)
+    # The initial state must have force-accept paths leading toward acceptance
+    self.assertTrue(has_force[tables.initial_state])
 
 
 if __name__ == "__main__":
