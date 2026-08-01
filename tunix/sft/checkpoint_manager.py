@@ -35,6 +35,7 @@ fork, which auto-detects the checkpoint format and dispatches to the
 most efficient compatible handler.
 """
 
+import functools
 import os
 from pathlib import Path
 import time
@@ -62,17 +63,81 @@ def is_pathways_persistence_enabled() -> bool:
   registered ``CloudPathwaysArrayHandler`` as the global ``jax.Array``
   type handler.
   """
-  return (
-      os.getenv("ENABLE_PATHWAYS_PERSISTENCE") == "1"
-      or "proxy" in os.getenv("JAX_PLATFORMS", "")
-  )
+  return os.getenv(
+      "ENABLE_PATHWAYS_PERSISTENCE"
+  ) == "1" or "proxy" in os.getenv("JAX_PLATFORMS", "")
+
+
+@functools.cache
+def _gcsfuse_mount_points() -> tuple[tuple[str, str], ...]:
+  """Parse ``/proc/mounts`` once and return all GCSFuse mount points.
+
+  Returns a tuple of ``(mount_point, bucket_name)`` pairs.  The result
+  is cached for the lifetime of the process — mount points don't change
+  after pod startup.
+  """
+  proc_mounts = Path("/proc/mounts")
+  if not proc_mounts.exists():
+    return ()
+  mounts: list[tuple[str, str]] = []
+  try:
+    with proc_mounts.open("r", encoding="utf-8") as f:
+      for line in f:
+        parts = line.split()
+        if len(parts) >= 3:
+          device, mount_point_str, fstype, *_ = parts
+          if "gcsfuse" in fstype or "gcsfuse" in device or "fuse" in fstype:
+            mount_point = str(Path(mount_point_str).resolve())
+            bucket_name = device.split(":")[-1].strip("/")
+            if (
+                not bucket_name
+                or "/" in bucket_name
+                or bucket_name in ("gcsfuse", "fuse", "/dev/fuse")
+            ):
+              bucket_name = Path(mount_point_str).name
+            mounts.append((mount_point, bucket_name))
+  except (OSError, UnicodeDecodeError) as e:
+    logging.warning("Could not read /proc/mounts for GCSFuse detection: %s", e)
+  if mounts:
+    logging.info(
+        "Detected GCSFuse mount points: %s",
+        [(mp, bn) for mp, bn in mounts],
+    )
+  return tuple(mounts)
+
+
+def _find_gcsfuse_mount(path: str) -> tuple[str, str] | None:
+  """Find the GCSFuse mount point for *path*, if any.
+
+  Walks up the parent chain of *path* checking against the cached set
+  of known FUSE mount points.  Returns ``(mount_point, bucket_name)``
+  or ``None``.
+  """
+  mounts = _gcsfuse_mount_points()
+  if not mounts:
+    return None
+  # Build a dict for O(1) lookups (tiny — typically 1-3 mounts).
+  mount_map = {mp: bn for mp, bn in mounts}
+  current = os.path.normpath(os.path.abspath(path))
+  while True:
+    if current in mount_map:
+      return (current, mount_map[current])
+    parent = os.path.dirname(current)
+    if parent == current:
+      break
+    current = parent
+  return None
 
 
 def is_gcs_or_gcsfuse_path(path: str) -> bool:
-  """Returns True if path is a gs:// URI or mounted via GCSFuse."""
+  """Returns True if path is a ``gs://`` URI or mounted via GCSFuse.
+
+  Uses a cached set of mount points from ``/proc/mounts`` — no per-call
+  I/O and no log spam regardless of how many paths are checked.
+  """
   if path.startswith("gs://"):
     return True
-  return gcsfuse_to_gs_path(path).startswith("gs://")
+  return _find_gcsfuse_mount(path) is not None
 
 
 def gcsfuse_to_gs_path(path: str) -> str:
@@ -84,39 +149,20 @@ def gcsfuse_to_gs_path(path: str) -> str:
   if path.startswith("gs://"):
     return path
 
-  abs_path = Path(path).resolve()
-  proc_mounts = Path("/proc/mounts")
-  if proc_mounts.exists():
-    try:
-      with proc_mounts.open("r", encoding="utf-8") as f:
-        for line in f:
-          parts = line.split()
-          if len(parts) >= 3:
-            device, mount_point_str, fstype, *_ = parts
-            if "gcsfuse" in fstype or "gcsfuse" in device or "fuse" in fstype:
-              mount_point = Path(mount_point_str).resolve()
-              if abs_path == mount_point or mount_point in abs_path.parents:
-                bucket_name = device.split(":")[-1].strip("/")
-                if (
-                    not bucket_name
-                    or "/" in bucket_name
-                    or bucket_name in ("gcsfuse", "fuse", "/dev/fuse")
-                ):
-                  bucket_name = mount_point.name
-                rel_path = abs_path.relative_to(mount_point)
-                gs_path = f"gs://{bucket_name}/{rel_path}".rstrip("/")
-                logging.info(
-                    "[Checkpointing] Translated GCSFuse path %r -> %r",
-                    path,
-                    gs_path,
-                )
-                return gs_path
-    except (OSError, UnicodeDecodeError) as e:
-      logging.warning(
-          "Could not read /proc/mounts for GCSFuse translation: %s", e
-      )
+  mount = _find_gcsfuse_mount(path)
+  if mount is None:
+    return path
 
-  return path
+  mount_point, bucket_name = mount
+  abs_path = Path(path).resolve()
+  rel_path = abs_path.relative_to(mount_point)
+  gs_path = f"gs://{bucket_name}/{rel_path}".rstrip("/")
+  logging.info(
+      "[Checkpointing] Translated GCSFuse path %r -> %r",
+      path,
+      gs_path,
+  )
+  return gs_path
 
 
 class CheckpointManager:
@@ -126,12 +172,12 @@ class CheckpointManager:
   the runtime environment.
 
   Args:
-    root_directory: Root directory for checkpoints. If None, the
-      checkpoint manager is disabled (all operations become no-ops).
+    root_directory: Root directory for checkpoints. If None, the checkpoint
+      manager is disabled (all operations become no-ops).
     options: Orbax checkpoint manager options.  On standard JAX,
-      ``save_device_host_concurrent_gb`` is forwarded to handlers to
-      throttle Device-to-Host transfers. On Pathways (DMA saves),
-      this option is ignored since no host transfer occurs.
+      ``save_device_host_concurrent_gb`` is forwarded to handlers to throttle
+      Device-to-Host transfers. On Pathways (DMA saves), this option is ignored
+      since no host transfer occurs.
 
   Examples:
     >>> manager = CheckpointManager("/path/to/checkpoints")
@@ -162,14 +208,14 @@ class CheckpointManager:
         and options.save_device_host_concurrent_gb is not None
     ):
       # Standard ArrayHandler: OCDBT via TensorStore (host transfer)
-      handler_kwargs['save_device_host_concurrent_gb'] = (
+      handler_kwargs["save_device_host_concurrent_gb"] = (
           options.save_device_host_concurrent_gb
       )
 
     item_handlers = {
-        'model_params': ocp.PyTreeCheckpointHandler(**handler_kwargs),
-        'optimizer_state': ocp.PyTreeCheckpointHandler(**handler_kwargs),
-        'custom_metadata': ocp.JsonCheckpointHandler(),
+        "model_params": ocp.PyTreeCheckpointHandler(**handler_kwargs),
+        "optimizer_state": ocp.PyTreeCheckpointHandler(**handler_kwargs),
+        "custom_metadata": ocp.JsonCheckpointHandler(),
     }
     self._checkpoint_manager = ocp.CheckpointManager(
         root_directory,
@@ -178,9 +224,11 @@ class CheckpointManager:
     )
 
     logging.info(
-        '[Checkpointing] Initialized — strategy=%s, format=%s, path=%s',
-        'Pathways DMA (zero host memory)' if use_dma else 'TensorStore (host transfer)',
-        'zarr' if use_dma else 'OCDBT',
+        "[Checkpointing] Initialized — strategy=%s, format=%s, path=%s",
+        "Pathways DMA (zero host memory)"
+        if use_dma
+        else "TensorStore (host transfer)",
+        "zarr" if use_dma else "OCDBT",
         root_directory,
     )
 
@@ -228,7 +276,7 @@ class CheckpointManager:
     )
 
     cp_save_args = {
-        'model_params': model_cp_args,
+        "model_params": model_cp_args,
     }
     if optimizer is not None:
       optimizer_state = nnx.state(optimizer, nnx.optimizer.OptState)
@@ -236,7 +284,7 @@ class CheckpointManager:
           item=optimizer_state,
           save_args=jax.tree.map(lambda _: ocp.SaveArgs(), optimizer_state),
       )
-      cp_save_args['optimizer_state'] = optimizer_cp_args
+      cp_save_args["optimizer_state"] = optimizer_cp_args
     return self._checkpoint_manager.save(
         step,
         args=ocp.args.Composite(**cp_save_args),
@@ -261,7 +309,7 @@ class CheckpointManager:
     if self._checkpoint_manager is None:
       return False
     metadata = self._checkpoint_manager.metadata(step)
-    if not metadata or 'optimizer_state' not in metadata.item_metadata:
+    if not metadata or "optimizer_state" not in metadata.item_metadata:
       return False
 
     optimizer_state = nnx.state(optimizer, nnx.optimizer.OptState)
@@ -296,7 +344,7 @@ class CheckpointManager:
         ),
     )
     nnx.update(optimizer, ckpt.optimizer_state)
-    logging.info('Restored optimizer state from step: %d', step)
+    logging.info("Restored optimizer state from step: %d", step)
     return True
 
   @classmethod
@@ -315,15 +363,15 @@ class CheckpointManager:
     Returns:
       True if optimizer state was restored, False otherwise.
     """
-    ckpt_path = checkpoint_path.rstrip('/')
-    if ckpt_path.endswith('/model_params'):
-      ckpt_path = ckpt_path[: -len('/model_params')]
+    ckpt_path = checkpoint_path.rstrip("/")
+    if ckpt_path.endswith("/model_params"):
+      ckpt_path = ckpt_path[: -len("/model_params")]
     step_str = os.path.basename(ckpt_path)
     if not step_str.isdigit():
       return False
     ckpt_root = os.path.dirname(ckpt_path)
     step_dir = os.path.join(ckpt_root, step_str)
-    if not os.path.exists(os.path.join(step_dir, 'optimizer_state')):
+    if not os.path.exists(os.path.join(step_dir, "optimizer_state")):
       return False
 
     mgr = cls(ckpt_root)
@@ -393,7 +441,7 @@ class CheckpointManager:
       self.restore_optimizer_state(optimizer, step)
 
     logging.info(
-        'Restored params from step: %d in %.3f seconds',
+        "Restored params from step: %d in %.3f seconds",
         step,
         time.time() - restore_start,
     )
