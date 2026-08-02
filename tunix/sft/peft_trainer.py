@@ -423,7 +423,10 @@ class PeftTrainer:
 
   def jit_train_and_eval_step(
       self, skip_jit: bool = False, cache_nnx_graph: bool = False
-  ):
+  ) -> tuple[
+      Callable[..., tuple[jax.Array, Any, jax.Array]],
+      Callable[..., tuple[jax.Array, Any]],
+  ]:
     """Creates and returns the train and eval step functions.
 
     This function will return the cached ones if available.

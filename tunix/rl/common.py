@@ -14,9 +14,10 @@
 """Common RL helper classes and functions."""
 
 from functools import partial  # pylint: disable=g-importing-member
-from typing import Any, Iterable
+from typing import Any, Iterable, Literal, overload
 
 import flax
+import flax.struct
 from flax import nnx
 import jax
 from jax import numpy as jnp
@@ -271,6 +272,40 @@ def process_ids(
   input_seg_ids = prompt_completion_mask.astype(jnp.int32)
 
   return prompt_completion_ids, positions, attn_mask, input_seg_ids
+
+
+@overload
+def compute_per_token_logps(
+    graphdef: Any,
+    state: Any,
+    prompt_tokens: jax.Array,
+    completion_tokens: jax.Array,
+    pad_id: int,
+    eos_id: int,
+    images: jax.Array | None = ...,
+    stop_gradient: bool = ...,
+    return_logits: Literal[False] = ...,
+    segment_ids: jax.Array | None = ...,
+    segment_positions: jax.Array | None = ...,
+    temperature: float = ...,
+) -> jax.Array: ...
+
+
+@overload
+def compute_per_token_logps(
+    graphdef: Any,
+    state: Any,
+    prompt_tokens: jax.Array,
+    completion_tokens: jax.Array,
+    pad_id: int,
+    eos_id: int,
+    images: jax.Array | None = ...,
+    stop_gradient: bool = ...,
+    return_logits: Literal[True] = ...,
+    segment_ids: jax.Array | None = ...,
+    segment_positions: jax.Array | None = ...,
+    temperature: float = ...,
+) -> tuple[jax.Array, jax.Array]: ...
 
 
 @partial(
