@@ -151,8 +151,6 @@ class PeftTrainer:
       optax.schedules.inject_hyperparams(optax.sgd)(learning_rate=learning_rate_schedule)``
     loss_fn: The loss function to use.
     eval_loss_fn: The loss function to use for evaluation.
-    gen_model_input_fn: The function to generate model input from training
-      input.
     checkpoint_manager: The checkpoint manager to use.
     metrics_logger: The metrics logger to use.
     metrics_prefix: The prefix for metric names for logging.
@@ -195,7 +193,6 @@ class PeftTrainer:
 
     self.loss_fn = _default_loss_fn
     self.eval_loss_fn = _default_loss_fn
-    self.gen_model_input_fn = lambda x: x
     self.checkpoint_manager = checkpoint_manager.CheckpointManager(
         root_directory=self.config.checkpoint_root_directory,
         options=self.config.checkpointing_options,
@@ -299,25 +296,6 @@ class PeftTrainer:
     self._has_aux = has_aux
     return self
 
-  def with_gen_model_input_fn(
-      self, gen_model_input_fn: Callable[[Any], _ModelInput]
-  ):
-    """Generates model input from training input.
-
-    NB: output of this function will be passed to the loss function, so the args
-    should match what loss function expects.
-
-    Args:
-      gen_model_input_fn: A function that generates model input from training
-        input.
-
-    Returns:
-      PeftTrainer.
-    """
-    self.clear_jit_cache()
-    self.gen_model_input_fn = gen_model_input_fn
-    return self
-
   def _train_step(
       self, model: nnx.Module, optimizer: nnx.Optimizer, inputs: Any
   ) -> tuple[ArrayLike, Any | None, ArrayLike]:
@@ -332,14 +310,12 @@ class PeftTrainer:
       A tuple containing the loss, auxiliary data (or None if has_aux is False),
       and the gradient norm.
     """
-    inputs = self.gen_model_input_fn(inputs)
-
     grad_fn = nnx.value_and_grad(
         self.loss_fn,
         argnums=nnx.DiffState(0, nnx.LoRAParam) if self._lora_enabled else 0,
         has_aux=self._has_aux,
     )
-    out, grads = grad_fn(model, **inputs)
+    out, grads = grad_fn(model, inputs)
     grad_norm = optax.global_norm(grads)
     optimizer.update(model, grads)
     if self._has_aux:
@@ -351,8 +327,7 @@ class PeftTrainer:
   def _eval_step(
       self, model: nnx.Module, inputs: Any
   ) -> ArrayLike | tuple[ArrayLike, Any]:
-    inputs = self.gen_model_input_fn(inputs)
-    out = self.eval_loss_fn(model, **inputs)
+    out = self.eval_loss_fn(model, inputs)
     if self._has_aux:
       loss, aux = out
       return loss, aux
