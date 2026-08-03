@@ -27,6 +27,7 @@ except PackageNotFoundError:
 
 from tunix.distillation.distillation_trainer import DistillationTrainer
 from tunix.distillation.distillation_trainer import TrainingConfig as DistillationTrainingConfig
+from tunix.generate import functional
 from tunix.generate.sampler import CacheConfig
 from tunix.generate.sampler import Sampler
 from tunix.generate.tokenizer_adapter import TokenizerAdapter, Tokenizer
