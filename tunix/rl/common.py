@@ -13,6 +13,7 @@
 # limitations under the License.
 """Common RL helper classes and functions."""
 
+import inspect
 from functools import partial  # pylint: disable=g-importing-member
 from typing import Any, Iterable, Literal, overload
 
@@ -383,14 +384,17 @@ def compute_per_token_logps(
   # precedence; otherwise we pass the per-position non-pad mask derived in
   # ``process_ids`` so flash-attention variants that lack a separate
   # padding-mask input still skip pad positions.
-  import inspect  # pylint: disable=g-import-not-at-top
   try:
     sig = inspect.signature(model.__call__)
     has_segment_ids = ("segment_ids" in sig.parameters) or any(
         p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
     )
+    has_target_indices = ("target_indices" in sig.parameters) or any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+    )
   except Exception:
     has_segment_ids = False
+    has_target_indices = False
 
   if has_segment_ids:
     if segment_ids is not None:
@@ -400,21 +404,32 @@ def compute_per_token_logps(
   if images is not None:
     model_kwargs["images"] = images
 
+  if has_target_indices and segment_ids is None and prompt_tokens.shape[1] > 0:
+    prompt_len = prompt_tokens.shape[1]
+    completion_len = completion_tokens.shape[1]
+    model_kwargs["target_indices"] = (prompt_len - 1) + jnp.arange(
+        completion_len, dtype=jnp.int32
+    )[None, :]
+
   logits, _ = model(input_tokens, **model_kwargs)
 
-  if segment_ids is not None:
-    # Packed Mode: Evaluate the full sequence (mixed prompts + completions).
-    # Since predicting token[i] requires logit[i-1], we skip the first token.
-    # This shrinks the output shape to [Batch, FullSeqLen - 1]
-    logits_to_keep = input_tokens.shape[1] - 1
+  if "target_indices" in model_kwargs:
+    input_tokens_to_keep = completion_tokens
   else:
-    logits_to_keep = completion_tokens.shape[1]
+    if segment_ids is not None:
+      # Packed Mode: Evaluate the full sequence (mixed prompts + completions).
+      # Since predicting token[i] requires logit[i-1], we skip the first token.
+      # This shrinks the output shape to [Batch, FullSeqLen - 1]
+      logits_to_keep = input_tokens.shape[1] - 1
+    else:
+      logits_to_keep = completion_tokens.shape[1]
 
-  logits = logits[:, -logits_to_keep - 1 : -1, :]
+    logits = logits[:, -logits_to_keep - 1 : -1, :]
+    input_tokens_to_keep = input_tokens[:, -logits_to_keep:]
+
   if temperature != 0.0 and temperature != 1.0:
     logits /= temperature
 
-  input_tokens_to_keep = input_tokens[:, -logits_to_keep:]
   per_token_logps = selective_log_softmax(logits, input_tokens_to_keep)
 
   if segment_ids is not None:
