@@ -495,7 +495,7 @@ class MetricLoggingHook(hooks.TrainingHooks):
       level: str = "",
   ) -> None:
     aggregated_metrics: dict[str, _FloatLike_co] = {
-        k: self._metric_reducers[k](_to_np_array(v))
+        k: self._metric_reducers.get(k, np.mean)(_to_np_array(v))
         for k, v in metrics_buffer.metrics.items()
     }
     if self._step_metrics_fn is not None:
