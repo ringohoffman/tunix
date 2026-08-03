@@ -19,13 +19,12 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping, Sequence
 import dataclasses
 import inspect
-import json
-import time
-from typing import Any, Literal, TypeGuard, TypedDict, overload
+from collections.abc import Sequence
+from typing import Any, TypeGuard, TypeVar
 import warnings
 
-from absl import logging
 import flax
+import flax.struct
 from flax import nnx
 from flax.nnx import filterlib
 from flax.nnx import graph
@@ -33,7 +32,6 @@ from flax.nnx import statelib
 import flax.typing
 import jax
 import jax.numpy as jnp
-import jax.typing
 import jaxtyping
 import numpy as np
 from tunix.generate import base_sampler
@@ -42,7 +40,8 @@ from tunix.generate import utils
 import tunix.generate.beam_search as beam_search_lib
 import tunix.generate.tokenizer_adapter as tok_adapter
 from tunix.processors import image_processor as image_processor_lib
-from tunix.utils import sharding_utils
+
+_ParamT = TypeVar("_ParamT", jax.Array, jax.ShapeDtypeStruct)
 
 LayerCache = dict[str, jaxtyping.Array]
 Cache = dict[str, LayerCache]
@@ -751,7 +750,7 @@ class Sampler(base_sampler.BaseSampler):
 
   def _prefill_fn(
       self,
-      params: statelib.State,
+      params: Sequence[nnx.Variable[_ParamT]],
       sampler_state: _SamplingState,
       images: jnp.ndarray | None = None,
       echo: bool = True,
@@ -871,7 +870,7 @@ class Sampler(base_sampler.BaseSampler):
 
   def _decode_fn(
       self,
-      params: statelib.State,
+      params: Sequence[nnx.Variable[_ParamT]],
       sampling_state: _SamplingState,
   ) -> _SamplingState:
     """Internal generating function (to be jitted).
