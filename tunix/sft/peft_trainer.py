@@ -169,6 +169,7 @@ class PeftTrainer:
       metrics_logger: MetricsLogger | None = None,
       perf_tracer: perf_trace.Tracer | None = None,
       perf_tracer_v2: perf_tracer_lib.Tracer | None = None,
+      wrt: nnx.filterlib.Filter | None = None,
   ) -> None:
     # TODO(noghabi): Implement sequence packing for SFT and remove this check.
     if (
@@ -186,7 +187,9 @@ class PeftTrainer:
       optimizer = optax.MultiSteps(
           optimizer, training_config.gradient_accumulation_steps
       )
-    if self._lora_enabled:
+    if wrt is not None:
+      self.optimizer = nnx.Optimizer(self.model, optimizer, wrt=wrt)
+    elif self._lora_enabled:
       self.optimizer = nnx.Optimizer(self.model, optimizer, wrt=nnx.LoRAParam)
     else:
       self.optimizer = nnx.Optimizer(self.model, optimizer, wrt=nnx.Param)
