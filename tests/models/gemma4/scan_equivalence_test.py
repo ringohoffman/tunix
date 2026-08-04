@@ -144,25 +144,25 @@ def _copy_weights_loop_to_scan(
   num_shared_groups = num_shared_layers // pattern_len
 
   # Copy shared state (embedder, final_norm) from the loop model.
-  scan_state['embedder'] = loop_state['embedder']
-  scan_state['final_norm'] = loop_state['final_norm']
+  scan_state["embedder"] = loop_state["embedder"]
+  scan_state["final_norm"] = loop_state["final_norm"]
 
   unshared_key = (
-      'unshared_scan_groups'
+      "unshared_scan_groups"
       if loop_model.config.frac_shared_layers > 0
-      else 'scan_groups'
+      else "scan_groups"
   )
   for sub_idx in range(pattern_len):
     loop_indices = [
         g * pattern_len + sub_idx for g in range(num_unshared_groups)
     ]
-    loop_layer_states = [loop_state['layers'][li] for li in loop_indices]
+    loop_layer_states = [loop_state["layers"][li] for li in loop_indices]
 
     stacked = jax.tree.map(
         lambda *xs: jnp.stack(xs, axis=0),
         *loop_layer_states,
     )
-    scan_state[unshared_key]['sub_layers'][sub_idx] = stacked
+    scan_state[unshared_key]["sub_layers"][sub_idx] = stacked
 
   if num_shared_groups > 0:
     for sub_idx in range(pattern_len):
@@ -170,13 +170,13 @@ def _copy_weights_loop_to_scan(
           num_unshared_layers + g * pattern_len + sub_idx
           for g in range(num_shared_groups)
       ]
-      loop_layer_states = [loop_state['layers'][li] for li in loop_indices]
+      loop_layer_states = [loop_state["layers"][li] for li in loop_indices]
 
       stacked = jax.tree.map(
           lambda *xs: jnp.stack(xs, axis=0),
           *loop_layer_states,
       )
-      scan_state['shared_scan_groups']['sub_layers'][sub_idx] = stacked
+      scan_state["shared_scan_groups"]["sub_layers"][sub_idx] = stacked
 
   nnx.update(scan_model, scan_state)
 
@@ -226,14 +226,14 @@ def _assert_close(
     scan_arr: jax.Array,
     *,
     atol: float = _FORWARD_ATOL,
-    msg: str = '',
+    msg: str = "",
 ):
   """Assert two arrays are element-wise close, with a useful error message."""
   max_diff = float(jnp.max(jnp.abs(loop_arr - scan_arr)))
   test_case.assertLess(
       max_diff,
       atol,
-      msg=f'{msg} Max diff: {max_diff}',
+      msg=f"{msg} Max diff: {max_diff}",
   )
 
 
@@ -268,7 +268,7 @@ class ScanSmokeTest(absltest.TestCase):
     grad_leaves = jax.tree.leaves(nnx.state(grads))
     for leaf in grad_leaves:
       self.assertTrue(
-          jnp.all(jnp.isfinite(leaf)), msg=f'Non-finite gradient: {leaf.shape}'
+          jnp.all(jnp.isfinite(leaf)), msg=f"Non-finite gradient: {leaf.shape}"
       )
 
   def test_invalid_num_layers(self):
@@ -301,7 +301,7 @@ class ScanForwardEquivalenceTest(absltest.TestCase):
     )
 
     _assert_close(
-        self, loop_logits, scan_logits, msg='Forward pass (2 groups) diverged.'
+        self, loop_logits, scan_logits, msg="Forward pass (2 groups) diverged."
     )
 
   def test_forward_equivalence_single_group(self):
@@ -317,7 +317,7 @@ class ScanForwardEquivalenceTest(absltest.TestCase):
     )
 
     _assert_close(
-        self, loop_logits, scan_logits, msg='Forward pass (1 group) diverged.'
+        self, loop_logits, scan_logits, msg="Forward pass (1 group) diverged."
     )
 
   def test_forward_equivalence_three_groups(self):
@@ -333,7 +333,7 @@ class ScanForwardEquivalenceTest(absltest.TestCase):
     )
 
     _assert_close(
-        self, loop_logits, scan_logits, msg='Forward pass (3 groups) diverged.'
+        self, loop_logits, scan_logits, msg="Forward pass (3 groups) diverged."
     )
 
   def test_forward_equivalence_batch_size_1(self):
@@ -349,7 +349,7 @@ class ScanForwardEquivalenceTest(absltest.TestCase):
     )
 
     _assert_close(
-        self, loop_logits, scan_logits, msg='Forward pass (batch=1) diverged.'
+        self, loop_logits, scan_logits, msg="Forward pass (batch=1) diverged."
     )
 
   def test_forward_equivalence_with_segment_ids(self):
@@ -378,7 +378,7 @@ class ScanForwardEquivalenceTest(absltest.TestCase):
         self,
         loop_logits,
         scan_logits,
-        msg='Forward pass with segment_ids diverged.',
+        msg="Forward pass with segment_ids diverged.",
     )
 
   def test_forward_equivalence_return_hidden_states(self):
@@ -405,13 +405,13 @@ class ScanForwardEquivalenceTest(absltest.TestCase):
         self,
         loop_out.hidden_states,
         scan_out.hidden_states,
-        msg='Hidden states diverged.',
+        msg="Hidden states diverged.",
     )
     _assert_close(
         self,
         loop_out.logits,
         scan_out.logits,
-        msg='Logits with return_hidden_states diverged.',
+        msg="Logits with return_hidden_states diverged.",
     )
 
   def test_forward_equivalence_target_indices(self):
@@ -439,7 +439,7 @@ class ScanForwardEquivalenceTest(absltest.TestCase):
         self,
         loop_out.logits,
         scan_out.logits,
-        msg='Logits with target_indices diverged.',
+        msg="Logits with target_indices diverged.",
     )
 
   def test_forward_equivalence_decode_only_last_token(self):
@@ -466,7 +466,7 @@ class ScanForwardEquivalenceTest(absltest.TestCase):
         self,
         loop_out.logits,
         scan_out.logits,
-        msg='Logits with decode_only_last_token diverged.',
+        msg="Logits with decode_only_last_token diverged.",
     )
 
   def test_forward_equivalence_with_per_layer_inputs(self):
@@ -487,7 +487,7 @@ class ScanForwardEquivalenceTest(absltest.TestCase):
         self,
         loop_logits,
         scan_logits,
-        msg='Forward pass with per_layer_inputs diverged.',
+        msg="Forward pass with per_layer_inputs diverged.",
     )
 
   def test_forward_equivalence_with_shared_kv_layers(self):
@@ -508,7 +508,7 @@ class ScanForwardEquivalenceTest(absltest.TestCase):
         self,
         loop_logits,
         scan_logits,
-        msg='Shared KV training forward pass diverged.',
+        msg="Shared KV training forward pass diverged.",
     )
 
   def test_forward_equivalence_gemma4_e2b(self):
@@ -538,7 +538,7 @@ class ScanForwardEquivalenceTest(absltest.TestCase):
         self,
         loop_logits,
         scan_logits,
-        msg='Gemma4 E2B training forward pass diverged.',
+        msg="Gemma4 E2B training forward pass diverged.",
     )
 
   def test_gradient_equivalence(self):
@@ -558,14 +558,14 @@ class ScanForwardEquivalenceTest(absltest.TestCase):
         float(loop_loss),
         float(scan_loss),
         places=4,
-        msg=f'Losses differ. Loop: {loop_loss}, Scan: {scan_loss}',
+        msg=f"Losses differ. Loop: {loop_loss}, Scan: {scan_loss}",
     )
 
     # Compare gradients for shared params (embedder, final_norm).
     loop_state = nnx.state(loop_grads)
     scan_state = nnx.state(scan_grads)
 
-    for key in ('embedder', 'final_norm'):
+    for key in ("embedder", "final_norm"):
       loop_leaves = jax.tree.leaves(loop_state[key])
       scan_leaves = jax.tree.leaves(scan_state[key])
       for i, (ll, sl) in enumerate(zip(loop_leaves, scan_leaves)):
@@ -573,18 +573,18 @@ class ScanForwardEquivalenceTest(absltest.TestCase):
         self.assertLess(
             max_diff,
             _GRADIENT_ATOL,
-            msg=f'Gradient diff in {key} leaf {i}: {max_diff}',
+            msg=f"Gradient diff in {key} leaf {i}: {max_diff}",
         )
 
     # Compare gradients for layer params.
     num_groups = scan_model.num_scan_groups
     for sub_idx in range(_PATTERN_LEN):
-      scan_sub_grads = scan_state['scan_groups']['sub_layers'][sub_idx]
+      scan_sub_grads = scan_state["scan_groups"]["sub_layers"][sub_idx]
       scan_sub_leaves = jax.tree.leaves(scan_sub_grads)
 
       for group_idx in range(num_groups):
         loop_layer_idx = group_idx * _PATTERN_LEN + sub_idx
-        loop_layer_grads = loop_state['layers'][loop_layer_idx]
+        loop_layer_grads = loop_state["layers"][loop_layer_idx]
         loop_layer_leaves = jax.tree.leaves(loop_layer_grads)
 
         for leaf_idx, (ll, sl) in enumerate(
@@ -596,11 +596,168 @@ class ScanForwardEquivalenceTest(absltest.TestCase):
               max_diff,
               _GRADIENT_ATOL,
               msg=(
-                  f'Gradient diff at layer {loop_layer_idx} '
-                  f'(sub={sub_idx}, group={group_idx}), '
-                  f'leaf {leaf_idx}: {max_diff}'
+                  f"Gradient diff at layer {loop_layer_idx} "
+                  f"(sub={sub_idx}, group={group_idx}), "
+                  f"leaf {leaf_idx}: {max_diff}"
               ),
           )
+
+  def test_scan_carry_origin_eliminates_stacked_memory_overhead(self):
+    """Proves that carrying origin KV via nnx.Carry prevents 5D stacked buffer accumulation in HLO."""
+    config = _make_config(
+        num_layers=24,
+        use_scan_layers=True,
+        frac_shared_layers=0.5,
+    )
+    tokens, positions, attn_mask = _make_inputs(
+        config, batch_size=4, seq_len=256
+    )
+    model = model_lib.Gemma4(config=config, rngs=nnx.Rngs(0))
+
+    def loss_carry(m, tok, pos, mask):
+      out, _ = m(tok, positions=pos, attention_mask=mask)
+      return jnp.sum(out)
+
+    # Compile backward pass for current Carry implementation
+    grad_carry = nnx.jit(nnx.grad(loss_carry, argnums=0))
+    compiled_carry = grad_carry.lower(
+        model, tokens, positions, attn_mask
+    ).compile()
+    mem_carry = compiled_carry.memory_analysis()
+    hlo_carry = compiled_carry.as_text()
+
+    # Define HEAD-style forward scan that returns origin KV via out_axes instead of Carry
+    pattern_len = len(model.scan_pattern)
+    num_unshared_layers = int(
+        config.num_layers * (1.0 - config.frac_shared_layers)
+    )
+    global_sub_idx = (num_unshared_layers - 1) % pattern_len
+    local_sub_idx = (num_unshared_layers - 2) % pattern_len
+
+    def forward_scan_head_stacked(m, tok, pos, mask):
+      x = m.embedder.encode(tok)
+
+      @nnx.scan(
+          in_axes=(nnx.Carry, 0, None, None, None, None),
+          out_axes=(
+              nnx.Carry,
+              {
+                  "global_origin": {"k": 0, "v": 0},
+                  "local_origin": {"k": 0, "v": 0},
+              },
+          ),
+      )
+      def scan_body_unshared_head(
+          x, group, positions, attn_mask, group_pli, segment_ids
+      ):
+        new_group_kvs = {}
+        x = group(
+            x,
+            positions,
+            attn_mask,
+            per_layer_inputs=group_pli,
+            new_group_kvs=new_group_kvs,
+            segment_ids=segment_ids,
+        )
+        return x, {
+            "global_origin": new_group_kvs[global_sub_idx],
+            "local_origin": new_group_kvs[local_sub_idx],
+        }
+
+      x, unshared_kvs = scan_body_unshared_head(
+          x, m.unshared_scan_groups, pos, mask, None, None
+      )
+      origin_kv_g = {
+          "k": unshared_kvs["global_origin"]["k"][-1],
+          "v": unshared_kvs["global_origin"]["v"][-1],
+      }
+      origin_kv_l = {
+          "k": unshared_kvs["local_origin"]["k"][-1],
+          "v": unshared_kvs["local_origin"]["v"][-1],
+      }
+
+      @nnx.scan(
+          in_axes=(nnx.Carry, 0, None, None, None, None, None, None),
+          out_axes=nnx.Carry,
+      )
+      def scan_body_shared_head(
+          x,
+          group,
+          positions,
+          attn_mask,
+          origin_g,
+          origin_l,
+          group_pli,
+          segment_ids,
+      ):
+        return group(
+            x,
+            positions,
+            attn_mask,
+            origin_kv_global=origin_g,
+            origin_kv_local=origin_l,
+            per_layer_inputs=group_pli,
+            segment_ids=segment_ids,
+        )
+
+      x = scan_body_shared_head(
+          x,
+          m.shared_scan_groups,
+          pos,
+          mask,
+          origin_kv_g,
+          origin_kv_l,
+          None,
+          None,
+      )
+      if m.final_norm is not None:
+        x = m.final_norm(x)
+      return x
+
+    def loss_head(m, tok, pos, mask):
+      out = forward_scan_head_stacked(m, tok, pos, mask)
+      return jnp.sum(out)
+
+    # Compile backward pass for HEAD-style implementation
+    grad_head = nnx.jit(nnx.grad(loss_head, argnums=0))
+    compiled_head = grad_head.lower(
+        model, tokens, positions, attn_mask
+    ).compile()
+    mem_head = compiled_head.memory_analysis()
+    hlo_head = compiled_head.as_text()
+
+    # 1. Verify Carry generates fewer dynamic-update-slice and dynamic-slice instructions
+    head_dus_count = hlo_head.count("dynamic-update-slice")
+    carry_dus_count = hlo_carry.count("dynamic-update-slice")
+    self.assertLess(
+        carry_dus_count,
+        head_dus_count,
+        msg=(
+            f"Carry DUS count ({carry_dus_count}) should be less than HEAD"
+            f" ({head_dus_count})"
+        ),
+    )
+
+    head_ds_count = hlo_head.count("dynamic-slice")
+    carry_ds_count = hlo_carry.count("dynamic-slice")
+    self.assertLess(
+        carry_ds_count,
+        head_ds_count,
+        msg=(
+            f"Carry DS count ({carry_ds_count}) should be less than HEAD"
+            f" ({head_ds_count})"
+        ),
+    )
+
+    # 2. Verify Carry produces a smaller HLO text graph by avoiding stacked tensor tracking
+    self.assertLess(
+        len(hlo_carry),
+        len(hlo_head),
+        msg=(
+            f"Carry HLO size ({len(hlo_carry)} chars) should be smaller "
+            f"than HEAD ({len(hlo_head)} chars)"
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -639,7 +796,7 @@ class ScanGenerationEquivalenceTest(absltest.TestCase):
         self,
         loop_out.logits,
         scan_out.logits,
-        msg='Prefill logits diverged.',
+        msg="Prefill logits diverged.",
     )
 
     # Single decode step.
@@ -666,7 +823,7 @@ class ScanGenerationEquivalenceTest(absltest.TestCase):
         self,
         loop_dec.logits,
         scan_dec.logits,
-        msg='Single decode step logits diverged.',
+        msg="Single decode step logits diverged.",
     )
 
   def test_multi_step_autoregressive_decode(self):
@@ -698,7 +855,7 @@ class ScanGenerationEquivalenceTest(absltest.TestCase):
         self,
         loop_out.logits,
         scan_out.logits,
-        msg='Prefill logits diverged (multi-step).',
+        msg="Prefill logits diverged (multi-step).",
     )
 
     loop_cache = loop_out.cache
@@ -723,7 +880,7 @@ class ScanGenerationEquivalenceTest(absltest.TestCase):
           self,
           loop_dec.logits,
           scan_dec.logits,
-          msg=f'Decode step {step} logits diverged.',
+          msg=f"Decode step {step} logits diverged.",
       )
 
       loop_cache = loop_dec.cache
@@ -753,7 +910,7 @@ class ScanGenerationEquivalenceTest(absltest.TestCase):
         self,
         loop_out.logits,
         scan_out.logits,
-        msg='Prefill logits (batch=1) diverged.',
+        msg="Prefill logits (batch=1) diverged.",
     )
 
   def test_generation_single_group(self):
@@ -780,7 +937,7 @@ class ScanGenerationEquivalenceTest(absltest.TestCase):
         self,
         loop_out.logits,
         scan_out.logits,
-        msg='Single-group generation logits diverged.',
+        msg="Single-group generation logits diverged.",
     )
 
   def test_generation_with_segment_ids(self):
@@ -819,7 +976,7 @@ class ScanGenerationEquivalenceTest(absltest.TestCase):
         self,
         loop_out.logits,
         scan_out.logits,
-        msg='Segment IDs generation logits diverged.',
+        msg="Segment IDs generation logits diverged.",
     )
 
   def test_generation_with_shared_kv_layers(self):
@@ -855,7 +1012,7 @@ class ScanGenerationEquivalenceTest(absltest.TestCase):
         self,
         loop_out.logits,
         scan_out.logits,
-        msg='Shared-KV prefill logits mismatch.',
+        msg="Shared-KV prefill logits mismatch.",
     )
 
     # --- Decode step ---
@@ -882,7 +1039,7 @@ class ScanGenerationEquivalenceTest(absltest.TestCase):
         self,
         loop_dec.logits,
         scan_dec.logits,
-        msg='Shared-KV decode logits mismatch.',
+        msg="Shared-KV decode logits mismatch.",
     )
 
   def test_generation_equivalence_gemma4_e2b(self):
@@ -918,7 +1075,7 @@ class ScanGenerationEquivalenceTest(absltest.TestCase):
         self,
         loop_out.logits,
         scan_out.logits,
-        msg='Gemma4 E2B prefill logits diverged.',
+        msg="Gemma4 E2B prefill logits diverged.",
     )
 
     # Single decode step
@@ -945,7 +1102,7 @@ class ScanGenerationEquivalenceTest(absltest.TestCase):
         self,
         loop_dec.logits,
         scan_dec.logits,
-        msg='Gemma4 E2B single decode step logits diverged.',
+        msg="Gemma4 E2B single decode step logits diverged.",
     )
 
   def test_generation_with_per_layer_inputs(self):
@@ -974,7 +1131,7 @@ class ScanGenerationEquivalenceTest(absltest.TestCase):
         self,
         loop_out.logits,
         scan_out.logits,
-        msg='Per-layer input generation logits diverged.',
+        msg="Per-layer input generation logits diverged.",
     )
 
 
@@ -1000,7 +1157,7 @@ class ScanShardingSpecTest(absltest.TestCase):
   both production crashes occurred.
   """
 
-  _MESH = jax.sharding.AbstractMesh((32, 1), ('fsdp', 'tp'))
+  _MESH = jax.sharding.AbstractMesh((32, 1), ("fsdp", "tp"))
   _CONFIG_31B = model_lib.ModelConfig.gemma4_31b()
 
   def _eval_model(self, config):
@@ -1014,19 +1171,19 @@ class ScanShardingSpecTest(absltest.TestCase):
     scan = base.with_scan_axis()
 
     weight_fields = (
-        'q_weight_ndh',
-        'kv_weight_cndh',
-        'qkv_weight_cndh',
-        'o_weight_nhd',
-        'ffw_weight_df',
-        'ffw_weight_fd',
-        'rms_norm_weight',
-        'vision_proj',
-        'vision_soft_emb_norm_weight',
-        'exp_weight_edf',
-        'exp_weight_efd',
-        'per_layer_input_gate',
-        'per_layer_projection',
+        "q_weight_ndh",
+        "kv_weight_cndh",
+        "qkv_weight_cndh",
+        "o_weight_nhd",
+        "ffw_weight_df",
+        "ffw_weight_fd",
+        "rms_norm_weight",
+        "vision_proj",
+        "vision_soft_emb_norm_weight",
+        "exp_weight_edf",
+        "exp_weight_efd",
+        "per_layer_input_gate",
+        "per_layer_projection",
     )
     for field in weight_fields:
       base_val = getattr(base, field)
@@ -1034,22 +1191,22 @@ class ScanShardingSpecTest(absltest.TestCase):
       self.assertEqual(
           scan_val,
           (None,) + base_val,
-          msg=f'{field}: expected (None,) + {base_val!r}, got {scan_val!r}',
+          msg=f"{field}: expected (None,) + {base_val!r}, got {scan_val!r}",
       )
 
     # Activation / embedder specs must be unchanged.
     for field in (
-        'act_btd',
-        'act_btf',
-        'act_btnh',
-        'emb_vd',
-        'per_layer_model_projection',
-        'per_layer_input_embedding',
+        "act_btd",
+        "act_btf",
+        "act_btnh",
+        "emb_vd",
+        "per_layer_model_projection",
+        "per_layer_input_embedding",
     ):
       self.assertEqual(
           getattr(scan, field),
           getattr(base, field),
-          msg=f'{field} should not be modified by with_scan_axis()',
+          msg=f"{field} should not be modified by with_scan_axis()",
       )
 
   def test_non_scan_31b_init_under_production_mesh(self):
@@ -1058,7 +1215,7 @@ class ScanShardingSpecTest(absltest.TestCase):
     try:
       self._eval_model(config)
     except Exception as e:  # pylint: disable=broad-except
-      self.fail(f'Non-scan 31b init raised: {e}')
+      self.fail(f"Non-scan 31b init raised: {e}")
 
   def test_scan_31b_init_under_production_mesh(self):
     """Model init must not raise under the production mesh (fsdp=32, tp=1)."""
@@ -1066,7 +1223,7 @@ class ScanShardingSpecTest(absltest.TestCase):
     try:
       self._eval_model(config)
     except Exception as e:  # pylint: disable=broad-except
-      self.fail(f'Scan 31b init raised under fsdp=32 mesh: {e}')
+      self.fail(f"Scan 31b init raised under fsdp=32 mesh: {e}")
 
   def test_optimizer_init_31b_under_production_mesh(self):
     """Optimizer init must not raise under the production mesh."""
@@ -1079,7 +1236,7 @@ class ScanShardingSpecTest(absltest.TestCase):
             lambda: nnx.Optimizer(model, optax.adam(1e-4), wrt=nnx.Param)
         )
     except Exception as e:  # pylint: disable=broad-except
-      self.fail(f'nnx.Optimizer(31b scan) raised under fsdp=32 mesh: {e}')
+      self.fail(f"nnx.Optimizer(31b scan) raised under fsdp=32 mesh: {e}")
 
   def test_checkpoint_restore_target_31b_under_production_mesh(self):
     """Building restore targets must not raise under the production mesh."""
@@ -1096,43 +1253,43 @@ class ScanShardingSpecTest(absltest.TestCase):
     # Real un-stacked checkpoint shapes (31B layout).
     fake_upstream = {}
     for i in range(config.num_layers):
-      fake_upstream[f'layer_{i}'] = {
-          'attn': {
-              'q_einsum': {'w': np.zeros((32, 5376, 256))},
-              'kv_einsum': {'w': np.zeros((2, 16, 5376, 256))},
-              'pre_attention_norm': {'scale': np.zeros((5376,))},
+      fake_upstream[f"layer_{i}"] = {
+          "attn": {
+              "q_einsum": {"w": np.zeros((32, 5376, 256))},
+              "kv_einsum": {"w": np.zeros((2, 16, 5376, 256))},
+              "pre_attention_norm": {"scale": np.zeros((5376,))},
           }
       }
-    fake_upstream['embedder'] = {'input_embedding': np.zeros((262144, 5376))}
-    fake_upstream['final_norm'] = {'scale': np.zeros((5376,))}
+    fake_upstream["embedder"] = {"input_embedding": np.zeros((262144, 5376))}
+    fake_upstream["final_norm"] = {"scale": np.zeros((5376,))}
 
     temp_dir = tempfile.mkdtemp()
     try:
       ckptr = ocp.PyTreeCheckpointer()
-      ckptr.save(temp_dir + '/ckpt', fake_upstream)
+      ckptr.save(temp_dir + "/ckpt", fake_upstream)
 
       with use_abstract_mesh(self._MESH):
         target, _ = params_lib._build_sharded_restore_target(
-            temp_dir + '/ckpt', model_state, self._MESH, config
+            temp_dir + "/ckpt", model_state, self._MESH, config
         )
     except Exception as e:  # pylint: disable=broad-except
-      self.fail(f'_build_sharded_restore_target raised: {e}')
+      self.fail(f"_build_sharded_restore_target raised: {e}")
     finally:
       shutil.rmtree(temp_dir)
 
     # Verify specs match checkpoint rank (scan axis stripped).
-    q_w_sharding = target['layer_0']['attn']['q_einsum']['w'].sharding
+    q_w_sharding = target["layer_0"]["attn"]["q_einsum"]["w"].sharding
     self.assertEqual(len(q_w_sharding.spec), 3)
     self.assertEqual(
         q_w_sharding.spec,
-        jax.sharding.PartitionSpec('tp', 'fsdp', None),
+        jax.sharding.PartitionSpec("tp", "fsdp", None),
     )
 
-    kv_w_sharding = target['layer_0']['attn']['kv_einsum']['w'].sharding
+    kv_w_sharding = target["layer_0"]["attn"]["kv_einsum"]["w"].sharding
     self.assertEqual(len(kv_w_sharding.spec), 4)
     self.assertEqual(
         kv_w_sharding.spec,
-        jax.sharding.PartitionSpec(None, 'tp', 'fsdp', None),
+        jax.sharding.PartitionSpec(None, "tp", "fsdp", None),
     )
 
   def test_scan_sharding_annotations_match_param_rank(self):
@@ -1144,23 +1301,23 @@ class ScanShardingSpecTest(absltest.TestCase):
     for path, var in nnx.iter_graph(model):
       if not isinstance(var, nnx.Param):
         continue
-      spec = var.get_metadata('out_sharding', None)
+      spec = var.get_metadata("out_sharding", None)
       if not isinstance(spec, tuple):
         continue
       value = var.get_value()
-      if not hasattr(value, 'ndim'):
+      if not hasattr(value, "ndim"):
         continue
       if len(spec) != value.ndim:
-        path_str = '.'.join(str(p) for p in path)
+        path_str = ".".join(str(p) for p in path)
         mismatches.append(
-            f'{path_str}: spec rank {len(spec)} != ndim {value.ndim}'
-            f' (shape={value.shape}, spec={spec})'
+            f"{path_str}: spec rank {len(spec)} != ndim {value.ndim}"
+            f" (shape={value.shape}, spec={spec})"
         )
 
     self.assertEmpty(
         mismatches,
-        msg='out_sharding rank mismatches after vmap:\n'
-        + '\n'.join(mismatches),
+        msg="out_sharding rank mismatches after vmap:\n"
+        + "\n".join(mismatches),
     )
 
   def test_non_scan_31b_optimizes_under_production_mesh(self):
@@ -1175,7 +1332,7 @@ class ScanShardingSpecTest(absltest.TestCase):
             lambda: nnx.Optimizer(model, optax.adam(1e-4), wrt=nnx.Param)
         )
     except Exception as e:  # pylint: disable=broad-except
-      self.fail(f'Non-scan 31b optimizer raised under fsdp=32 mesh: {e}')
+      self.fail(f"Non-scan 31b optimizer raised under fsdp=32 mesh: {e}")
 
   def test_init_cache_stacked_cache_sharding_under_mesh(self):
     """StackedCache tensors must be partitioned by batch axis (shd_b) under mesh."""
@@ -1189,8 +1346,8 @@ class ScanShardingSpecTest(absltest.TestCase):
       for sub_cache in stacked_cache:
         if sub_cache is None:
           continue
-        k_sharding = getattr(sub_cache['k'], 'sharding', None)
-        v_sharding = getattr(sub_cache['v'], 'sharding', None)
+        k_sharding = getattr(sub_cache["k"], "sharding", None)
+        v_sharding = getattr(sub_cache["v"], "sharding", None)
         self.assertIsNotNone(
             k_sharding, msg="Stacked cache 'k' missing sharding spec"
         )
@@ -1199,7 +1356,7 @@ class ScanShardingSpecTest(absltest.TestCase):
         )
         if isinstance(k_sharding, jax.sharding.NamedSharding):
           self.assertEqual(k_sharding.spec[0], None)
-          self.assertEqual(k_sharding.spec[1], 'fsdp')
+          self.assertEqual(k_sharding.spec[1], "fsdp")
 
 
 def _unstack_cache(
@@ -1221,10 +1378,10 @@ def _unstack_cache(
     sub_idx = i % pattern_len
     c = stacked_cache[sub_idx]
     if c is not None:
-      dict_cache[f'layer_{i}'] = {
-          'k': c['k'][group_idx],
-          'v': c['v'][group_idx],
-          'end_index': c['end_index'][group_idx],
+      dict_cache[f"layer_{i}"] = {
+          "k": c["k"][group_idx],
+          "v": c["v"][group_idx],
+          "end_index": c["end_index"][group_idx],
       }
   return dict_cache
 
@@ -1249,14 +1406,14 @@ def _stack_cache(
         (i for i in group_layer_indices if kv_cache_sharing_patterns[i] == i),
         None,
     )
-    if proto_i is not None and f'layer_{proto_i}' in cache:
-      proto_cache = cache[f'layer_{proto_i}']
-      k_shape = proto_cache['k'].shape
-      v_shape = proto_cache['v'].shape
-      end_idx_shape = proto_cache['end_index'].shape
-      k_dtype = proto_cache['k'].dtype
-      v_dtype = proto_cache['v'].dtype
-      end_idx_dtype = proto_cache['end_index'].dtype
+    if proto_i is not None and f"layer_{proto_i}" in cache:
+      proto_cache = cache[f"layer_{proto_i}"]
+      k_shape = proto_cache["k"].shape
+      v_shape = proto_cache["v"].shape
+      end_idx_shape = proto_cache["end_index"].shape
+      k_dtype = proto_cache["k"].dtype
+      v_dtype = proto_cache["v"].dtype
+      end_idx_dtype = proto_cache["end_index"].dtype
     else:
       proto_cache = None
 
@@ -1265,20 +1422,20 @@ def _stack_cache(
       vs = []
       end_indices = []
       for i in group_layer_indices:
-        if kv_cache_sharing_patterns[i] == i and f'layer_{i}' in cache:
-          c = cache[f'layer_{i}']
-          ks.append(c['k'])
-          vs.append(c['v'])
-          end_indices.append(c['end_index'])
+        if kv_cache_sharing_patterns[i] == i and f"layer_{i}" in cache:
+          c = cache[f"layer_{i}"]
+          ks.append(c["k"])
+          vs.append(c["v"])
+          end_indices.append(c["end_index"])
         else:
           ks.append(jnp.zeros(k_shape, dtype=k_dtype))
           vs.append(jnp.zeros(v_shape, dtype=v_dtype))
           end_indices.append(jnp.zeros(end_idx_shape, dtype=end_idx_dtype))
 
       scan_cache_list.append({
-          'k': jnp.stack(ks, axis=0),
-          'v': jnp.stack(vs, axis=0),
-          'end_index': jnp.stack(end_indices, axis=0),
+          "k": jnp.stack(ks, axis=0),
+          "v": jnp.stack(vs, axis=0),
+          "end_index": jnp.stack(end_indices, axis=0),
       })
     else:
       scan_cache_list.append(None)
@@ -1309,14 +1466,14 @@ class CacheConversionTest(absltest.TestCase):
     self.assertEqual(set(dict_cache.keys()), set(unstacked.keys()))
 
     for key in dict_cache:
-      for k in ('k', 'v', 'end_index'):
+      for k in ("k", "v", "end_index"):
         np.testing.assert_allclose(dict_cache[key][k], unstacked[key][k])
 
   def test_gemma_output_pytree_node(self):
     """Test that GemmaOutput is a valid JAX PyTree node (flatten/unflatten/map)."""
     logits = jnp.ones((2, 3))
     cache = {
-        'layer_0': {'k': jnp.zeros((2, 4, 16)), 'v': jnp.zeros((2, 4, 16))}
+        "layer_0": {"k": jnp.zeros((2, 4, 16)), "v": jnp.zeros((2, 4, 16))}
     }
     out = model_lib.GemmaOutput(logits=logits, cache=cache)
 
@@ -1327,9 +1484,9 @@ class CacheConversionTest(absltest.TestCase):
     self.assertIsInstance(reconstructed, model_lib.GemmaOutput)
     np.testing.assert_allclose(reconstructed.logits, logits)
 
-    doubled = jax.tree.map(lambda x: x * 2 if hasattr(x, 'shape') else x, out)
+    doubled = jax.tree.map(lambda x: x * 2 if hasattr(x, "shape") else x, out)
     np.testing.assert_allclose(doubled.logits, logits * 2)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
   absltest.main()

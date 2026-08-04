@@ -44,9 +44,7 @@ import jaxtyping
 import numpy as np
 from tunix.generate.mappings import BackendMappingMixin
 from tunix.models.gemma4 import moe
-from tunix.utils import compat
-from tunix.utils import env_utils
-from tunix.utils import sharding_utils
+from tunix.utils import compat, env_utils, sharding_utils
 from typing_extensions import NotRequired
 
 # JAX checkpoint policy type — matches nnx.remat's policy parameter.
@@ -158,7 +156,9 @@ class GemmaOutput:
   cache: Cache | StackedCache | None = None
   hidden_states: jax.Array | None = None
 
-  def tree_flatten(self) -> tuple[
+  def tree_flatten(
+      self,
+  ) -> tuple[
       tuple[jax.Array, Cache | StackedCache | None, jax.Array | None],
       None,
   ]:
@@ -666,13 +666,13 @@ class Embedder(nnx.Module):
     )
     x = self.per_layer_model_projection(x)
     x = self.per_layer_projection_norm(x)
-    y = self.per_layer_input_embedding.value[t]
+    y = self.per_layer_input_embedding[t]
     y *= jnp.sqrt(self.config.per_layer_input_dim).astype(y.dtype)
     return (x + y) * jax.lax.rsqrt(2.0).astype(x.dtype)
 
   def decode(self, x: jaxtyping.ArrayLike) -> jaxtyping.Array:
     x = jnp.astype(x, self.config.dtype)
-    w = jnp.astype(self.input_embedding.value, self.config.dtype)
+    w = jnp.astype(self.input_embedding[...], self.config.dtype)
     return jnp.dot(x, w.T)
 
 
@@ -702,7 +702,7 @@ class Einsum(nnx.Module):
     )
 
   def __call__(self, x: jaxtyping.ArrayLike) -> jaxtyping.Array:
-    w = self.w.value
+    w = self.w[...]
     if self.w_scale is not None:
       w = w * self.w_scale
     x = jnp.astype(x, self.dtype)
@@ -782,7 +782,7 @@ class RMSNorm(nnx.Module):
     x = jnp.astype(x, jnp.float32)
     var = jnp.mean(jnp.square(x), axis=-1, keepdims=True)
     normed_inputs = x * jax.lax.rsqrt(var + 1e-06).astype(x.dtype)
-    scale = jnp.expand_dims(self.scale.value, axis=range(len(x.shape) - 1))
+    scale = jnp.expand_dims(self.scale[...], axis=range(len(x.shape) - 1))
     normed_inputs = normed_inputs * scale
     return normed_inputs.astype(self.dtype)
 
@@ -1691,7 +1691,7 @@ class DecoderLayer(nnx.Module):
       mapped = self.post_per_layer_input_norm(mapped)
       ffw += mapped
 
-    ffw = ffw * self.skip_scale.value
+    ffw = ffw * self.skip_scale[...]
     return cache, ffw, kv
 
   def __call__(
@@ -2341,9 +2341,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
           % pattern_len
           for s in range(pattern_len)
       ]
-      is_origin_sub = [
-          origin_sub_indices[s] != s for s in range(pattern_len)
-      ]
+      is_origin_sub = [origin_sub_indices[s] != s for s in range(pattern_len)]
       is_shared_per_group = np.zeros(
           (num_scan_groups, pattern_len), dtype=np.bool_
       )
@@ -2734,6 +2732,27 @@ class Gemma4(BackendMappingMixin, nnx.Module):
       global_sub_idx = (num_unshared_layers - 1) % pattern_len
       local_sub_idx = (num_unshared_layers - 2) % pattern_len
 
+      def _make_dummy_kv(num_heads: int, head_dim: int) -> LayerKV:
+        z = jnp.zeros(
+            (x.shape[0], x.shape[1], num_heads, head_dim),
+            dtype=x.dtype,
+        )
+        return {"k": z, "v": z}
+
+      init_carry: tuple[jaxtyping.Array, OriginKV] = (
+          x,
+          {
+              "global_origin": _make_dummy_kv(
+                  self.config.num_global_kv_heads or self.config.num_kv_heads,
+                  self.config.global_key_size or self.config.head_dim,
+              ),
+              "local_origin": _make_dummy_kv(
+                  self.config.num_kv_heads,
+                  self.config.head_dim,
+              ),
+          },
+      )
+
       @nnx.scan(
           in_axes=(
               nnx.Carry,
@@ -2743,38 +2762,33 @@ class Gemma4(BackendMappingMixin, nnx.Module):
               0 if scan_unshared_pli is not None else None,
               None,
           ),
-          out_axes=(
-              nnx.Carry,
-              {
-                  "global_origin": {"k": 0, "v": 0},
-                  "local_origin": {"k": 0, "v": 0},
-              },
-          ),
+          out_axes=nnx.Carry,
       )
       def scan_body_unshared(
-          x: jaxtyping.Array,
+          carry: tuple[jaxtyping.Array, OriginKV],
           group: ScanLayerGroup,
           positions: jaxtyping.Array,
           attn_mask: jaxtyping.Array | None,
           group_per_layer_inputs: jaxtyping.Array | None,
           segment_ids: jaxtyping.Array | None,
       ) -> tuple[jaxtyping.Array, OriginKV]:
+        x_curr, _ = carry
         new_group_kvs: dict[int, LayerKV] = {}
-        x = group(
-            x,
+        x_next = group(
+            x_curr,
             positions,
             attn_mask,
             per_layer_inputs=group_per_layer_inputs,
             new_group_kvs=new_group_kvs,
             segment_ids=segment_ids,
         )
-        return x, {
+        return x_next, {
             "global_origin": new_group_kvs[global_sub_idx],
             "local_origin": new_group_kvs[local_sub_idx],
         }
 
       x, unshared_kvs = scan_body_unshared(
-          x,
+          init_carry,
           self.unshared_scan_groups,
           positions,
           attention_mask,
@@ -2782,21 +2796,10 @@ class Gemma4(BackendMappingMixin, nnx.Module):
           segment_ids,
       )
 
-      # Extract origin KVs from the last unshared group
-      origin_kv_global: LayerKV = {
-          "k": unshared_kvs["global_origin"]["k"][-1],
-          "v": unshared_kvs["global_origin"]["v"][-1],
-      }
-      origin_kv_local: LayerKV = {
-          "k": unshared_kvs["local_origin"]["k"][-1],
-          "v": unshared_kvs["local_origin"]["v"][-1],
-      }
-
       @nnx.scan(
           in_axes=(
               nnx.Carry,
               0,
-              None,
               None,
               None,
               None,
@@ -2810,8 +2813,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
           group: ScanLayerGroup,
           positions: jaxtyping.Array,
           attn_mask: jaxtyping.Array | None,
-          origin_kv_g: LayerKV,
-          origin_kv_l: LayerKV,
+          origin_kvs: OriginKV,
           group_per_layer_inputs: jaxtyping.Array | None,
           segment_ids: jaxtyping.Array | None,
       ) -> jaxtyping.Array:
@@ -2819,8 +2821,8 @@ class Gemma4(BackendMappingMixin, nnx.Module):
             x,
             positions,
             attn_mask,
-            origin_kv_global=origin_kv_g,
-            origin_kv_local=origin_kv_l,
+            origin_kv_global=origin_kvs["global_origin"],
+            origin_kv_local=origin_kvs["local_origin"],
             per_layer_inputs=group_per_layer_inputs,
             segment_ids=segment_ids,
         )
@@ -2830,8 +2832,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
           self.shared_scan_groups,
           positions,
           attention_mask,
-          origin_kv_global,
-          origin_kv_local,
+          unshared_kvs,
           scan_shared_pli,
           segment_ids,
       )
