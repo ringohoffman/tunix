@@ -23,6 +23,7 @@ convenience ``Sampler`` wrapper.
 from __future__ import annotations
 
 import dataclasses
+import inspect
 from typing import TypeAlias
 
 import flax
@@ -338,11 +339,23 @@ def generate(
   else:
     attention_mask = utils.make_causal_attn_mask(input_mask, cache_size)
 
+  # Only project the last prompt position through the LM head during
+  # prefill — we discard all other logits anyway (line ``last_logits =
+  # logits[:, -1:]`` below).  This saves (prompt_len - 1) * batch_size
+  # linear projections through the vocabulary projection layer.
+  prefill_kwargs: dict[str, object] = {}
+  try:
+    if "decode_only_last_token" in inspect.signature(model.__call__).parameters:
+      prefill_kwargs["decode_only_last_token"] = True
+  except (ValueError, TypeError):
+    pass
+
   out = model(
       input_ids,
       positions[:, :prompt_len],
       cache,
       attention_mask,
+      **prefill_kwargs,
   )
   logits, cache = _unpack_model_output(out)
 
