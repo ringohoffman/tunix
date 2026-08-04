@@ -276,52 +276,51 @@ class Gemma4ForClassification(gemma4_model.Gemma4):
       *,
       rngs: nnx.Rngs,
       pool_strategy: PoolStrategy = PoolStrategy.LAST_TOKEN,
-      pad_id: int = 0,
       max_examples_per_packed_sequence: int | None = None,
   ) -> None:
     super().__init__(config, rngs=rngs)
     self.head = head
     self.pool_strategy = pool_strategy
-    self.pad_id = pad_id
     self.max_examples_per_packed_sequence = max_examples_per_packed_sequence
 
-  def __call__(  # type: ignore[override]
+  def __call__(
       self,
       tokens: jaxtyping.Array,
       positions: jaxtyping.Array | None = None,
+      cache: gemma4_model.Cache | gemma4_model.StackedCache | None = None,
       attention_mask: jaxtyping.Array | None = None,
-      *,
-      pool_mask: jaxtyping.Array | None = None,
+      decode_only_last_token: bool = False,
       segment_ids: jaxtyping.Array | None = None,
   ) -> ClassificationOutput:
-    packed = segment_ids is not None
-
-    if packed:
-      pad_mask = None
+    if segment_ids is not None:
       if positions is None:
         raise ValueError("positions must be provided for packed mode")
       if attention_mask is None:
         attention_mask = make_shared_prefix_attn_mask(segment_ids)
     else:
-      pad_mask = tokens != self.pad_id
-      if positions is None:
-        cumulative = jnp.cumsum(pad_mask.astype(jnp.int32), axis=-1)
-        positions = cumulative - (cumulative >= 1).astype(jnp.int32)
       if attention_mask is None:
         seq_len = tokens.shape[-1]
         causal = jnp.tril(jnp.ones((seq_len, seq_len), dtype=jnp.bool_))
-        valid = pad_mask[..., :, None] & pad_mask[..., None, :]
-        attention_mask = causal[None, ...] & valid
+        attention_mask = causal[None, ...]
+
+      # Derive valid token mask directly from attention_mask diagonal [B, T]
+      mask = jnp.diagonal(attention_mask, axis1=-2, axis2=-1)
+      if mask.ndim > 2:
+        mask = jnp.squeeze(mask, axis=-2)
+
+      if positions is None:
+        cumulative = jnp.cumsum(mask.astype(jnp.int32), axis=-1)
+        positions = cumulative - (cumulative >= 1).astype(jnp.int32)
 
     hidden, _ = self.forward_backbone(
         tokens,
         positions=positions,
-        cache=None,
+        cache=cache,
         attention_mask=attention_mask,
         segment_ids=segment_ids,
     )
 
-    if packed:
+    if segment_ids is not None:
       if self.max_examples_per_packed_sequence is None:
         raise ValueError(
             "max_examples_per_packed_sequence must be specified when"
@@ -333,9 +332,7 @@ class Gemma4ForClassification(gemma4_model.Gemma4):
       B, N, D = pooled.shape
       pooled = pooled.reshape(B * N, D)
     else:
-      if pool_mask is None and pad_mask is not None:
-        pool_mask = pad_mask
-      pooled = pool_hidden_states(hidden, pool_mask, self.pool_strategy)
+      pooled = pool_hidden_states(hidden, mask, self.pool_strategy)
 
     logits = self.head(pooled)
 
