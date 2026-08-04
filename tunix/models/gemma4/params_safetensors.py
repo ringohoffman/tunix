@@ -21,20 +21,21 @@ import re
 import jax
 import jax.numpy as jnp
 from tunix.models import safetensors_loader
-from tunix.models.gemma4 import model as model_lib
+from tunix.models.gemma4 import classification as gemma4_classification
+from tunix.models.gemma4 import model as gemma4_model
 
 
-def _get_key_and_transform_mapping(cfg: model_lib.ModelConfig):
+def _get_key_and_transform_mapping(cfg: gemma4_model.ModelConfig):
   """Mapping of torch_keys to (nnx_keys, (permute_rule, reshape_rule))."""
   pattern = (
       cfg.attention_pattern
       if cfg.attention_pattern
-      else model_lib.GEMMA4_ATTENTION_PATTERN
+      else gemma4_model.GEMMA4_ATTENTION_PATTERN
   )
   global_layers = []
   local_layers = []
   for i in range(cfg.num_layers):
-    if pattern[i % len(pattern)] == model_lib.AttentionType.GLOBAL:
+    if pattern[i % len(pattern)] == gemma4_model.AttentionType.GLOBAL:
       global_layers.append(str(i))
     else:
       local_layers.append(str(i))
@@ -251,7 +252,8 @@ def _get_key_and_transform_mapping(cfg: model_lib.ModelConfig):
 
 import numpy as np
 
-def _make_preprocess_fn(cfg: model_lib.ModelConfig):
+
+def _make_preprocess_fn(cfg: gemma4_model.ModelConfig):
   """Creates a tensor preprocessing function for Gemma 4 safetensors."""
   q_pat = re.compile(r"tmp\.layers\.([0-9]+)\.attn\.q$")
   k_pat = re.compile(r"tmp\.layers\.([0-9]+)\.attn\.k$")
@@ -278,7 +280,8 @@ def _make_preprocess_fn(cfg: model_lib.ModelConfig):
         x = np.reshape(x, (cfg.embed_dim, num_kv_heads, head_dim))
         return np.transpose(x, (1, 0, 2))
       raise ValueError(
-          f"Unexpected 2D kv shape: {x.shape}, expected dims to contain {num_kv_heads * head_dim} and {cfg.embed_dim}"
+          f"Unexpected 2D kv shape: {x.shape}, expected dims to contain"
+          f" {num_kv_heads * head_dim} and {cfg.embed_dim}"
       )
 
     # 3D shape handling
@@ -291,7 +294,8 @@ def _make_preprocess_fn(cfg: model_lib.ModelConfig):
       x = np.transpose(x, (h_axis, f_axis, k_axis))
       return x[:num_kv_heads]
     raise ValueError(
-        f"Unexpected kv shape: {x.shape}, expected dims to contain {cfg.embed_dim} and {head_dim}"
+        f"Unexpected kv shape: {x.shape}, expected dims to contain"
+        f" {cfg.embed_dim} and {head_dim}"
     )
 
   def preprocess(tensors: dict[str, jnp.ndarray]) -> dict[str, jnp.ndarray]:
@@ -310,7 +314,7 @@ def _make_preprocess_fn(cfg: model_lib.ModelConfig):
     pattern = (
         cfg.attention_pattern
         if cfg.attention_pattern
-        else model_lib.GEMMA4_ATTENTION_PATTERN
+        else gemma4_model.GEMMA4_ATTENTION_PATTERN
     )
 
     for layer_id_str, slots in list(pending.items()):
@@ -323,7 +327,7 @@ def _make_preprocess_fn(cfg: model_lib.ModelConfig):
 
       effective_head_dim = cfg.head_dim
       effective_num_kv_heads = cfg.num_kv_heads
-      if attn_type == model_lib.AttentionType.GLOBAL:
+      if attn_type == gemma4_model.AttentionType.GLOBAL:
         if cfg.global_key_size is not None:
           effective_head_dim = cfg.global_key_size
         if cfg.num_global_kv_heads is not None:
@@ -336,7 +340,7 @@ def _make_preprocess_fn(cfg: model_lib.ModelConfig):
 
       k_eq_v_active = (
           cfg.k_eq_v_global
-          if attn_type == model_lib.AttentionType.GLOBAL
+          if attn_type == gemma4_model.AttentionType.GLOBAL
           else False
       )
 
@@ -360,14 +364,19 @@ def _make_preprocess_fn(cfg: model_lib.ModelConfig):
 
 def create_model_from_safe_tensors(
     file_dir: str,
-    config: model_lib.ModelConfig,
+    config: gemma4_model.ModelConfig,
     mesh: jax.sharding.Mesh | None = None,
     dtype: jnp.dtype | None = None,
     mode: str = "auto",
 ):
+  model_cls = (
+      gemma4_classification.Gemma4ForClassification
+      if isinstance(config, gemma4_classification.ClassificationModelConfig)
+      else gemma4_model.Gemma4
+  )
   return safetensors_loader.load_and_create_model(
       file_dir=file_dir,
-      model_class=model_lib.Gemma4,
+      model_class=model_cls,
       config=config,
       key_mapping=_get_key_and_transform_mapping,
       mesh=mesh,

@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 from absl.testing import absltest
 from flax import nnx
 import jax
@@ -38,19 +40,38 @@ def _create_small_model_config() -> model_lib.ModelConfig:
   return config
 
 
+def _create_small_classification_config(
+    head_type: cls_lib.HeadType = cls_lib.HeadType.MULTILABEL,
+    num_classes: int = 3,
+    class_names: tuple[str, ...] = (),
+    max_examples_per_packed_sequence: int | None = None,
+    pool_strategy: cls_lib.PoolStrategy = cls_lib.PoolStrategy.LAST_TOKEN,
+) -> cls_lib.ClassificationModelConfig:
+  config = _create_small_model_config()
+  fields_dict = {
+      f.name: getattr(config, f.name) for f in dataclasses.fields(config)
+  }
+  return cls_lib.ClassificationModelConfig(
+      head_type=head_type,
+      num_classes=num_classes,
+      class_names=class_names,
+      max_examples_per_packed_sequence=max_examples_per_packed_sequence,
+      pool_strategy=pool_strategy,
+      **fields_dict,
+  )
+
+
 class Gemma4ForClassificationTest(absltest.TestCase):
 
   def test_unpacked_default_mask(self):
     """Test unpacked classification when no input_mask is provided."""
-    config = _create_small_model_config()
-    cls_config = cls_lib.ClassificationConfig(
+    config = _create_small_classification_config(
         head_type=cls_lib.HeadType.MULTILABEL,
         num_classes=3,
         class_names=("cat_a", "cat_b", "cat_c"),
     )
     rngs = nnx.Rngs(0)
-    head = cls_lib.build_head(cls_config, config.embed_dim, rngs=rngs)
-    model = cls_lib.Gemma4ForClassification(config=config, head=head, rngs=rngs)
+    model = cls_lib.Gemma4ForClassification(config=config, rngs=rngs)
 
     batch_size, seq_len = 2, 8
     tokens = jax.random.randint(
@@ -64,18 +85,15 @@ class Gemma4ForClassificationTest(absltest.TestCase):
 
   def test_unpacked_explicit_input_mask(self):
     """Test unpacked classification with an explicit attention_mask (padding)."""
-    config = _create_small_model_config()
-    cls_config = cls_lib.ClassificationConfig(
+    config = _create_small_classification_config(
         head_type=cls_lib.HeadType.MULTILABEL,
         num_classes=2,
+        pool_strategy=cls_lib.PoolStrategy.LAST_TOKEN,
     )
     rngs = nnx.Rngs(0)
-    head = cls_lib.build_head(cls_config, config.embed_dim, rngs=rngs)
     model = cls_lib.Gemma4ForClassification(
         config=config,
-        head=head,
-        rngs=nnx.Rngs(0),
-        pool_strategy=cls_lib.PoolStrategy.LAST_TOKEN,
+        rngs=rngs,
     )
 
     batch_size, seq_len = 2, 8
@@ -98,14 +116,12 @@ class Gemma4ForClassificationTest(absltest.TestCase):
 
   def test_unpacked_explicit_positions_and_attn_mask(self):
     """Test passing pre-computed positions and attention_mask."""
-    config = _create_small_model_config()
-    cls_config = cls_lib.ClassificationConfig(
+    config = _create_small_classification_config(
         head_type=cls_lib.HeadType.MULTILABEL,
         num_classes=2,
     )
     rngs = nnx.Rngs(0)
-    head = cls_lib.build_head(cls_config, config.embed_dim, rngs=rngs)
-    model = cls_lib.Gemma4ForClassification(config=config, head=head, rngs=rngs)
+    model = cls_lib.Gemma4ForClassification(config=config, rngs=rngs)
 
     batch_size, seq_len = 1, 4
     tokens = jnp.array([[10, 20, 30, 0]])
@@ -122,18 +138,15 @@ class Gemma4ForClassificationTest(absltest.TestCase):
 
   def test_unpacked_mean_pooling(self):
     """Test MEAN pooling strategy."""
-    config = _create_small_model_config()
-    cls_config = cls_lib.ClassificationConfig(
+    config = _create_small_classification_config(
         head_type=cls_lib.HeadType.MULTILABEL,
         num_classes=2,
+        pool_strategy=cls_lib.PoolStrategy.MEAN,
     )
     rngs = nnx.Rngs(0)
-    head = cls_lib.build_head(cls_config, config.embed_dim, rngs=rngs)
     model = cls_lib.Gemma4ForClassification(
         config=config,
-        head=head,
         rngs=rngs,
-        pool_strategy=cls_lib.PoolStrategy.MEAN,
     )
 
     tokens = jnp.array([[10, 20, 30, 0]])
@@ -149,14 +162,12 @@ class Gemma4ForClassificationTest(absltest.TestCase):
 
   def test_binary_head(self):
     """Test BINARY classification head producing [B] shaped logits."""
-    config = _create_small_model_config()
-    cls_config = cls_lib.ClassificationConfig(
+    config = _create_small_classification_config(
         head_type=cls_lib.HeadType.BINARY,
         num_classes=1,
     )
     rngs = nnx.Rngs(0)
-    head = cls_lib.build_head(cls_config, config.embed_dim, rngs=rngs)
-    model = cls_lib.Gemma4ForClassification(config=config, head=head, rngs=rngs)
+    model = cls_lib.Gemma4ForClassification(config=config, rngs=rngs)
 
     tokens = jnp.array([[10, 20, 30, 40], [50, 60, 70, 80]])
     out = model(tokens)
@@ -165,19 +176,15 @@ class Gemma4ForClassificationTest(absltest.TestCase):
 
   def test_packed_mode_success(self):
     """Test packed sequence classification."""
-    config = _create_small_model_config()
-    cls_config = cls_lib.ClassificationConfig(
+    config = _create_small_classification_config(
         head_type=cls_lib.HeadType.MULTILABEL,
         num_classes=3,
+        max_examples_per_packed_sequence=2,
     )
-    max_packed = 2
     rngs = nnx.Rngs(0)
-    head = cls_lib.build_head(cls_config, config.embed_dim, rngs=rngs)
     model = cls_lib.Gemma4ForClassification(
         config=config,
-        head=head,
         rngs=rngs,
-        max_examples_per_packed_sequence=max_packed,
     )
 
     batch_size, seq_len = 2, 10
@@ -194,25 +201,29 @@ class Gemma4ForClassificationTest(absltest.TestCase):
     out = model(tokens, positions=positions, segment_ids=segment_ids)
 
     # Output shape should be [B * N, C] = [2 * 2, 3] = [4, 3]
-    self.assertEqual(out.logits.shape, (batch_size * max_packed, 3))
     self.assertEqual(
-        out.hidden_states.shape, (batch_size * max_packed, config.embed_dim)
+        out.logits.shape,
+        (batch_size * config.max_examples_per_packed_sequence, 3),
+    )
+    self.assertEqual(
+        out.hidden_states.shape,
+        (
+            batch_size * config.max_examples_per_packed_sequence,
+            config.embed_dim,
+        ),
     )
 
   def test_packed_mode_missing_positions_error(self):
     """Test that packed mode raises ValueError if positions is omitted."""
-    config = _create_small_model_config()
-    cls_config = cls_lib.ClassificationConfig(
+    config = _create_small_classification_config(
         head_type=cls_lib.HeadType.MULTILABEL,
         num_classes=2,
+        max_examples_per_packed_sequence=2,
     )
     rngs = nnx.Rngs(0)
-    head = cls_lib.build_head(cls_config, config.embed_dim, rngs=rngs)
     model = cls_lib.Gemma4ForClassification(
         config=config,
-        head=head,
         rngs=rngs,
-        max_examples_per_packed_sequence=2,
     )
 
     tokens = jnp.ones((1, 8), dtype=jnp.int32)
@@ -223,14 +234,12 @@ class Gemma4ForClassificationTest(absltest.TestCase):
 
   def test_packed_mode_missing_max_examples_error(self):
     """Test that packed mode raises ValueError if max_examples_per_packed_sequence is None."""
-    config = _create_small_model_config()
-    cls_config = cls_lib.ClassificationConfig(
+    config = _create_small_classification_config(
         head_type=cls_lib.HeadType.MULTILABEL,
         num_classes=2,
     )
     rngs = nnx.Rngs(0)
-    head = cls_lib.build_head(cls_config, config.embed_dim, rngs=rngs)
-    model = cls_lib.Gemma4ForClassification(config=config, head=head, rngs=rngs)
+    model = cls_lib.Gemma4ForClassification(config=config, rngs=rngs)
 
     tokens = jnp.ones((1, 8), dtype=jnp.int32)
     positions = jnp.arange(8)[None, :]
@@ -242,16 +251,16 @@ class Gemma4ForClassificationTest(absltest.TestCase):
       model(tokens, positions=positions, segment_ids=segment_ids)
 
   def test_classification_config_validation(self):
-    """Test ClassificationConfig error conditions."""
+    """Test ClassificationModelConfig error conditions."""
     with self.assertRaisesRegex(
         ValueError, "BINARY head requires num_classes=1"
     ):
-      cls_lib.ClassificationConfig(
+      _create_small_classification_config(
           head_type=cls_lib.HeadType.BINARY, num_classes=2
       )
 
     with self.assertRaisesRegex(ValueError, "class_names length"):
-      cls_lib.ClassificationConfig(
+      _create_small_classification_config(
           head_type=cls_lib.HeadType.MULTILABEL,
           num_classes=2,
           class_names=("only_one",),

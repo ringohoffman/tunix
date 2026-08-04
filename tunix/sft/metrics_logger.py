@@ -19,7 +19,7 @@ from __future__ import annotations
 import collections
 import dataclasses
 import enum
-from typing import Any, Callable, Protocol, TypeAlias, TypedDict, overload, TYPE_CHECKING
+from typing import Any, Callable, Protocol, TYPE_CHECKING, TypeAlias, TypedDict, overload
 
 from absl import logging
 import jax
@@ -240,10 +240,10 @@ class MetricsLogger:
       step: The training step number.
       formatted_name: Optional pre-formatted metric name for
         ``jax.monitoring.record_scalar``. If ``None``, defaults to
-        ``"{metrics_prefix}/{mode}/{metric_name}"``. This allows callers
-        to override the name format (e.g., ``"loss/train/batch"``) while
-        keeping internal storage keyed by ``(prefix, mode, metric_name)``
-        for progress bar compatibility.
+        ``"{metrics_prefix}/{mode}/{metric_name}"``. This allows callers to
+        override the name format (e.g., ``"loss/train/batch"``) while keeping
+        internal storage keyed by ``(prefix, mode, metric_name)`` for progress
+        bar compatibility.
     """
     self._metrics[metrics_prefix][mode][metric_name].append(scalar_value)
 
@@ -288,6 +288,10 @@ class MetricsLogger:
   def close(self):
     """Closes all registered logging backends."""
     for backend in self._backends:
+      try:
+        jax.monitoring.unregister_scalar_listener(backend.log_scalar)
+      except Exception:  # pylint: disable=broad-exception-caught
+        pass
       backend.close()
     try:
       jax.monitoring.clear_event_listeners()
@@ -302,8 +306,8 @@ class MetricsBuffer:
 
   Attributes:
     step: The training step number.
-    metrics: Dictionary for storing all metrics. The key is
-      the metric name, and the value is a list of metric values.
+    metrics: Dictionary for storing all metrics. The key is the metric name, and
+      the value is a list of metric values.
   """
 
   step: int
@@ -397,10 +401,10 @@ class MetricLoggingHook(hooks.TrainingHooks):
 
   Args:
     formatter: Controls metric name formatting.  Defaults to
-      ``"{metric}/{mode}/{level}"`` which produces TensorBoard-friendly
-      names like ``"loss/train/step"``.
-    show_progress_bar: If ``True``, show a tqdm progress bar during
-      training.  Defaults to ``True``.
+      ``"{metric}/{mode}/{level}"`` which produces TensorBoard-friendly names
+      like ``"loss/train/step"``.
+    show_progress_bar: If ``True``, show a tqdm progress bar during training.
+      Defaults to ``True``.
     tqdm_train_metrics: Metric names to display in the progress bar.
   """
 

@@ -21,17 +21,17 @@ import contextlib
 import dataclasses
 import functools
 import time
-from typing import Any, Callable, Concatenate, ParamSpec, Self, TypeAlias, TYPE_CHECKING
+from typing import Any, Callable, Concatenate, Generic, ParamSpec, Self, TYPE_CHECKING, TypeAlias
 
 from absl import logging
 import flax
 from flax import nnx
+import flax.struct
 import jax
-import jax.stages
 from jax.interpreters import pxla
 import jax.numpy as jnp
 import jax.sharding as shd
-from jax.typing import ArrayLike  # pylint: disable=g-importing-member
+import jax.stages
 import numpy as np
 import optax
 import orbax.checkpoint as ocp
@@ -46,11 +46,18 @@ from tunix.sft import metrics_logger as sft_metrics_logger
 from tunix.sft import profiler
 from tunix.sft import sharding_utils
 from tunix.sft import utils
+from typing_extensions import TypeVar
 
 if TYPE_CHECKING:
   from numpy._typing import _FloatLike_co
 
-_ModelInput: TypeAlias = dict[str, ArrayLike]
+ModuleT = TypeVar("ModuleT", bound=nnx.Module, default=nnx.Module)
+LossReturnT = TypeVar(
+    "LossReturnT",
+    jax.Array,
+    tuple[jax.Array, dict[str, jax.Array]],
+    covariant=True,
+)
 P = ParamSpec("P")
 MetricsLogger = sft_metrics_logger.MetricsLogger
 MetricsLoggerOptions = sft_metrics_logger.MetricsLoggerOptions
@@ -139,7 +146,7 @@ def _sft_step_metrics_fn(
     metrics["learning_rate"] = learning_rate
 
 
-class PeftTrainer:
+class PeftTrainer(Generic[ModuleT]):
   """PEFT trainer for LoRA. Only LoRA parameters are updated.
 
   Attributes:
@@ -163,7 +170,7 @@ class PeftTrainer:
 
   def __init__(
       self,
-      model: nnx.Module,
+      model: ModuleT,
       optimizer: optax.GradientTransformation,
       training_config: TrainingConfig,
       metrics_logger: MetricsLogger | None = None,
@@ -288,11 +295,9 @@ class PeftTrainer:
 
   def with_loss_fn(
       self,
-      loss_fn: Callable[
-          Concatenate[nnx.Module, P], ArrayLike | tuple[ArrayLike, Any]
-      ],
+      loss_fn: Callable[Concatenate[ModuleT, P], LossReturnT],
       has_aux: bool = False,
-  ):
+  ) -> PeftTrainer[ModuleT]:
     self.clear_jit_cache()
     self.loss_fn = loss_fn
     self.eval_loss_fn = loss_fn
@@ -300,8 +305,8 @@ class PeftTrainer:
     return self
 
   def _train_step(
-      self, model: nnx.Module, optimizer: nnx.Optimizer, inputs: Any
-  ) -> tuple[ArrayLike, Any | None, ArrayLike]:
+      self, model: ModuleT, optimizer: nnx.Optimizer, inputs: Any
+  ) -> tuple[jax.Array, Any | None, jax.Array]:
     """Main body for one train step.
 
     Args:
@@ -328,8 +333,8 @@ class PeftTrainer:
       return out, None, grad_norm
 
   def _eval_step(
-      self, model: nnx.Module, inputs: Any
-  ) -> ArrayLike | tuple[ArrayLike, Any]:
+      self, model: ModuleT, inputs: Any
+  ) -> jax.Array | tuple[jax.Array, dict[str, jax.Array] | None]:
     out = self.eval_loss_fn(model, inputs)
     if self._has_aux:
       loss, aux = out
@@ -339,11 +344,14 @@ class PeftTrainer:
 
   def create_train_step_fn(
       self,
-  ) -> Callable[..., tuple[ArrayLike, Any | None, ArrayLike]]:
+  ) -> (
+      Callable[..., jax.Array]
+      | Callable[..., tuple[jax.Array, dict[str, jax.Array] | None]]
+  ):
     """Creates the train step function."""
     return self._train_step
 
-  def create_eval_step_fn(self) -> Callable[..., ArrayLike]:
+  def create_eval_step_fn(self) -> Callable[..., jax.Array]:
     """Creates the eval step function."""
     return self._eval_step
 
@@ -362,13 +370,13 @@ class PeftTrainer:
     total_bytes = sum(
         leaf.nbytes
         for leaf in jax.tree.leaves(optimizer_state)
-        if hasattr(leaf, 'nbytes')
+        if hasattr(leaf, "nbytes")
     )
     global_total_gb = total_bytes / (1024**3)
-    fsdp_size = mesh.shape.get('fsdp', 1)
+    fsdp_size = mesh.shape.get("fsdp", 1)
     logging.info(
-        '_shard_optimizer: global optimizer state = %.2f GB across mesh=%s '
-        'using jax.device_put',
+        "_shard_optimizer: global optimizer state = %.2f GB across mesh=%s "
+        "using jax.device_put",
         global_total_gb,
         dict(mesh.shape),
     )
@@ -390,10 +398,12 @@ class PeftTrainer:
     )
     nnx.update(self.optimizer, optimizer_sharded_state)
 
-    per_chip_gb = global_total_gb / fsdp_size if fsdp_size > 0 else global_total_gb
+    per_chip_gb = (
+        global_total_gb / fsdp_size if fsdp_size > 0 else global_total_gb
+    )
     logging.info(
-        '_shard_optimizer: SHARDED successfully -> %.2f GB per device '
-        '(%.2f GB global total divided across FSDP=%d chips)',
+        "_shard_optimizer: SHARDED successfully -> %.2f GB per device "
+        "(%.2f GB global total divided across FSDP=%d chips)",
         per_chip_gb,
         global_total_gb,
         fsdp_size,
@@ -739,13 +749,13 @@ class PeftTrainer:
 
 
 def _default_loss_fn(
-    model: nnx.Module,
+    model: ModuleT,
     input_tokens: jax.Array,
     input_mask: jax.Array,
     positions: jax.Array,
     attention_mask: jax.Array,
     images: jax.Array | None = None,
-) -> ArrayLike:
+) -> jax.Array:
   """Default loss function for PEFT training."""
   # Weird kwargs workaround because not all models support `images` right now.
   kwargs = {} if images is None else {"images": images}

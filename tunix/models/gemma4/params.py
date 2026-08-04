@@ -41,6 +41,7 @@ from jax import numpy as jnp
 from jax._src.mesh import use_abstract_mesh
 from orbax import checkpoint as ocp
 import sentencepiece as spm
+from tunix.models.gemma4 import classification as gemma4_classification
 from tunix.models.gemma4 import model as gemma4_model
 from tunix.sft import checkpoint_manager
 
@@ -590,8 +591,15 @@ def create_model_from_checkpoint(
       nnx.use_eager_sharding(True),
       _mesh_context(mesh),
   ):
+    model_cls = (
+        gemma4_classification.Gemma4ForClassification
+        if isinstance(
+            model_config, gemma4_classification.ClassificationModelConfig
+        )
+        else gemma4_model.Gemma4
+    )
     abs_model = nnx.eval_shape(
-        lambda: gemma4_model.Gemma4(model_config, rngs=nnx.Rngs(0))
+        lambda: model_cls(model_config, rngs=nnx.Rngs(0))
     )
   model_state: nnx.State[
       flax.typing.PathParts, nnx.Variable[jax.ShapeDtypeStruct]

@@ -125,16 +125,19 @@ class HeadType(enum.Enum):
   MULTILABEL = "multilabel"
 
 
-@dataclasses.dataclass(frozen=True, slots=True)
-class ClassificationConfig:
-  """Single source of truth for head shape and semantics."""
+@dataclasses.dataclass(slots=True, kw_only=True)
+class ClassificationModelConfig(gemma4_model.ModelConfig):
+  """Configuration for Gemma4ForClassification model."""
 
-  head_type: HeadType
-  num_classes: int
+  head_type: HeadType = HeadType.MULTILABEL
+  num_classes: int = 1
   class_names: tuple[str, ...] = ()
   dropout_rate: float = 0.0
+  max_examples_per_packed_sequence: int | None = None
+  pool_strategy: PoolStrategy = PoolStrategy.LAST_TOKEN
 
   def __post_init__(self) -> None:
+    super().__post_init__()
     if self.head_type == HeadType.BINARY and self.num_classes != 1:
       raise ValueError(
           f"BINARY head requires num_classes=1, got {self.num_classes}"
@@ -174,7 +177,7 @@ class ClassificationHead(nnx.Module, abc.ABC):
 
   @property
   @abc.abstractmethod
-  def config(self) -> ClassificationConfig:
+  def config(self) -> ClassificationModelConfig:
     ...
 
 
@@ -183,16 +186,15 @@ class BinaryClassificationHead(ClassificationHead):
 
   def __init__(
       self,
-      embed_dim: int,
-      classification_config: ClassificationConfig,
+      config: ClassificationModelConfig,
       *,
       rngs: nnx.Rngs,
   ) -> None:
-    self._config = classification_config
-    self.linear = nnx.Linear(embed_dim, 1, use_bias=True, rngs=rngs)
+    self._config = config
+    self.linear = nnx.Linear(config.embed_dim, 1, use_bias=True, rngs=rngs)
     self.dropout = (
-        nnx.Dropout(rate=classification_config.dropout_rate, rngs=rngs)
-        if classification_config.dropout_rate > 0.0
+        nnx.Dropout(rate=config.dropout_rate, rngs=rngs)
+        if config.dropout_rate > 0.0
         else None
     )
 
@@ -210,21 +212,20 @@ class MultilabelClassificationHead(ClassificationHead):
 
   def __init__(
       self,
-      embed_dim: int,
-      classification_config: ClassificationConfig,
+      config: ClassificationModelConfig,
       *,
       rngs: nnx.Rngs,
   ) -> None:
-    self._config = classification_config
+    self._config = config
     self.linear = nnx.Linear(
-        embed_dim,
-        classification_config.num_classes,
+        config.embed_dim,
+        config.num_classes,
         use_bias=True,
         rngs=rngs,
     )
     self.dropout = (
-        nnx.Dropout(rate=classification_config.dropout_rate, rngs=rngs)
-        if classification_config.dropout_rate > 0.0
+        nnx.Dropout(rate=config.dropout_rate, rngs=rngs)
+        if config.dropout_rate > 0.0
         else None
     )
 
@@ -235,23 +236,6 @@ class MultilabelClassificationHead(ClassificationHead):
   @property
   def config(self):
     return self._config
-
-
-def build_head(
-    classification_config: ClassificationConfig,
-    embed_dim: int,
-    *,
-    rngs: nnx.Rngs,
-) -> ClassificationHead:
-  """Build the appropriate head from a ``ClassificationConfig``."""
-  head_type = classification_config.head_type
-  if head_type == HeadType.BINARY:
-    return BinaryClassificationHead(embed_dim, classification_config, rngs=rngs)
-  if head_type == HeadType.MULTILABEL:
-    return MultilabelClassificationHead(
-        embed_dim, classification_config, rngs=rngs
-    )
-  raise ValueError(f"Unknown head type: {head_type}")
 
 
 class Gemma4ForClassification(gemma4_model.Gemma4):
@@ -271,19 +255,20 @@ class Gemma4ForClassification(gemma4_model.Gemma4):
 
   def __init__(
       self,
-      config: gemma4_model.ModelConfig,
-      head: ClassificationHead,
+      config: ClassificationModelConfig,
       *,
       rngs: nnx.Rngs,
-      pool_strategy: PoolStrategy = PoolStrategy.LAST_TOKEN,
-      max_examples_per_packed_sequence: int | None = None,
   ) -> None:
+    self.config: ClassificationModelConfig
     super().__init__(config, rngs=rngs)
-    self.head = head
-    self.pool_strategy = pool_strategy
-    self.max_examples_per_packed_sequence = max_examples_per_packed_sequence
+    if config.head_type == HeadType.BINARY:
+      self.head = BinaryClassificationHead(config, rngs=rngs)
+    elif config.head_type == HeadType.MULTILABEL:
+      self.head = MultilabelClassificationHead(config, rngs=rngs)
+    else:
+      raise ValueError(f"Unknown head type: {config.head_type}")
 
-  def __call__(
+  def __call__(  # pyright: ignore[reportIncompatibleMethodOverride]
       self,
       tokens: jaxtyping.Array,
       positions: jaxtyping.Array | None = None,
@@ -292,6 +277,7 @@ class Gemma4ForClassification(gemma4_model.Gemma4):
       decode_only_last_token: bool = False,
       segment_ids: jaxtyping.Array | None = None,
   ) -> ClassificationOutput:
+    mask: jax.Array | None = None
     if segment_ids is not None:
       if positions is None:
         raise ValueError("positions must be provided for packed mode")
@@ -305,6 +291,7 @@ class Gemma4ForClassification(gemma4_model.Gemma4):
 
       # Derive valid token mask directly from attention_mask diagonal [B, T]
       mask = jnp.diagonal(attention_mask, axis1=-2, axis2=-1)
+      assert mask is not None
       if mask.ndim > 2:
         mask = jnp.squeeze(mask, axis=-2)
 
@@ -321,18 +308,19 @@ class Gemma4ForClassification(gemma4_model.Gemma4):
     )
 
     if segment_ids is not None:
-      if self.max_examples_per_packed_sequence is None:
+      if self.config.max_examples_per_packed_sequence is None:
         raise ValueError(
             "max_examples_per_packed_sequence must be specified when"
             " initializing Gemma4ForClassification for packed mode."
         )
       pooled = pool_packed_hidden_states(
-          hidden, segment_ids, self.max_examples_per_packed_sequence
+          hidden, segment_ids, self.config.max_examples_per_packed_sequence
       )
       B, N, D = pooled.shape
       pooled = pooled.reshape(B * N, D)
     else:
-      pooled = pool_hidden_states(hidden, mask, self.pool_strategy)
+      assert mask is not None
+      pooled = pool_hidden_states(hidden, mask, self.config.pool_strategy)
 
     logits = self.head(pooled)
 
