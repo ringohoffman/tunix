@@ -19,6 +19,7 @@ from absl.testing import absltest
 from absl.testing import parameterized
 from flax import nnx
 from flax.traverse_util import flatten_dict
+import flax.typing
 import jax
 import numpy as np
 from tunix.models.gemma4 import params
@@ -517,6 +518,31 @@ class CreateModelTest(absltest.TestCase):
     self.assertIs(result, mock_processor)
 
 
+def _make_array_metadata_tree(
+    tree: flax.typing.PyTree[params.LeafT],
+) -> flax.typing.PyTree[params.ocp.metadata.ArrayMetadata]:
+  """Converts a dict of numpy arrays to a dict of ocp.metadata.ArrayMetadata."""
+
+  def _to_meta(x: Any) -> Any:
+    if isinstance(x, (np.ndarray, jax.Array, jax.ShapeDtypeStruct)):
+      return params.ocp.metadata.ArrayMetadata(
+          name='',
+          directory=None,
+          shape=x.shape,
+          sharding=None,
+          dtype=np.dtype(x.dtype),
+      )
+    return x
+
+  return jax.tree.map(
+      _to_meta,
+      tree,
+      is_leaf=lambda x: isinstance(
+          x, (np.ndarray, jax.Array, jax.ShapeDtypeStruct)
+      ),
+  )
+
+
 class BuildShardedRestoreTargetTest(absltest.TestCase):
   """Tests for _build_sharded_restore_target."""
 
@@ -533,7 +559,7 @@ class BuildShardedRestoreTargetTest(absltest.TestCase):
         'embedder': {'input_embedding': np.zeros((16, 4))},
     }
     mock_meta = mock.MagicMock()
-    mock_meta.item_metadata.tree = self.fake_upstream
+    mock_meta.item_metadata.tree = _make_array_metadata_tree(self.fake_upstream)
     self.mock_ckptr.metadata.return_value = mock_meta
 
     devices = np.array(jax.devices()[:1]).reshape(1, 1)
@@ -541,36 +567,44 @@ class BuildShardedRestoreTargetTest(absltest.TestCase):
     self.enter_context(jax.set_mesh(self.mesh))
 
   def test_build_target_without_scan_layers(self):
-    config = mock.create_autospec(params.gemma4_model.ModelConfig, instance=True)
+    config = mock.create_autospec(
+        params.gemma4_model.ModelConfig, instance=True
+    )
     config.use_scan_layers = False
 
     # Downstream layout matches upstream map output exactly
-    model_state = nnx.Dict({
-        'layers': nnx.Dict({
-            '0': nnx.Dict({
-                'mlp': nnx.Dict({
-                    'gate_proj': nnx.Dict({
-                        'kernel': nnx.Param(
-                            np.zeros((4, 8)),
-                            sharding=jax.sharding.PartitionSpec('fsdp', 'tp'),
-                        )
-                    }),
-                    'up_proj': nnx.Dict({
-                        'kernel': nnx.Param(
-                            np.zeros((4, 8)),
-                            sharding=jax.sharding.PartitionSpec('fsdp', 'tp'),
-                        )
-                    }),
+    model_state = nnx.state(
+        nnx.Dict({
+            'layers': nnx.List([
+                nnx.Dict({
+                    'mlp': nnx.Dict({
+                        'gate_proj': nnx.Dict({
+                            'kernel': nnx.Param(
+                                np.zeros((4, 8)),
+                                sharding=jax.sharding.PartitionSpec(
+                                    'fsdp', 'tp'
+                                ),
+                            )
+                        }),
+                        'up_proj': nnx.Dict({
+                            'kernel': nnx.Param(
+                                np.zeros((4, 8)),
+                                sharding=jax.sharding.PartitionSpec(
+                                    'fsdp', 'tp'
+                                ),
+                            )
+                        }),
+                    })
                 })
-            })
-        }),
-        'embedder': nnx.Dict({
-            'input_embedding': nnx.Param(
-                np.zeros((16, 4)),
-                sharding=jax.sharding.PartitionSpec('fsdp', None),
-            )
-        }),
-    })
+            ]),
+            'embedder': nnx.Dict({
+                'input_embedding': nnx.Param(
+                    np.zeros((16, 4)),
+                    sharding=jax.sharding.PartitionSpec('fsdp', None),
+                )
+            }),
+        })
+    )
 
     target, _ = params._build_sharded_restore_target(
         '/fake/checkpoint', model_state, self.mesh, config
@@ -590,44 +624,49 @@ class BuildShardedRestoreTargetTest(absltest.TestCase):
     )
 
   def test_build_target_with_scan_layers(self):
-    config = mock.create_autospec(params.gemma4_model.ModelConfig, instance=True)
+    config = mock.create_autospec(
+        params.gemma4_model.ModelConfig, instance=True
+    )
     config.use_scan_layers = True
     config.attention_pattern = (params.gemma4_model.AttentionType.GLOBAL,)
     config.num_layers = 1
+    config.frac_shared_layers = 0.0
 
     # Downstream scan layout: scan_groups/sub_layers/0/...
-    model_state = nnx.Dict({
-        'scan_groups': nnx.Dict({
-            'sub_layers': nnx.Dict({
-                '0': nnx.Dict({
-                    'mlp': nnx.Dict({
-                        'gate_proj': nnx.Dict({
-                            'kernel': nnx.Param(
-                                np.zeros((1, 4, 8)),
-                                sharding=jax.sharding.PartitionSpec(
-                                    'fsdp', 'tp'
-                                ),
-                            )
-                        }),
-                        'up_proj': nnx.Dict({
-                            'kernel': nnx.Param(
-                                np.zeros((1, 4, 8)),
-                                sharding=jax.sharding.PartitionSpec(
-                                    'fsdp', 'tp'
-                                ),
-                            )
-                        }),
+    model_state = nnx.state(
+        nnx.Dict({
+            'scan_groups': nnx.Dict({
+                'sub_layers': nnx.List([
+                    nnx.Dict({
+                        'mlp': nnx.Dict({
+                            'gate_proj': nnx.Dict({
+                                'kernel': nnx.Param(
+                                    np.zeros((1, 4, 8)),
+                                    sharding=jax.sharding.PartitionSpec(
+                                        'fsdp', 'tp'
+                                    ),
+                                )
+                            }),
+                            'up_proj': nnx.Dict({
+                                'kernel': nnx.Param(
+                                    np.zeros((1, 4, 8)),
+                                    sharding=jax.sharding.PartitionSpec(
+                                        'fsdp', 'tp'
+                                    ),
+                                )
+                            }),
+                        })
                     })
-                })
-            })
-        }),
-        'embedder': nnx.Dict({
-            'input_embedding': nnx.Param(
-                np.zeros((16, 4)),
-                sharding=jax.sharding.PartitionSpec('fsdp', None),
-            )
-        }),
-    })
+                ])
+            }),
+            'embedder': nnx.Dict({
+                'input_embedding': nnx.Param(
+                    np.zeros((16, 4)),
+                    sharding=jax.sharding.PartitionSpec('fsdp', None),
+                )
+            }),
+        })
+    )
 
     target, _ = params._build_sharded_restore_target(
         '/fake/checkpoint', model_state, self.mesh, config
@@ -682,7 +721,7 @@ class BuildShardedRestoreTargetTest(absltest.TestCase):
         'layer_0': {'attn': {'kv_einsum': {'w': np.zeros((2, 16, 5376, 256))}}}
     }
     mock_meta = mock.MagicMock()
-    mock_meta.item_metadata.tree = fake_upstream
+    mock_meta.item_metadata.tree = _make_array_metadata_tree(fake_upstream)
     self.mock_ckptr.metadata.return_value = mock_meta
 
     target, _ = params._build_sharded_restore_target(
@@ -745,7 +784,7 @@ class BuildShardedRestoreTargetTest(absltest.TestCase):
     fake_upstream['final_norm'] = {'scale': np.zeros((5376,))}
 
     mock_meta = mock.MagicMock()
-    mock_meta.item_metadata.tree = fake_upstream
+    mock_meta.item_metadata.tree = _make_array_metadata_tree(fake_upstream)
     self.mock_ckptr.metadata.return_value = mock_meta
     self.mock_ckptr.restore.return_value = fake_upstream
 
@@ -850,46 +889,46 @@ class BuildShardedRestoreTargetTest(absltest.TestCase):
         },
     }
     for i in range(12):
-        is_global = (i % 6 == 5)
-        if is_global:
-            kv_heads = _GKV
-            head_dim = _GHD
-            # k_eq_v_global: only 'key', no 'value'
-            attn_dict = {
-                'query': {'kernel': {'value': np.ones((_E, _H, head_dim))}},
-                'key': {'kernel': {'value': np.ones((_E, kv_heads, head_dim))}},
-                'out': {'kernel': {'value': np.ones((_H, head_dim, _E))}},
-                'query_norm': {'scale': {'value': np.ones((head_dim,))}},
-                'key_norm': {'scale': {'value': np.ones((head_dim,))}},
-            }
-        else:
-            kv_heads = _KV
-            head_dim = _HD
-            # LOCAL_SLIDING: separate 'key' and 'value'
-            attn_dict = {
-                'query': {'kernel': {'value': np.ones((_E, _H, head_dim))}},
-                'key': {'kernel': {'value': np.ones((_E, kv_heads, head_dim))}},
-                'value': {'kernel': {'value': np.ones((_E, kv_heads, head_dim))}},
-                'out': {'kernel': {'value': np.ones((_H, head_dim, _E))}},
-                'query_norm': {'scale': {'value': np.ones((head_dim,))}},
-                'key_norm': {'scale': {'value': np.ones((head_dim,))}},
-            }
-        fine_tuned_raw['decoder'][f'layers_{i}'] = {
-            'self_attention': attn_dict,
-            'mlp': {
-                'wi_0': {'kernel': {'value': np.ones((_E, _F))}},
-                'wi_1': {'kernel': {'value': np.ones((_E, _F))}},
-                'wo': {'kernel': {'value': np.ones((_F, _E))}},
-            },
-            'pre_self_attention_norm': {'scale': {'value': np.ones((_E,))}},
-            'post_self_attention_norm': {'scale': {'value': np.ones((_E,))}},
-            'pre_ffw_norm': {'scale': {'value': np.ones((_E,))}},
-            'post_ffw_norm': {'scale': {'value': np.ones((_E,))}},
-            'layer_scalar': {'value': np.ones((1,))},
+      is_global = i % 6 == 5
+      if is_global:
+        kv_heads = _GKV
+        head_dim = _GHD
+        # k_eq_v_global: only 'key', no 'value'
+        attn_dict = {
+            'query': {'kernel': {'value': np.ones((_E, _H, head_dim))}},
+            'key': {'kernel': {'value': np.ones((_E, kv_heads, head_dim))}},
+            'out': {'kernel': {'value': np.ones((_H, head_dim, _E))}},
+            'query_norm': {'scale': {'value': np.ones((head_dim,))}},
+            'key_norm': {'scale': {'value': np.ones((head_dim,))}},
         }
+      else:
+        kv_heads = _KV
+        head_dim = _HD
+        # LOCAL_SLIDING: separate 'key' and 'value'
+        attn_dict = {
+            'query': {'kernel': {'value': np.ones((_E, _H, head_dim))}},
+            'key': {'kernel': {'value': np.ones((_E, kv_heads, head_dim))}},
+            'value': {'kernel': {'value': np.ones((_E, kv_heads, head_dim))}},
+            'out': {'kernel': {'value': np.ones((_H, head_dim, _E))}},
+            'query_norm': {'scale': {'value': np.ones((head_dim,))}},
+            'key_norm': {'scale': {'value': np.ones((head_dim,))}},
+        }
+      fine_tuned_raw['decoder'][f'layers_{i}'] = {
+          'self_attention': attn_dict,
+          'mlp': {
+              'wi_0': {'kernel': {'value': np.ones((_E, _F))}},
+              'wi_1': {'kernel': {'value': np.ones((_E, _F))}},
+              'wo': {'kernel': {'value': np.ones((_F, _E))}},
+          },
+          'pre_self_attention_norm': {'scale': {'value': np.ones((_E,))}},
+          'post_self_attention_norm': {'scale': {'value': np.ones((_E,))}},
+          'pre_ffw_norm': {'scale': {'value': np.ones((_E,))}},
+          'post_ffw_norm': {'scale': {'value': np.ones((_E,))}},
+          'layer_scalar': {'value': np.ones((1,))},
+      }
 
     mock_meta = mock.MagicMock()
-    mock_meta.item_metadata.tree = fine_tuned_raw
+    mock_meta.item_metadata.tree = _make_array_metadata_tree(fine_tuned_raw)
     self.mock_ckptr.metadata.return_value = mock_meta
     self.mock_ckptr.restore.return_value = fine_tuned_raw
 

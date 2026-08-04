@@ -714,6 +714,13 @@ def _validate_param_shapes(
         f'{sorted(str(k) for k in missing_keys)}'
     )
 
+  extra_keys = mapped_keys - model_keys
+  if extra_keys:
+    logging.warning(
+        'Checkpoint contains extra keys not expected by the model: %s',
+        sorted(str(k) for k in extra_keys),
+    )
+
   mismatched: list[
       tuple[flax.typing.PathParts, tuple[int, ...], tuple[int, ...]]
   ] = []
@@ -983,10 +990,15 @@ def map_from_upstream_checkpoint(
 
     # gating_einsum[0] → gate_proj, gating_einsum[1] → up_proj (transposed)
     if module_path[1:] in (['mlp', 'gating_einsum'], ['mlp2', 'gating_einsum']):
-      if len(value.shape) == 4 or value.shape[0] != 2:
-        # 4D or shape[0]!=2 → MoE expert-level tensor, not gate/up split
+      if len(value.shape) == 4:
+        # 4D → MoE expert-level tensor, not gate/up split
         new_params[(*layer_key, 'moe', 'gating_einsum')] = value
         continue
+      if value.shape[0] != 2:
+        raise ValueError(
+            'Expected gating_einsum shape[0]=2 for gate/up split, got shape'
+            f' {value.shape} for key {key_path}'
+        )
       new_params[(*layer_key, 'mlp', 'gate_proj', 'kernel')] = value[0].T
       new_params[(*layer_key, 'mlp', 'up_proj', 'kernel')] = value[1].T
       continue
