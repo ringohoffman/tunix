@@ -2017,6 +2017,68 @@ class Gemma4(BackendMappingMixin, nnx.Module):
         if isinstance(spec, tuple):
           var.set_metadata("out_sharding", (None,) + spec)
 
+  def forward_backbone(
+      self,
+      tokens: jaxtyping.Array,
+      positions: jaxtyping.Array | None = None,
+      cache: Cache | StackedCache | None = None,
+      attention_mask: jaxtyping.Array | None = None,
+      segment_ids: jaxtyping.Array | None = None,
+  ) -> tuple[jaxtyping.Array, Cache | None]:
+    """Forward pass through the backbone only (embed → layers → final norm).
+
+    Returns the post-norm hidden states ``[B, L, D]`` without projecting
+    through the vocabulary embedding.  Subclasses can call this to attach
+    their own task-specific heads without paying for the LM decode.
+
+    Args:
+      tokens: Input token IDs, shape ``[B, L]``.
+      positions: RoPE position indices, shape ``[B, L]``. Computed from
+        ``tokens`` if not provided.
+      cache: KV cache dict, or ``None`` for training / prefill without cache.
+      attention_mask: Causal attention mask.
+      segment_ids: Accepted for RL pipeline compatibility; currently unused.
+
+    Returns:
+      A tuple of ``(hidden_states, cache)`` where ``hidden_states`` has
+      shape ``[B, L, D]`` and ``cache`` is the updated KV cache (or
+      ``None`` if no cache was provided).
+    """
+    if positions is None:
+      B, T = tokens.shape  # pylint: disable=invalid-name
+      positions = jnp.tile(jnp.arange(T)[None, :], (B, 1))
+
+    return_cache = cache is not None
+    new_cache: Cache = {}
+    x = self.embedder.encode(tokens)
+
+    per_layer_inputs = None
+    if self.config.per_layer_input_dim > 0:
+      per_layer_inputs = self.embedder.encode_per_layer_input(x, tokens)
+
+    transient_kvs: TransientKVs = {}
+    is_prefill = tokens.shape[1] > 1
+
+    forward_fn = (
+        self._forward_scan
+        if self.config.use_scan_layers
+        else self._forward_loop
+    )
+    x, out_cache = forward_fn(
+        x,
+        positions,
+        cache=cache,
+        attention_mask=attention_mask,
+        per_layer_inputs=per_layer_inputs,
+        new_cache=new_cache,
+        transient_kvs=transient_kvs,
+        is_prefill=is_prefill,
+        segment_ids=segment_ids,
+    )
+    x = self.final_norm(x)
+
+    return x, out_cache if return_cache else None
+
   def __call__(
       self,
       tokens: jaxtyping.Array,
@@ -2051,49 +2113,19 @@ class Gemma4(BackendMappingMixin, nnx.Module):
       A ``GemmaOutput`` with ``logits``, ``cache``, and optionally
       ``hidden_states``.
     """
-    if positions is None:
-      B, T = tokens.shape  # pylint: disable=invalid-name
-      positions = jnp.tile(jnp.arange(T)[None, :], (B, 1))
-
-    return_cache = cache is not None
-    new_cache: Cache = {}
-    x = self.embedder.encode(tokens)
-
-    per_layer_inputs = None
-    if self.config.per_layer_input_dim > 0:
-      per_layer_inputs = self.embedder.encode_per_layer_input(x, tokens)
-
-    # Stores the raw KV projections for the current forward pass. Used for
-    # KV cache sharing during prefill.
-    transient_kvs: TransientKVs = {}
-    is_prefill = tokens.shape[1] > 1
-
-    forward_fn = (
-        self._forward_scan
-        if self.config.use_scan_layers
-        else self._forward_loop
-    )
-    x, out_cache = forward_fn(
-        x,
-        positions,
+    x, out_cache = self.forward_backbone(
+        tokens,
+        positions=positions,
         cache=cache,
         attention_mask=attention_mask,
-        per_layer_inputs=per_layer_inputs,
-        new_cache=new_cache,
-        transient_kvs=transient_kvs,
-        is_prefill=is_prefill,
         segment_ids=segment_ids,
     )
-    x = self.final_norm(x)
 
     # Sparse gather: select specific hidden states before the expensive decode.
     if target_indices is not None:
       # target_indices shape: [B, K] — gather K positions per batch element.
       x = jnp.take_along_axis(x, target_indices[..., None], axis=1)
     elif decode_only_last_token:
-      # Only compute logits for the last token. This can significantly reduce
-      # memory requirements during prefill (when sampling), since we only need
-      # the logits for the last token to sample from.
       x = x[:, -1:, :]
 
     hidden_states_out = x if return_hidden_states else None
@@ -2105,7 +2137,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
 
     return GemmaOutput(
         logits=logits,
-        cache=out_cache if return_cache else None,
+        cache=out_cache,
         hidden_states=hidden_states_out,
     )
 
