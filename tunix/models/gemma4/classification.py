@@ -28,11 +28,10 @@ import dataclasses
 import enum
 from typing import Self
 
+from flax import nnx
 import jax
 import jax.numpy as jnp
 import jaxtyping
-from flax import nnx
-
 from tunix.models.gemma4 import model as gemma4_model
 
 
@@ -76,20 +75,33 @@ def pool_packed_hidden_states(
   """
   B, L, D = hidden.shape
 
-  def _last_token_for_segment(b: int, seg: int) -> jaxtyping.Array:
-    seg_mask = segment_ids[b] == (seg + 1)
-    positions = jnp.arange(L) * seg_mask.astype(jnp.int32)
-    last_pos = jnp.max(positions)
-    has_segment = jnp.any(seg_mask)
-    h = hidden[b, last_pos]
-    return jnp.where(has_segment, h, jnp.zeros(D, dtype=hidden.dtype))
+  def _get_row_segment_positions(
+      seg_row: jaxtyping.Array,
+  ) -> tuple[jaxtyping.Array, jaxtyping.Array]:
+    def _get_seg_pos(
+        k: jaxtyping.Array,
+    ) -> tuple[jaxtyping.Array, jaxtyping.Array]:
+      mask = seg_row == (k + 1)
+      pos = jnp.max(jnp.where(mask, jnp.arange(L), 0))
+      has_seg = jnp.any(mask)
+      return pos, has_seg
 
-  pooled = jax.vmap(
-      jax.vmap(_last_token_for_segment, in_axes=(None, 0)),
-      in_axes=(0, None),
-  )(jnp.arange(B), jnp.arange(num_segments))
+    pos, has_seg = jax.vmap(_get_seg_pos)(jnp.arange(num_segments))
+    return pos, has_seg
 
-  return pooled
+  last_pos, has_segment = jax.vmap(_get_row_segment_positions)(segment_ids)
+  last_pos = jax.lax.stop_gradient(last_pos)
+  has_segment = jax.lax.stop_gradient(has_segment)
+
+  def _gather_row(
+      h_row: jaxtyping.Array,
+      pos_row: jaxtyping.Array,
+      mask_row: jaxtyping.Array,
+  ) -> jaxtyping.Array:
+    gathered = h_row[pos_row]
+    return jnp.where(mask_row[:, None], gathered, jnp.zeros_like(gathered))
+
+  return jax.vmap(_gather_row)(hidden, last_pos, has_segment)
 
 
 def make_shared_prefix_attn_mask(
@@ -157,11 +169,13 @@ class ClassificationOutput:
 class ClassificationHead(nnx.Module, abc.ABC):
 
   @abc.abstractmethod
-  def __call__(self, pooled: jaxtyping.Array) -> jaxtyping.Array: ...
+  def __call__(self, pooled: jaxtyping.Array) -> jaxtyping.Array:
+    ...
 
   @property
   @abc.abstractmethod
-  def config(self) -> ClassificationConfig: ...
+  def config(self) -> ClassificationConfig:
+    ...
 
 
 class BinaryClassificationHead(ClassificationHead):
