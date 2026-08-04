@@ -263,11 +263,13 @@ class Gemma4ForClassification(gemma4_model.Gemma4):
       rngs: nnx.Rngs,
       pool_strategy: PoolStrategy = PoolStrategy.LAST_TOKEN,
       pad_id: int = 0,
+      max_examples_per_packed_sequence: int | None = None,
   ) -> None:
     super().__init__(config, rngs=rngs)
     self.head = head
     self.pool_strategy = pool_strategy
     self.pad_id = pad_id
+    self.max_examples_per_packed_sequence = max_examples_per_packed_sequence
 
   def __call__(  # type: ignore[override]
       self,
@@ -277,12 +279,11 @@ class Gemma4ForClassification(gemma4_model.Gemma4):
       *,
       pool_mask: jaxtyping.Array | None = None,
       segment_ids: jaxtyping.Array | None = None,
-      num_packed_segments: int | None = None,
   ) -> ClassificationOutput:
     packed = segment_ids is not None
 
     if packed:
-      assert num_packed_segments is not None
+      pad_mask = None
       if positions is None:
         raise ValueError("positions must be provided for packed mode")
       if attention_mask is None:
@@ -307,13 +308,18 @@ class Gemma4ForClassification(gemma4_model.Gemma4):
     )
 
     if packed:
+      if self.max_examples_per_packed_sequence is None:
+        raise ValueError(
+            "max_examples_per_packed_sequence must be specified when"
+            " initializing Gemma4ForClassification for packed mode."
+        )
       pooled = pool_packed_hidden_states(
-          hidden, segment_ids, num_packed_segments
+          hidden, segment_ids, self.max_examples_per_packed_sequence
       )
       B, N, D = pooled.shape
       pooled = pooled.reshape(B * N, D)
     else:
-      if pool_mask is None:
+      if pool_mask is None and pad_mask is not None:
         pool_mask = pad_mask
       pooled = pool_hidden_states(hidden, pool_mask, self.pool_strategy)
 
