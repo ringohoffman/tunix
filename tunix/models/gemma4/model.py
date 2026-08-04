@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 import dataclasses
 import enum
 import functools
@@ -2024,7 +2024,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
       cache: Cache | StackedCache | None = None,
       attention_mask: jaxtyping.Array | None = None,
       segment_ids: jaxtyping.Array | None = None,
-  ) -> tuple[jaxtyping.Array, Cache | None]:
+  ) -> tuple[jaxtyping.Array, Cache | StackedCache | None]:
     """Forward pass through the backbone only (embed → layers → final norm).
 
     Returns the post-norm hidden states ``[B, L, D]`` without projecting
@@ -2155,7 +2155,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
   ) -> tuple[jaxtyping.Array, Cache]:
     """For-loop forward pass over layers with full feature parity and pre-merged scan layers."""
     num_layers = self.config.num_layers
-    unrolled_layers: list[DecoderLayer] = []
+    unrolled_layers: Sequence[DecoderLayer] = []
     if self.config.use_scan_layers:
       pattern_len = len(self.scan_pattern)
       num_unshared_layers = int(
