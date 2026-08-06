@@ -215,7 +215,7 @@ class FunctionalGenerateTest(parameterized.TestCase):
   def test_constrained_decoding(self):
     prompt = jnp.array([[3, 4, 5]], dtype=jnp.int32)
     ta = tok_adapter.TokenizerAdapter(self.vocab)
-    tables = constrained.cached_chain_constraints(
+    tables = constrained.chain_constraints(
         r"(hello|world)",
         token_id_to_str=ta.token_id_to_str,
         vocab_size=ta.vocab_size,

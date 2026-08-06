@@ -62,6 +62,7 @@ from tunix.sft.dpo.dpo_trainer import ORPOTrainingConfig
 from tunix.sft.dpo.dpo_trainer import OrpoTrainingConfig
 from tunix.sft.metrics_logger import MetricsLogger
 from tunix.sft.metrics_logger import MetricsLoggerOptions
+from tunix.sft.peft_trainer import Kernel
 from tunix.sft.peft_trainer import PeftTrainer
 from tunix.sft.peft_trainer import TrainingConfig
 

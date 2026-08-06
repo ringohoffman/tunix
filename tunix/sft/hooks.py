@@ -16,29 +16,36 @@
 
 from __future__ import annotations
 
-from typing import Any, Protocol, TYPE_CHECKING
+from typing import Any, Generic, Protocol, TypeVar, TYPE_CHECKING
 
 if TYPE_CHECKING:
   import jax
-  from jax.typing import ArrayLike
-  from tunix.sft.peft_trainer import PeftTrainer, ModuleT
+  from tunix.sft.peft_trainer import PeftTrainer
 
 
-class TrainingHooks(Protocol):
+PeftTrainerT_contra = TypeVar(
+  "PeftTrainerT_contra",
+  bound="PeftTrainer[Any]",
+  default="PeftTrainer[Any]",
+  contravariant=True,
+)
+
+
+class TrainingHooks(Protocol, Generic[PeftTrainerT_contra]):
   """Hooks to be used for training."""
 
-  def on_train_start(self, train_ctx: PeftTrainer[ModuleT]) -> None:
+  def on_train_start(self, train_ctx: PeftTrainerT_contra) -> None:
     """Called at the beginning of training."""
 
-  def on_train_end(self, train_ctx: PeftTrainer[ModuleT]) -> None:
+  def on_train_end(self, train_ctx: PeftTrainerT_contra) -> None:
     """Called at the end of training."""
 
-  def on_train_step_start(self, train_ctx: PeftTrainer[ModuleT]) -> None:
+  def on_train_step_start(self, train_ctx: PeftTrainerT_contra) -> None:
     """Called at the beginning of a training step."""
 
   def on_train_step_end(
       self,
-      train_ctx: PeftTrainer[ModuleT],
+      train_ctx: PeftTrainerT_contra,
       train_step: int,
       batch: Any,
       train_loss: jax.Array,
@@ -47,7 +54,7 @@ class TrainingHooks(Protocol):
 
   def on_train_micro_step_end(
       self,
-      train_ctx: PeftTrainer[ModuleT],
+      train_ctx: PeftTrainerT_contra,
       batch: Any,
       train_loss: jax.Array,
       grad_norm: jax.Array | None = None,
@@ -55,22 +62,22 @@ class TrainingHooks(Protocol):
   ) -> None:
     """Called at the end of a micro-step during gradient accumulation."""
 
-  def on_eval_start(self, train_ctx: PeftTrainer[ModuleT]) -> None:
+  def on_eval_start(self, train_ctx: PeftTrainerT_contra) -> None:
     """Called at the beginning of an evaluation phase."""
 
   def on_eval_end(
       self,
-      train_ctx: PeftTrainer[ModuleT],
+      train_ctx: PeftTrainerT_contra,
       eval_loss: jax.Array,
   ) -> None:
     """Called at the end of an evaluation phase."""
 
-  def on_eval_step_start(self, train_ctx: PeftTrainer[ModuleT]) -> None:
+  def on_eval_step_start(self, train_ctx: PeftTrainerT_contra) -> None:
     """Called at the beginning of an evaluation step (batch)."""
 
   def on_eval_step_end(
       self,
-      train_ctx: PeftTrainer[ModuleT],
+      train_ctx: PeftTrainerT_contra,
       batch: Any,
       eval_loss: jax.Array,
   ) -> None:
@@ -78,7 +85,7 @@ class TrainingHooks(Protocol):
 
   def on_eval_micro_step_end(
       self,
-      train_ctx: PeftTrainer[ModuleT],
+      train_ctx: PeftTrainerT_contra,
       batch: Any,
       eval_loss: jax.Array,
       aux: dict[str, jax.Array] | None = None,
@@ -86,11 +93,11 @@ class TrainingHooks(Protocol):
     """Called at the end of a micro-step during evaluation."""
 
 
-class DataHooks(Protocol):
+class DataHooks(Protocol, Generic[PeftTrainerT_contra]):
   """Hooks to wire in external data loader and processing logic."""
 
-  def load_next_train_batch(self, train_ctx: PeftTrainer[ModuleT]) -> Any:
+  def load_next_train_batch(self, train_ctx: PeftTrainerT_contra) -> Any:
     """Loads the next batch of data for training."""
 
-  def load_next_eval_batch(self, train_ctx: PeftTrainer[ModuleT]) -> Any:
+  def load_next_eval_batch(self, train_ctx: PeftTrainerT_contra) -> Any:
     """Loads the next batch of data for evaluation."""

@@ -194,10 +194,8 @@ def ppo_policy_loss_fn(
   completion_ids = train_example.completion_ids
   completion_mask = train_example.completion_mask
 
-  graphdef, state = nnx.split(model)
   per_token_logps, logits = common.compute_per_token_logps(
-      graphdef,
-      state,
+      model,
       prompt_tokens=train_example.prompt_ids,
       completion_tokens=completion_ids,
       pad_id=pad_id,
@@ -381,11 +379,8 @@ def grpo_loss_fn(
       train_example.completion_mask,
   )
 
-  # TODO(tsbao): split can be avoided with updated peft_trainer model handling.
-  graphdef, state = nnx.split(model)
   per_token_logps, logits = common.compute_per_token_logps(
-      graphdef,
-      state,
+      model,
       prompt_tokens=train_example.prompt_ids,
       completion_tokens=completion_ids,
       pad_id=pad_id,

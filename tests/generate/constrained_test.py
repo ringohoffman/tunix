@@ -281,8 +281,8 @@ class ConstrainedSamplerTest(parameterized.TestCase):
     )
     self.assertGreater(tables.num_states, 0)
 
-  def test_cached_chain_constraints(self):
-    """cached_chain_constraints caches results across identical calls."""
+  def test_chain_constraints(self):
+    """chain_constraints caches results across identical calls."""
     sampler, vocab, _ = self._make_sampler_and_constraint()
     schema = {"type": "integer"}
 

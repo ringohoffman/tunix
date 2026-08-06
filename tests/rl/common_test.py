@@ -258,12 +258,8 @@ class CommonTest(parameterized.TestCase):
       segment_positions,
       expected_logps,
   ):
-    model = tc.ToyTransformer(config=tc.ModelConfig(), rngs=nnx.Rngs(0))
-    graphdef, state = nnx.split(model)
-
     per_token_logps = common.compute_per_token_logps(
-        graphdef,
-        state,
+        model,
         prompt_tokens,
         completion_tokens,
         pad_id=0,
@@ -278,8 +274,7 @@ class CommonTest(parameterized.TestCase):
     )
 
     _, logits = common.compute_per_token_logps(
-        graphdef,
-        state,
+        model,
         prompt_tokens,
         completion_tokens,
         pad_id=0,

@@ -17,3 +17,4 @@
 from tunix.generate import functional
 from tunix.generate.functional import generate
 from tunix.generate.functional import GenerateOutput
+from tunix.generate.functional import KVCache

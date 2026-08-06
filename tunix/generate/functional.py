@@ -56,6 +56,15 @@ class GenerateOutput:
   logprobs: jax.Array | None = None
   """Per-step log-probabilities of sampled tokens, shape ``[B, max_new_tokens]``, or ``None``."""
 
+  cache: KVCache = None
+  """Final KV cache after generation.  Populated when ``return_cache=True``.
+
+  Callers can explicitly manage this cache's lifecycle:
+  - ``del output.cache``  — free HBM immediately
+  - ``jax.device_put(output.cache, cpu)``  — offload to host RAM
+  - Pass to downstream kernels that accept a warm cache
+  """
+
 
 @flax.struct.dataclass
 class _DecodeState:
@@ -237,6 +246,7 @@ def generate(
     beam_size: int | None = None,
     return_logits: bool = False,
     return_logprobs: bool = False,
+    return_cache: bool = False,
 ) -> GenerateOutput:
   """Autoregressive generation as a pure JAX function.
 
@@ -261,10 +271,13 @@ def generate(
     beam_size: Beam width for beam search.  ``None`` → sampling mode.
     return_logits: If ``True``, accumulate per-step logits.
     return_logprobs: If ``True``, accumulate per-step log-probabilities.
+    return_cache: If ``True``, include the final KV cache in the output.
+      Allows callers to explicitly manage cache lifecycle (keep, delete,
+      or offload to host) rather than having it implicitly freed.
 
   Returns:
     A ``GenerateOutput`` containing generated tokens and optional
-    logits / log-probabilities.
+    logits / log-probabilities / KV cache.
   """
   batch_size, prompt_len = input_ids.shape
   total_len = prompt_len + max_new_tokens
@@ -628,4 +641,5 @@ def generate(
       tokens=gen_tokens,
       logits=gen_logits,
       logprobs=gen_logprobs,
+      cache=final_state.cache if return_cache else None,
   )

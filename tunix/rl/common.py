@@ -277,8 +277,7 @@ def process_ids(
 
 @overload
 def compute_per_token_logps(
-    graphdef: Any,
-    state: Any,
+    model: nnx.Module,
     prompt_tokens: jax.Array,
     completion_tokens: jax.Array,
     pad_id: int,
@@ -294,8 +293,7 @@ def compute_per_token_logps(
 
 @overload
 def compute_per_token_logps(
-    graphdef: Any,
-    state: Any,
+    model: nnx.Module,
     prompt_tokens: jax.Array,
     completion_tokens: jax.Array,
     pad_id: int,
@@ -320,8 +318,7 @@ def compute_per_token_logps(
     ),
 )
 def compute_per_token_logps(
-    graphdef,
-    state,
+    model: nnx.Module,
     prompt_tokens: jax.Array,
     completion_tokens: jax.Array,
     pad_id: int,
@@ -336,8 +333,7 @@ def compute_per_token_logps(
   """Computes the per-token log probabilities.
 
   Args:
-    graphdef: Flax NNX GraphDef.
-    state: Flax NNX State.
+    model: Flax NNX Module.
     prompt_tokens: jax.Array token IDs for prompt. If sequence packing is
       enabled, prompt_tokens will be empty (shape [B, 0]), because prompts and
       completions are already concatenated into completion_tokens.
@@ -364,7 +360,6 @@ def compute_per_token_logps(
     logits: optional output tensor associated directly when tracking
     derivatives.
   """
-  model = nnx.merge(graphdef, state)
   input_tokens, calculated_positions, attn_mask, input_seg_ids = process_ids(
       prompt_tokens,
       completion_tokens,

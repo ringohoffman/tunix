@@ -361,7 +361,7 @@ class Sampler(base_sampler.BaseSampler):
         if hasattr(self.eos_tokens, 'tolist')
         else list(self.eos_tokens)
     )
-    return constrained.cached_chain_constraints(
+    return constrained.chain_constraints(
         constraint,
         token_id_to_str=self.tokenizer.token_id_to_str,
         vocab_size=self.tokenizer.vocab_size,

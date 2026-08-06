@@ -21,7 +21,7 @@ import contextlib
 import dataclasses
 import functools
 import time
-from typing import Any, Callable, Concatenate, Generic, ParamSpec, Self, TYPE_CHECKING, TypeAlias
+from typing import Any, Callable, Generic, ParamSpec, Self, TYPE_CHECKING, TypeAlias, overload
 
 from absl import logging
 import flax
@@ -46,21 +46,112 @@ from tunix.sft import metrics_logger as sft_metrics_logger
 from tunix.sft import profiler
 from tunix.sft import sharding_utils
 from tunix.sft import utils
-from typing_extensions import TypeVar
+from typing_extensions import Concatenate, TypeVar
 
 if TYPE_CHECKING:
   from numpy._typing import _FloatLike_co
 
 ModuleT = TypeVar("ModuleT", bound=nnx.Module, default=nnx.Module)
-LossReturnT = TypeVar(
-    "LossReturnT",
-    jax.Array,
-    tuple[jax.Array, dict[str, jax.Array]],
-    covariant=True,
-)
 P = ParamSpec("P")
+R = TypeVar("R")
+G1 = TypeVar("G1")
+G2 = TypeVar("G2")
 MetricsLogger = sft_metrics_logger.MetricsLogger
 MetricsLoggerOptions = sft_metrics_logger.MetricsLoggerOptions
+
+Loss: TypeAlias = jax.Array
+Aux: TypeAlias = dict[str, jax.Array] | None
+GradNorm: TypeAlias = jax.Array
+
+
+class Kernel(Generic[P, R]):
+  """A callable that starts eager and can be JIT-compiled via ``compile()``.
+
+  Wraps a function with graph-node arguments (model, optimizer, etc.) baked
+  in via ``functools.partial``.  ``compile()`` replaces the inner callable
+  with an ``nnx.jit``-compiled version that has the same call signature,
+  so callers never need to branch on compilation state.
+
+  Usage::
+
+      k = Kernel(my_fn, model, optimizer, donate_argnames=("optimizer",))
+      k(inputs)            # eager
+      k.compile(...)
+      k(inputs)            # JIT'd, same call
+      k.reset()
+      k(inputs)            # back to eager
+  """
+
+  # TODO: https://github.com/microsoft/pyright/issues/11591
+  # pyright does not support TypeVarTuple inside Concatenate
+  @overload
+  def __init__(
+      self,
+      fn: Callable[P, R],
+      *,
+      donate_argnames: tuple[str, ...] | None = None,
+  ) -> None:
+    ...
+
+  @overload
+  def __init__(
+      self,
+      fn: Callable[Concatenate[G1, P], R],
+      __graph_arg1: G1,
+      /,
+      *,
+      donate_argnames: tuple[str, ...] | None = None,
+  ) -> None:
+    ...
+
+  @overload
+  def __init__(
+      self,
+      fn: Callable[Concatenate[G1, G2, P], R],
+      __graph_arg1: G1,
+      __graph_arg2: G2,
+      /,
+      *,
+      donate_argnames: tuple[str, ...] | None = None,
+  ) -> None:
+    ...
+
+  def __init__(
+      self,
+      fn: Callable[..., R],
+      *graph_args: Any,
+      donate_argnames: tuple[str, ...] | None = None,
+  ) -> None:
+    self._fn = fn
+    self._graph_args = graph_args
+    self._donate_argnames = donate_argnames
+    self._call: Callable[..., R] = functools.partial(fn, *graph_args)
+
+  def compile(
+      self,
+      *,
+      compiler_options: jax.stages.CompilerOptions | None = None,
+      cache_nnx_graph: bool = False,
+  ) -> None:
+    """Replace the inner callable with a JIT-compiled version."""
+    jitted = nnx.jit(
+        self._fn,
+        donate_argnames=self._donate_argnames,
+        compiler_options=compiler_options,
+    )
+    if cache_nnx_graph:
+      self._call = functools.partial(
+          nnx.cached_partial(jitted, *self._graph_args)
+      )
+    else:
+      self._call = functools.partial(jitted, *self._graph_args)
+
+  def reset(self) -> None:
+    """Reset to eager mode."""
+    self._call = functools.partial(self._fn, *self._graph_args)
+
+  def __call__(self, *args: P.args, **kwargs: P.kwargs) -> R:
+    return self._call(*args, **kwargs)
 
 
 @dataclasses.dataclass(slots=True, kw_only=True)
@@ -125,7 +216,7 @@ class TrainingInput:
 
 
 def _sft_step_metrics_fn(
-    train_ctx: PeftTrainer,
+    train_ctx: PeftTrainer[Any],
     step: int,
     mode: sft_metrics_logger.Mode,
     metrics: dict[str, _FloatLike_co],
@@ -149,13 +240,28 @@ def _sft_step_metrics_fn(
 class PeftTrainer(Generic[ModuleT]):
   """PEFT trainer for LoRA. Only LoRA parameters are updated.
 
+  Lifecycle::
+
+      trainer = PeftTrainer(model, optimizer, config)
+      trainer = trainer.with_loss_fn(my_loss_fn, has_aux=True)
+      trainer.compile()          # JIT-compile train/eval kernels
+      trainer.train(train_ds)    # runs the loop (calls compile() if needed)
+
+      # Or call steps manually:
+      trainer.compile()
+      loss, aux, grad_norm = trainer.train_step(batch)
+      loss, aux = trainer.eval_step(batch)
+
+      # Eager (no JIT) also works — just don't call compile():
+      loss, aux, grad_norm = trainer.train_step(batch)
+
+  Subclasses override ``compile()`` and ``train_step()`` to set up custom
+  JIT kernels (e.g. multi-kernel GRPO).
+
   Attributes:
     model: The model to train.
     config: The training config.
-    optimizer: The optimizer to use. To monitor the learning rate at each step,
-      use `optax.schedules.inject_hyperparams` to inject learning rate as a
-      hyperparameter. For example: ``optimizer =
-      optax.schedules.inject_hyperparams(optax.sgd)(learning_rate=learning_rate_schedule)``
+    optimizer: The optimizer to use.
     loss_fn: The loss function to use.
     eval_loss_fn: The loss function to use for evaluation.
     checkpoint_manager: The checkpoint manager to use.
@@ -190,19 +296,20 @@ class PeftTrainer(Generic[ModuleT]):
     self.model = model
     self.config = training_config
     self._lora_enabled = utils.is_lora_enabled(self.model)
-    if training_config.gradient_accumulation_steps is not None:
-      optimizer = optax.MultiSteps(
-          optimizer, training_config.gradient_accumulation_steps
-      )
-    if wrt is not None:
-      self.optimizer = nnx.Optimizer(self.model, optimizer, wrt=wrt)
-    elif self._lora_enabled:
-      self.optimizer = nnx.Optimizer(self.model, optimizer, wrt=nnx.LoRAParam)
-    else:
-      self.optimizer = nnx.Optimizer(self.model, optimizer, wrt=nnx.Param)
 
-    self.loss_fn = _default_loss_fn
-    self.eval_loss_fn = _default_loss_fn
+    gradient_transform = optimizer
+    if training_config.gradient_accumulation_steps is not None:
+      gradient_transform = optax.MultiSteps(
+          optimizer, training_config.gradient_accumulation_steps
+      ).gradient_transformation()
+
+    if wrt is None:
+      wrt = nnx.LoRAParam if self._lora_enabled else nnx.Param
+
+    self.optimizer = nnx.Optimizer(self.model, gradient_transform, wrt=wrt)
+
+    self.loss_fn: Callable[..., Any] = _default_loss_fn
+    self.eval_loss_fn: Callable[..., Any] = _default_loss_fn
     self.checkpoint_manager = checkpoint_manager.CheckpointManager(
         root_directory=self.config.checkpoint_root_directory,
         options=self.config.checkpointing_options,
@@ -243,8 +350,15 @@ class PeftTrainer(Generic[ModuleT]):
         "gradient_accumulation_steps", 1
     )
 
-    self._jitted_train_step_fn = None
-    self._jitted_eval_step_fn = None
+    self._compiled: bool = False
+    self._train_kernel = Kernel(
+        self._train_step_impl,
+        self.model,
+        self.optimizer,
+        donate_argnames=("optimizer",),
+    )
+    self._eval_kernel = Kernel(self._eval_step_impl, self.model)
+
     max_step = None
     if self.config.max_steps is not None:
       max_step = self.config.max_steps * self.config.get_with_default(
@@ -267,9 +381,9 @@ class PeftTrainer(Generic[ModuleT]):
     )
     self.with_training_hooks(metric_logging_hook)
 
-    self.data_hooks = None
-    self._jit_cache = set()
-    self._mini_batch_size = None
+    self.data_hooks: hooks.DataHooks | None = None
+    self._jit_cache: set[int] = set()
+    self._mini_batch_size: int | None = None
 
   def with_training_hooks(
       self, training_hooks: hooks.TrainingHooks | Iterable[hooks.TrainingHooks]
@@ -281,21 +395,22 @@ class PeftTrainer(Generic[ModuleT]):
     )
     return self
 
-  def with_data_hooks(self, data_hooks: hooks.DataHooks):
+  def with_data_hooks(self, data_hooks: hooks.DataHooks) -> None:
     self.data_hooks = data_hooks
 
-  def clear_jit_cache(self):
-    """Clears the JIT cache of the train and eval step functions.
+  def clear_jit_cache(self) -> None:
+    """Clears compiled state, forcing recompilation on next ``compile()``.
 
-    This function should be called when the trainer is being reused after
-    overriding the training related states, for example, the loss function.
+    Automatically resets all ``Kernel`` attributes on this trainer.
     """
-    self._jitted_train_step_fn = None
-    self._jitted_eval_step_fn = None
+    for attr in vars(self).values():
+      if isinstance(attr, Kernel):
+        attr.reset()
+    self._compiled = False
 
   def with_loss_fn(
       self,
-      loss_fn: Callable[Concatenate[ModuleT, P], LossReturnT],
+      loss_fn: Callable[..., Any],
       has_aux: bool = False,
   ) -> PeftTrainer[ModuleT]:
     self.clear_jit_cache()
@@ -304,10 +419,10 @@ class PeftTrainer(Generic[ModuleT]):
     self._has_aux = has_aux
     return self
 
-  def _train_step(
-      self, model: ModuleT, optimizer: nnx.Optimizer, inputs: Any
-  ) -> tuple[jax.Array, Any | None, jax.Array]:
-    """Main body for one train step.
+  def _train_step_impl(
+      self, model: ModuleT, optimizer: nnx.Optimizer[Any], inputs: Any
+  ) -> tuple[Loss, Aux, GradNorm]:
+    """Raw train step body — forward, backward, optimizer update.
 
     Args:
       model: The model to train.
@@ -315,8 +430,7 @@ class PeftTrainer(Generic[ModuleT]):
       inputs: The training input.
 
     Returns:
-      A tuple containing the loss, auxiliary data (or None if has_aux is False),
-      and the gradient norm.
+      A tuple of (loss, aux_or_None, grad_norm).
     """
     grad_fn = nnx.value_and_grad(
         self.loss_fn,
@@ -332,28 +446,12 @@ class PeftTrainer(Generic[ModuleT]):
     else:
       return out, None, grad_norm
 
-  def _eval_step(
-      self, model: ModuleT, inputs: Any
-  ) -> jax.Array | tuple[jax.Array, dict[str, jax.Array] | None]:
+  def _eval_step_impl(self, model: ModuleT, inputs: Any) -> tuple[Loss, Aux]:
     out = self.eval_loss_fn(model, inputs)
     if self._has_aux:
       loss, aux = out
       return loss, aux
-    else:
-      return out, None
-
-  def create_train_step_fn(
-      self,
-  ) -> (
-      Callable[..., jax.Array]
-      | Callable[..., tuple[jax.Array, dict[str, jax.Array] | None]]
-  ):
-    """Creates the train step function."""
-    return self._train_step
-
-  def create_eval_step_fn(self) -> Callable[..., jax.Array]:
-    """Creates the eval step function."""
-    return self._eval_step
+    return out, None
 
   def _shard_optimizer(self, mesh: shd.Mesh) -> None:
     """Optimizer states should be sharded before calling the jit function.
@@ -409,54 +507,30 @@ class PeftTrainer(Generic[ModuleT]):
         fsdp_size,
     )
 
-  def jit_train_and_eval_step(
-      self, skip_jit: bool = False, cache_nnx_graph: bool = False
-  ) -> tuple[
-      Callable[..., tuple[jax.Array, Any, jax.Array]],
-      Callable[..., tuple[jax.Array, Any]],
-  ]:
-    """Creates and returns the train and eval step functions.
+  def compile(self, *, cache_nnx_graph: bool = False) -> None:
+    """JIT-compile all ``Kernel`` instances on this trainer. Idempotent."""
+    if self._compiled:
+      return
 
-    This function will return the cached ones if available.
+    self._shard_optimizer(pxla.thread_resources.env.physical_mesh)
 
-    Args:
-      skip_jit: If True, the train and eval step functions will not be JITed.
-      cache_nnx_graph: If True, the nnx graph will be cached.
+    opts: dict[str, Any] = dict(
+        compiler_options=self.config.compiler_options,
+        cache_nnx_graph=cache_nnx_graph,
+    )
+    for attr in vars(self).values():
+      if isinstance(attr, Kernel):
+        attr.compile(**opts)
 
-    Returns:
-      A tuple of train and eval step functions.
-    """
-    train_step = self.create_train_step_fn()
-    eval_step = self.create_eval_step_fn()
-    if skip_jit:
-      return train_step, eval_step
+    self._compiled = True
 
-    if self._jitted_train_step_fn is None:
-      self._shard_optimizer(pxla.thread_resources.env.physical_mesh)
-      self._jitted_train_step_fn = nnx.jit(
-          train_step,
-          donate_argnames=("optimizer",),
-          compiler_options=self.config.compiler_options,
-      )
-      self._jitted_eval_step_fn = nnx.jit(
-          eval_step,
-          compiler_options=self.config.compiler_options,
-      )
+  def train_step(self, inputs: Any) -> tuple[Loss, Aux, GradNorm]:
+    """Execute a single training step (eager or compiled)."""
+    return self._train_kernel(inputs)
 
-      def maybe_cache_and_partial(f, *args):
-        if cache_nnx_graph:
-          # wrap with partial so we can access jitted_fn in a consistent way.
-          return functools.partial(nnx.cached_partial(f, *args))
-        else:
-          return functools.partial(f, *args)
-
-      self._jitted_train_step_fn = maybe_cache_and_partial(
-          self._jitted_train_step_fn, self.model, self.optimizer
-      )
-      self._jitted_eval_step_fn = maybe_cache_and_partial(
-          self._jitted_eval_step_fn, self.model
-      )
-    return self._jitted_train_step_fn, self._jitted_eval_step_fn
+  def eval_step(self, inputs: Any) -> tuple[Loss, Aux]:
+    """Execute a single eval step (eager or compiled)."""
+    return self._eval_kernel(inputs)
 
   def _prepare_inputs(self, input_data: Any) -> Any:
     """Override this function for additional input preparation."""
@@ -495,30 +569,23 @@ class PeftTrainer(Generic[ModuleT]):
       self,
       train_ds: Iterable[Any],
       eval_ds: Iterable[Any] | None = None,
-      skip_jit: bool = False,
       *,
       cache_nnx_graph: bool = True,
   ) -> None:
-    """Training loop."""
+    """Training loop.
+
+    Calls ``compile()`` automatically if not already compiled.
+    """
     logging.log_first_n(
         logging.INFO,
         f"Training with mesh: {pxla.thread_resources.env.physical_mesh}",
         1,
     )
-    train_step, eval_step = self.jit_train_and_eval_step(
-        skip_jit, cache_nnx_graph
-    )
-    if not skip_jit:
-      cache_size = train_step.func.jitted_fn._cache_size()  # pytype: disable=attribute-error
-      logging.log_if(
-          logging.INFO,
-          f"Compiled train_step cache size: {cache_size}",
-          condition=cache_size not in self._jit_cache,
-      )
-      self._jit_cache.add(cache_size)
+
+    self.compile(cache_nnx_graph=cache_nnx_graph)
 
     if eval_ds and self.config.eval_at_start:
-      self._run_eval(eval_ds, eval_step)
+      self._run_eval(eval_ds)
 
     for hook in self.training_hooks:
       hook.on_train_start(self)
@@ -568,7 +635,7 @@ class PeftTrainer(Generic[ModuleT]):
 
         # Collect tags for the span
         metadata = self.custom_checkpoint_metadata()
-        global_step = metadata.get("global_step")
+        global_step: int | None = metadata.get("global_step")
 
         if global_step is not None:
           # Offset by 1 since global_step is incremented for checkpointing.
@@ -576,7 +643,7 @@ class PeftTrainer(Generic[ModuleT]):
           if global_step > 0:
             if self._mini_batch_size is None:
               self._mini_batch_size = max(1, self._train_steps // global_step)
-            mini_batch = self._train_steps % self._mini_batch_size
+            mini_batch: int | None = self._train_steps % self._mini_batch_size
           else:
             mini_batch = self._train_steps
         else:
@@ -585,7 +652,7 @@ class PeftTrainer(Generic[ModuleT]):
         micro_batch = self._iter_steps % self.config.get_with_default(
             "gradient_accumulation_steps", 1
         )
-        tags = {
+        tags: dict[str, Any] = {
             perf_constants.STEP: global_step,
             perf_constants.ROLE: metadata.get("role"),
             perf_constants.MICRO_BATCH: micro_batch,
@@ -600,7 +667,7 @@ class PeftTrainer(Generic[ModuleT]):
             pxla.thread_resources.env.physical_mesh.devices,
             tags=tags,
         ) as span_v2:
-          train_loss, aux, grad_norm = train_step(train_example)
+          train_loss, aux, grad_norm = self.train_step(train_example)
           span.device_end([train_loss])
           span_v2.async_end([train_loss])
 
@@ -644,7 +711,7 @@ class PeftTrainer(Generic[ModuleT]):
               eval_ds
               and self._train_steps % self.config.eval_every_n_steps == 0
           ):
-            self._run_eval(eval_ds, eval_step)
+            self._run_eval(eval_ds)
 
       self._prof.maybe_deactivate(self._iter_steps)
 
@@ -658,7 +725,7 @@ class PeftTrainer(Generic[ModuleT]):
     if not self.is_managed_externally:
       self.close()
 
-  def _save_last_checkpoint(self):
+  def _save_last_checkpoint(self) -> None:
     last_saved_step = self.checkpoint_manager.latest_step()
     if last_saved_step is None or last_saved_step < self._train_steps:
       self.checkpoint_manager.save(
@@ -683,14 +750,14 @@ class PeftTrainer(Generic[ModuleT]):
     """Override this function to return the custom metadata for the checkpoint manager."""
     return {}
 
-  def close(self):
+  def close(self) -> None:
     """Closes the trainer and its associated resources.
 
     This includes saving the last checkpoint,
     and closing the checkpoint manager and metrics logger.
     """
     for hook in self.training_hooks:
-      hook.on_train_step_end(self, self._train_steps, None, 0.0)
+      hook.on_train_step_end(self, self._train_steps, None, jnp.asarray(0))
     self._save_last_checkpoint()
     self.checkpoint_manager.close()
     if self.metrics_logger is not None:
@@ -699,13 +766,13 @@ class PeftTrainer(Generic[ModuleT]):
   def _run_eval(
       self,
       eval_ds: Iterable[Any],
-      eval_step_fn: Callable[..., Any],
   ) -> None:
     """Runs evaluation loop."""
     logging.info("Running evaluation on train step %d.", self._train_steps)
     eval_iterator = iter(eval_ds)
     with self._switch_mode(sft_metrics_logger.Mode.EVAL):
-      eval_loss, eval_steps = 0, 0
+      eval_loss: float | jax.Array = 0
+      eval_steps = 0
       for hook in self.training_hooks:
         hook.on_eval_start(self)
       while True:
@@ -724,7 +791,7 @@ class PeftTrainer(Generic[ModuleT]):
         )
         for hook in self.training_hooks:
           hook.on_eval_step_start(self)
-        loss, aux = eval_step_fn(eval_example)
+        loss, aux = self.eval_step(eval_example)
         loss = jax.lax.stop_gradient(loss)
         for hook in self.training_hooks:
           hook.on_eval_micro_step_end(self, eval_example, loss, aux)
@@ -745,11 +812,11 @@ class PeftTrainer(Generic[ModuleT]):
           self._train_steps,
       )
       for hook in self.training_hooks:
-        hook.on_eval_end(self, eval_loss)
+        hook.on_eval_end(self, jnp.asarray(eval_loss))
 
 
 def _default_loss_fn(
-    model: ModuleT,
+    model: nnx.Module,
     input_tokens: jax.Array,
     input_mask: jax.Array,
     positions: jax.Array,
