@@ -16,7 +16,9 @@
 
 from __future__ import annotations
 
-from typing import Any, Generic, Protocol, TypeVar, TYPE_CHECKING
+from typing import Any, Generic, Protocol, TYPE_CHECKING
+
+from typing_extensions import TypeVar
 
 if TYPE_CHECKING:
   import jax
