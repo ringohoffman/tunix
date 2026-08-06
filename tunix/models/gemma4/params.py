@@ -274,7 +274,7 @@ def _build_sharded_restore_target(
   meta = ckptr.metadata(checkpoint_path)
   assert meta.item_metadata is not None
   item_tree = meta.item_metadata.tree
-  assert flax.typing.is_pytree_of(item_tree, ocp.metadata.ArrayMetadata)
+  assert flax.typing.is_pytree_of(item_tree, ocp.metadata.Metadata)
   flat_upstream = flax.traverse_util.flatten_dict(item_tree)
 
   mock_upstream = flax.traverse_util.unflatten_dict(
