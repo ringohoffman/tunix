@@ -60,7 +60,9 @@ from typing import Any, Literal, Optional, TypeAlias, TypedDict, cast, overload
 import flax.struct
 import jax
 import jax.numpy as jnp
+import numba
 import numpy as np
+import numpy.typing as npt
 
 # Sentinel value indicating that a (state, token) transition is invalid.
 INVALID_STATE: int = -1
@@ -627,6 +629,94 @@ def _dfa_step(
   return INVALID_STATE
 
 
+@numba.njit(cache=True)
+def _simulate_tokens_numba(
+    char_table: npt.NDArray[np.int32],
+    token_bytes_flat: npt.NDArray[np.uint8],
+    token_offsets: npt.NDArray[np.int32],
+    token_lengths: npt.NDArray[np.int32],
+    table: npt.NDArray[np.int32],
+    num_states: int,
+    num_tokens: int,
+) -> None:
+  """Numba JIT kernel: simulate all tokens through char_table in compiled code.
+
+  For each token, simulates its byte sequence from every starting DFA state
+  simultaneously. This eliminates all Python loop overhead, dict lookups,
+  and per-token NumPy temporary allocations.
+
+  Args:
+      char_table: Dense byte lookup table of shape (num_states, 256).
+      token_bytes_flat: Flat 1D array of all token byte values concatenated.
+      token_offsets: Start offset into token_bytes_flat for each token.
+      token_lengths: Byte length of each token.
+      table: Output table of shape (num_states, vocab_size) to write into.
+      num_states: Number of DFA states.
+      num_tokens: Number of tokens to process.
+  """
+  for idx in range(num_tokens):
+    token_id = idx
+    length = token_lengths[idx]
+    if length == 0:
+      continue
+    offset = token_offsets[idx]
+
+    for s in range(num_states):
+      cur = s
+      for j in range(length):
+        b = token_bytes_flat[offset + j]
+        cur = char_table[cur, b]
+        if cur == -1:
+          break
+      table[s, token_id] = cur
+
+
+@numba.njit(cache=True)
+def _simulate_token_completions_numba(
+    char_table: npt.NDArray[np.int32],
+    token_bytes_flat: npt.NDArray[np.uint8],
+    token_offsets: npt.NDArray[np.int32],
+    token_lengths: npt.NDArray[np.int32],
+    item_bitmask: npt.NDArray[np.int32],
+    token_completions: npt.NDArray[np.int32],
+    num_states: int,
+    num_tokens: int,
+) -> None:
+  """Numba JIT kernel: compute item completion bitmasks for all (state, token).
+
+  For each token, simulates its byte sequence from every starting DFA state.
+  At each intermediate state, accumulates the item completion bitmask if the
+  state is an item completion state.
+
+  Args:
+      char_table: Dense byte lookup table of shape (num_states, 256).
+      token_bytes_flat: Flat 1D array of all token byte values concatenated.
+      token_offsets: Start offset into token_bytes_flat for each token.
+      token_lengths: Byte length of each token.
+      item_bitmask: Pre-computed bitmask for each state (0 if not a completion).
+      token_completions: Output array of shape (num_states, num_tokens).
+      num_states: Number of DFA states.
+      num_tokens: Number of tokens to process.
+  """
+  for token_id in range(num_tokens):
+    length = token_lengths[token_id]
+    if length == 0:
+      continue
+    offset = token_offsets[token_id]
+
+    for s in range(num_states):
+      cur = s
+      completions = np.int32(0)
+      for j in range(length):
+        b = token_bytes_flat[offset + j]
+        cur = char_table[cur, b]
+        if cur == -1:
+          break
+        completions |= item_bitmask[cur]
+      if cur != -1:
+        token_completions[s, token_id] = completions
+
+
 def _compile_token_transitions(
     char_transitions: dict[tuple[int, str], int],
     num_states: int,
@@ -637,22 +727,20 @@ def _compile_token_transitions(
 ) -> np.ndarray:
   """Compile character-level DFA transitions into a token-level table.
 
-  Uses vectorized NumPy lookup across states to compile all (state, token)
-  transitions in <0.2s even for 256k vocabularies.
+  Uses a Numba JIT kernel to simulate all (state, token) transitions in
+  compiled code, eliminating Python loop overhead for 256k+ vocabularies.
   """
   table = np.full((num_states, vocab_size), INVALID_STATE, dtype=np.int32)
   eos_set = set(eos_token_ids)
 
   # 1. Pre-build dense byte lookup table: char_table[state, byte_ord] -> next_state
-  # Handles ASCII/UTF-8 byte values 0..255.
   char_table = np.full((num_states, 256), INVALID_STATE, dtype=np.int32)
-  for state in range(num_states):
-    for b in range(256):
-      ch = chr(b)
-      if (state, ch) in char_transitions:
-        char_table[state, b] = char_transitions[(state, ch)]
-      elif (state, _ANY_CHAR) in char_transitions:
-        char_table[state, b] = char_transitions[(state, _ANY_CHAR)]
+  for (state, ch), next_s in char_transitions.items():
+    if ch == _ANY_CHAR:
+      char_table[state, :] = next_s
+  for (state, ch), next_s in char_transitions.items():
+    if ch != _ANY_CHAR:
+      char_table[state, ord(ch)] = next_s
 
   # Handle EOS tokens: allowed from accept states
   for state in accept_states:
@@ -660,33 +748,39 @@ def _compile_token_transitions(
       if 0 <= eos_id < vocab_size:
         table[state, eos_id] = state
 
-  # 2. Vectorized simulation across states per token
-  all_states = np.arange(num_states, dtype=np.int32)
+  # 2. Pre-encode all token strings into flat byte arrays for Numba
+  byte_chunks: list[bytes] = []
+  token_offsets = np.zeros(vocab_size, dtype=np.int32)
+  token_lengths = np.zeros(vocab_size, dtype=np.int32)
+  total_bytes = 0
 
   for token_id in range(vocab_size):
     if token_id in eos_set:
       continue
-
     token_str = token_id_to_str.get(token_id)
     if not token_str:
       continue
+    encoded = token_str.encode("utf-8", errors="replace")
+    token_offsets[token_id] = total_bytes
+    token_lengths[token_id] = len(encoded)
+    byte_chunks.append(encoded)
+    total_bytes += len(encoded)
 
-    token_bytes = token_str.encode("utf-8", errors="replace")
-    states = all_states.copy()
+  if total_bytes == 0:
+    return table
 
-    for b in token_bytes:
-      # Clamp invalid states to 0 for safe indexing, then restore.
-      # Without this, INVALID_STATE (-1) wraps via NumPy negative
-      # indexing to char_table[num_states - 1, ...], silently
-      # producing bogus transitions for multi-byte tokens.
-      invalid_mask = states == INVALID_STATE
-      safe_states = np.where(invalid_mask, 0, states)
-      states = char_table[safe_states, b]
-      states[invalid_mask] = INVALID_STATE
-      if (states == INVALID_STATE).all():
-        break
+  token_bytes_flat = np.frombuffer(b"".join(byte_chunks), dtype=np.uint8)
 
-    table[:, token_id] = states
+  # 3. Run Numba JIT kernel
+  _simulate_tokens_numba(
+      char_table,
+      token_bytes_flat,
+      token_offsets,
+      token_lengths,
+      table,
+      num_states,
+      vocab_size,
+  )
 
   return table
 
@@ -1635,12 +1729,11 @@ def build_unique_items_constraint(
 
   # Now build can_lead_to_items[state, token] by looking up reachable_items
   # of the next state.
-  can_lead_to_items = np.zeros((num_states, vocab_size), dtype=np.int32)
-  for s in range(num_states):
-    for v in range(vocab_size):
-      next_s = token_transitions[s, v]
-      if next_s != INVALID_STATE:
-        can_lead_to_items[s, v] = reachable_items[next_s]
+  valid_trans = token_transitions != INVALID_STATE
+  safe_next = np.where(valid_trans, token_transitions, 0)
+  can_lead_to_items = np.where(
+      valid_trans, reachable_items[safe_next], np.int32(0)
+  )
 
   # Build token_completions[state, token] -> bitmask of items completed
   # during intermediate character states when processing token v from state s.
@@ -1648,58 +1741,85 @@ def build_unique_items_constraint(
   # item-completion states.  Without this, completions at intermediate
   # character positions are invisible to the final-state-only lookup.
   char_table = np.full((num_states, 256), INVALID_STATE, dtype=np.int32)
-  for state in range(num_states):
-    for b in range(256):
-      ch = chr(b)
-      if (state, ch) in char_transitions:
-        char_table[state, b] = char_transitions[(state, ch)]
-      elif (state, _ANY_CHAR) in char_transitions:
-        char_table[state, b] = char_transitions[(state, _ANY_CHAR)]
+  for (state, ch), next_s in char_transitions.items():
+    if ch == _ANY_CHAR:
+      char_table[state, :] = next_s
+  for (state, ch), next_s in char_transitions.items():
+    if ch != _ANY_CHAR:
+      char_table[state, ord(ch)] = next_s
+
+  # Pre-find all trigger bytes that land on item completion states
+  item_completion_bytes = set(
+      np.where(
+          np.any(
+              (char_table != INVALID_STATE)
+              & (item_completion_map[np.maximum(0, char_table)] >= 0),
+              axis=0,
+          )
+      )[0]
+  )
 
   eos_set = set(eos_token_ids)
-  token_completions = np.zeros((num_states, vocab_size), dtype=np.int32)
+  all_states = np.arange(num_states, dtype=np.int32)
+  # Pre-compute item completion bitmasks for each state
+  has_completion = item_completion_map >= 0
+  item_bitmask = np.where(
+      has_completion,
+      np.int32(1) << item_completion_map.clip(0).astype(np.int32),
+      np.int32(0),
+  )
+
+  # Pre-encode token bytes for Numba kernel (reuse trigger-byte filter)
+  byte_chunks: list[bytes] = []
+  tc_token_offsets = np.zeros(vocab_size, dtype=np.int32)
+  tc_token_lengths = np.zeros(vocab_size, dtype=np.int32)
+  total_bytes = 0
+  trigger_bytes_arr = np.array(sorted(item_completion_bytes), dtype=np.uint8)
+
   for token_id in range(vocab_size):
     if token_id in eos_set:
       continue
     token_str = token_id_to_str.get(token_id)
     if not token_str:
       continue
-    token_bytes = token_str.encode("utf-8", errors="replace")
-    # Simulate character-by-character from each starting state
-    for s in range(num_states):
-      cur = s
-      completions = np.int32(0)
-      for byte_val in token_bytes:
-        if cur == INVALID_STATE:
-          break
-        next_cur = int(char_table[cur, byte_val])
-        if next_cur != INVALID_STATE and item_completion_map[next_cur] >= 0:
-          completions |= np.int32(1) << np.int32(item_completion_map[next_cur])
-        cur = next_cur
-      if cur != INVALID_STATE:
-        token_completions[s, token_id] = completions
+    encoded = token_str.encode("utf-8", errors="replace")
+    if trigger_bytes_arr.size > 0 and not any(
+        b in item_completion_bytes for b in encoded
+    ):
+      continue
+    tc_token_offsets[token_id] = total_bytes
+    tc_token_lengths[token_id] = len(encoded)
+    byte_chunks.append(encoded)
+    total_bytes += len(encoded)
+
+  token_completions = np.zeros((num_states, vocab_size), dtype=np.int32)
+  if total_bytes > 0:
+    tc_bytes_flat = np.frombuffer(b"".join(byte_chunks), dtype=np.uint8)
+    _simulate_token_completions_numba(
+        char_table,
+        tc_bytes_flat,
+        tc_token_offsets,
+        tc_token_lengths,
+        item_bitmask,
+        token_completions,
+        num_states,
+        vocab_size,
+    )
 
   # Build leads_to_close and leads_to_continue at token level.
   # These are computed for ALL states, not just after-item states, because
   # multi-character tokens can span from mid-item through completion to the
   # separator or closing bracket.
-  leads_to_close = np.zeros((num_states, vocab_size), dtype=bool)
-  leads_to_continue = np.zeros((num_states, vocab_size), dtype=bool)
-  for s in range(num_states):
-    for v in range(vocab_size):
-      next_s = token_transitions[s, v]
-      if next_s != INVALID_STATE:
-        # A token needs min/max enforcement if:
-        # (a) The current state is an after-item state (item was completed
-        #     by a previous token, seen_mask already recorded it), OR
-        # (b) This token itself completes an item during its character
-        #     simulation (token_completions captures this).
-        needs_enforcement = is_after_item[s] or token_completions[s, v] != 0
-        if needs_enforcement:
-          if is_done[next_s]:
-            leads_to_close[s, v] = True
-          elif next_s != s:
-            leads_to_continue[s, v] = True
+  valid_trans = token_transitions != INVALID_STATE
+  safe_next = np.where(valid_trans, token_transitions, 0)
+  needs_enforcement = is_after_item[:, None] | (token_completions != 0)
+  leads_to_close = valid_trans & needs_enforcement & is_done[safe_next]
+  leads_to_continue = (
+      valid_trans
+      & needs_enforcement
+      & (~is_done[safe_next])
+      & (safe_next != np.arange(num_states)[:, None])
+  )
 
   unique_info = UniqueItemsConstraint(
       token_completions=token_completions,
@@ -1826,13 +1946,11 @@ def _chain_constraints_uncached(
 
   for stage_index, stage in enumerate(compiled_stages):
     offset = offsets[stage_index]
-    for state_id in range(stage.num_states):
-      for token_id in range(vocab_size):
-        next_state = stage.token_transitions[state_id, token_id]
-        if next_state != INVALID_STATE:
-          combined_token_transitions[offset + state_id, token_id] = (
-              offset + next_state
-          )
+    stt = stage.token_transitions
+    valid = stt != INVALID_STATE
+    combined_token_transitions[offset : offset + stage.num_states] = np.where(
+        valid, stt + offset, INVALID_STATE
+    )
 
   for stage_index in range(len(compiled_stages) - 1):
     current_stage = compiled_stages[stage_index]
@@ -1840,16 +1958,16 @@ def _chain_constraints_uncached(
     current_offset = offsets[stage_index]
     next_offset = offsets[stage_index + 1]
 
+    next_init_row = next_stage.token_transitions[next_stage.initial_state]
+    next_valid = next_init_row != INVALID_STATE
+
     for accept_state in current_stage.accept_states:
       global_accept_state = current_offset + accept_state
-      for token_id in range(vocab_size):
-        next_target = next_stage.token_transitions[
-            next_stage.initial_state, token_id
-        ]
-        if next_target != INVALID_STATE:
-          combined_token_transitions[global_accept_state, token_id] = (
-              next_offset + next_target
-          )
+      combined_token_transitions[global_accept_state] = np.where(
+          next_valid,
+          next_offset + next_init_row,
+          combined_token_transitions[global_accept_state],
+      )
 
   initial_state = offsets[0] + compiled_stages[0].initial_state
   last_stage = compiled_stages[-1]
