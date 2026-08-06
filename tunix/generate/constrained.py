@@ -760,48 +760,48 @@ def prepare_token_bound_masks(tables: ConstraintTables) -> ConstraintTables:
   num_states = tables.num_states
   vocab_size = tables.token_transitions.shape[1]
   tt = tables.token_transitions
-  accept_states = tables.accept_states
 
-  # 1. accept_mask: True for (state, token) transitions where target state is an
-  # accept_state
-  accept_mask = np.zeros((num_states, vocab_size), dtype=bool)
-  for s in range(num_states):
-    for v in range(vocab_size):
-      next_s = tt[s, v]
-      if next_s != INVALID_STATE and next_s in accept_states:
-        accept_mask[s, v] = True
+  # Convert accept_states to a validated 1D NumPy index array
+  accept_indices = np.array(list(tables.accept_states), dtype=np.int32)
+  if accept_indices.size > 0:
+    accept_indices = accept_indices[
+        (accept_indices >= 0) & (accept_indices < num_states)
+    ]
 
-  # 2. force_accept_mask: True for transitions that strictly decrease distance
-  # to accept_state
-  dist = np.full(num_states, 999999, dtype=np.int32)
-  for acc in accept_states:
-    dist[acc] = 0
+  # 1. accept_mask: True for (state, token) transitions where target state is an accept_state
+  valid_mask = tt != INVALID_STATE
+  is_accept = np.zeros(num_states, dtype=bool)
+  is_accept[accept_indices] = True
+  accept_mask = np.where(
+      valid_mask, is_accept[np.clip(tt, 0, num_states - 1)], False
+  )
+
+  # 2. Vectorized Bellman-Ford for shortest distance to accept_state
+  INF = 999999
+  dist = np.full(num_states, INF, dtype=np.int32)
+  dist[accept_indices] = 0
+
+  # Extend dist table by 1 to map INVALID_STATE (-1) to index num_states with
+  # INF
+  dist_with_invalid = np.append(dist, INF)
 
   changed = True
   while changed:
-    changed = False
-    for s in range(num_states):
-      if s in accept_states:
-        continue
-      min_d = dist[s]
-      for v in range(vocab_size):
-        next_s = tt[s, v]
-        if next_s != INVALID_STATE:
-          if dist[next_s] + 1 < min_d:
-            min_d = dist[next_s] + 1
-      if min_d < dist[s]:
-        dist[s] = min_d
-        changed = True
+    dist_next = dist_with_invalid[tt]
+    min_step_dist = np.min(dist_next, axis=1) + 1
+    min_step_dist[accept_indices] = 0
+    new_dist = np.minimum(dist, min_step_dist)
+    changed = not np.array_equal(dist, new_dist)
+    dist = new_dist
+    dist_with_invalid[:num_states] = dist
 
-  force_accept_mask = np.zeros((num_states, vocab_size), dtype=bool)
-  for s in range(num_states):
-    for v in range(vocab_size):
-      next_s = tt[s, v]
-      if next_s != INVALID_STATE:
-        if dist[next_s] < dist[s]:
-          force_accept_mask[s, v] = True
-        elif dist[s] == 0:
-          force_accept_mask[s, v] = True
+  # 3. force_accept_mask: True for transitions that decrease distance to
+  # accept_state
+  target_dist = dist_with_invalid[tt]
+  curr_dist = dist[:, None]
+  force_accept_mask = valid_mask & (
+      (target_dist < curr_dist) | (curr_dist == 0)
+  )
 
   return dataclasses.replace(
       tables,
@@ -1771,7 +1771,7 @@ def _flatten_constraints(constraints: Constraint) -> list[ConstraintItem]:
   raise TypeError(f"Unsupported constraint type: {type(constraints)}")
 
 
-def chain_constraints(
+def _chain_constraints_uncached(
     constraints: Constraint,
     token_id_to_str: Mapping[int, str],
     vocab_size: int,
@@ -1779,24 +1779,7 @@ def chain_constraints(
     *,
     indent: int = 2,
 ) -> ConstraintTables:
-  """Sequentially chains one or multiple schemas, regex patterns, or ConstraintTables together.
-
-  Transitions from the accept state(s) of constraint i directly into the initial
-  state of constraint i+1.  Preserves uniqueItems side-channel metadata for any
-  stages that have it.
-
-  Args:
-      constraints: A single constraint or sequence of JSON Schemas (dicts),
-        regex patterns (strs), or pre-compiled ConstraintTables to execute
-        sequentially.
-      token_id_to_str: Mapping from token id to decoded string.
-      vocab_size: Vocabulary size.
-      eos_token_ids: End-of-sequence token ids.
-      indent: JSON formatting indent level for schema conversion.
-
-  Returns:
-      A single chained ConstraintTables object.
-  """
+  """Uncached implementation of chain_constraints."""
   constraint_items = _flatten_constraints(constraints)
 
   if not constraint_items:
@@ -2024,7 +2007,7 @@ def _cached_chain_constraints(
 ) -> ConstraintTables:
   constraints = cast(Constraint, _unfreeze(frozen_constraints))
   token_id_to_str = cast(Mapping[int, str], _unfreeze(frozen_tok_map))
-  return chain_constraints(
+  return _chain_constraints_uncached(
       constraints,
       token_id_to_str=token_id_to_str,
       vocab_size=vocab_size,
@@ -2033,7 +2016,7 @@ def _cached_chain_constraints(
   )
 
 
-def cached_chain_constraints(
+def chain_constraints(
     constraints: Constraint,
     token_id_to_str: Mapping[int, str],
     vocab_size: int,
@@ -2041,7 +2024,28 @@ def cached_chain_constraints(
     *,
     indent: int = 2,
 ) -> ConstraintTables:
-  """Cached wrapper around chain_constraints."""
+  """Sequentially chains one or multiple schemas, regex patterns, or ConstraintTables together.
+
+  Results are cached with an LRU cache (maxsize=128) keyed on the frozen
+  representation of the inputs.  Passing an already-compiled
+  ``ConstraintTables`` instance is a no-op passthrough.
+
+  Transitions from the accept state(s) of constraint i directly into the initial
+  state of constraint i+1.  Preserves uniqueItems side-channel metadata for any
+  stages that have it.
+
+  Args:
+      constraints: A single constraint or sequence of JSON Schemas (dicts),
+        regex patterns (strs), or pre-compiled ConstraintTables to execute
+        sequentially.
+      token_id_to_str: Mapping from token id to decoded string.
+      vocab_size: Vocabulary size.
+      eos_token_ids: End-of-sequence token ids.
+      indent: JSON formatting indent level for schema conversion.
+
+  Returns:
+      A single chained ConstraintTables object.
+  """
   if isinstance(constraints, ConstraintTables):
     return constraints
 
