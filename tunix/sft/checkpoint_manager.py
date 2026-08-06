@@ -154,7 +154,7 @@ def gcsfuse_to_gs_path(path: str) -> str:
     return path
 
   mount_point, bucket_name = mount
-  abs_path = os.path.abspath(path)
+  abs_path = os.path.realpath(os.path.abspath(path))
   rel_path = os.path.relpath(abs_path, mount_point)
   gs_path = f"gs://{bucket_name}/{rel_path}".rstrip("/")
   logging.info(
