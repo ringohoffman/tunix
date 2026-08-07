@@ -653,5 +653,39 @@ class PeftTrainerTest(parameterized.TestCase):
     )
 
 
+class KernelTest(parameterized.TestCase):
+
+  def test_kernel_preserves_function_name_for_plain_callable(self):
+    def my_custom_train_step(x: jax.Array) -> jax.Array:
+      return x * 2
+
+    k = peft_trainer.Kernel(my_custom_train_step)
+    self.assertEqual(k._fn.__name__, "my_custom_train_step")
+    self.assertEqual(k._fn.__qualname__, my_custom_train_step.__qualname__)
+    self.assertEqual(k(jnp.array(3)), 6)
+
+  def test_kernel_preserves_function_name_for_functools_partial(self):
+    def policy_gradient_train_step(bias: int, x: jax.Array) -> jax.Array:
+      return x + bias
+
+    p = functools.partial(policy_gradient_train_step, 10)
+    k = peft_trainer.Kernel(p)
+    self.assertEqual(k._fn.__name__, "policy_gradient_train_step")
+    self.assertEqual(k._fn.__qualname__, policy_gradient_train_step.__qualname__)
+    self.assertEqual(k(jnp.array(5)), 15)
+
+  def test_kernel_compile_generates_named_xla_module(self):
+    def rollout_generation_step(scale: float, x: jax.Array) -> jax.Array:
+      return x * scale
+
+    p = functools.partial(rollout_generation_step, 3.0)
+    k = peft_trainer.Kernel(p)
+    k.compile()
+
+    lowered = nnx.jit(k._fn).lower(jnp.ones((4,), dtype=jnp.float32))
+    hlo_text = lowered.as_text()
+    self.assertIn("rollout_generation_step", hlo_text)
+
+
 if __name__ == '__main__':
   absltest.main()

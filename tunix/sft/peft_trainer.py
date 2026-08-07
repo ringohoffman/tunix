@@ -122,10 +122,17 @@ class Kernel(Generic[P, R]):
       *graph_args: Any,
       donate_argnames: tuple[str, ...] | None = None,
   ) -> None:
-    self._fn = fn
+    if isinstance(fn, functools.partial):
+      target = getattr(fn, "func", fn)
+      @functools.wraps(target)
+      def _wrapped(*args: Any, **kwargs: Any) -> Any:
+        return fn(*args, **kwargs)
+      self._fn = _wrapped
+    else:
+      self._fn = fn
     self._graph_args = graph_args
     self._donate_argnames = donate_argnames
-    self._call: Callable[..., R] = functools.partial(fn, *graph_args)
+    self._call: Callable[..., R] = functools.partial(self._fn, *graph_args)
 
   def compile(
       self,
