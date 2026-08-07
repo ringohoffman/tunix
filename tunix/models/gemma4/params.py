@@ -645,81 +645,66 @@ def create_model_from_checkpoint(
     raw_params = ocp.PyTreeCheckpointer().restore(resolved_path)
     _log_phase('PyTreeCheckpointer.restore (I/O)')
 
-  mapped = map_from_upstream_checkpoint(
-      raw_params,
-      model_config=model_config,
-      stack_kv=lambda k, v: jnp.stack([k, v], axis=0),
-  )
-
-  _log_phase('map_from_upstream_checkpoint')
-
-  if (
-      model_config.attention_pattern is not None
-      and model_config.use_scan_layers
-  ):
-    mapped = _stack_layers_for_scan(
-        mapped,
-        model_config.num_layers,
-        len(model_config.attention_pattern),
-        model_config.frac_shared_layers,
-    )
-    _log_phase('_stack_layers_for_scan')
-
-  pruned = _prune_to_model_keys(mapped, model_state)
-  _validate_param_shapes(pruned, model_state)
-
-  _log_phase('prune + validate')
-
   pure_state = nnx.to_pure_dict(model_state)
-
   if mesh is not None:
     with _mesh_context(mesh):
-      shardings = nnx.to_pure_dict(nnx.get_named_sharding(model_state, mesh))
-      _log_phase('get_named_sharding')
-      # Fill missing leaves (e.g. vision weights absent from text-only ckpt)
-      flat_pure = flax.traverse_util.flatten_dict(pure_state)
-      flat_pruned = flax.traverse_util.flatten_dict(pruned)
-      for k, v in flat_pure.items():
-        if k not in flat_pruned:
-          flat_pruned[k] = jnp.zeros(v.shape, dtype=dtype)
-      complete_params = flax.traverse_util.unflatten_dict(flat_pruned)
-      _log_phase('flatten + fill missing + unflatten')
-      typed = jax.tree_util.tree_map_with_path(
-          lambda p, x, s: jnp.asarray(x, device=s, dtype=dtype),
-          complete_params,
-          shardings,
+      shardings_dict = nnx.to_pure_dict(
+          nnx.get_named_sharding(model_state, mesh)
       )
-      _log_phase('jnp.asarray (dtype cast + shard placement)')
   else:
-    typed = jax.tree_util.tree_map(
-        lambda x: jnp.asarray(x, dtype=dtype),
-        pruned,
+    shardings_dict = {}
+
+  @jax.jit
+  def _jit_transform(
+      raw: flax.typing.PyTree[jax.Array],
+  ) -> flax.typing.PyTree[jax.Array]:
+    mapped = map_from_upstream_checkpoint(
+        raw,
+        model_config=model_config,
+        stack_kv=lambda k, v: jnp.stack([k, v], axis=0),
     )
-    _log_phase('jnp.asarray (dtype cast)')
+
+    if (
+        model_config.attention_pattern is not None
+        and model_config.use_scan_layers
+    ):
+      mapped = _stack_layers_for_scan(
+          mapped,
+          model_config.num_layers,
+          len(model_config.attention_pattern),
+          model_config.frac_shared_layers,
+      )
+
+    pruned = _prune_to_model_keys(mapped, model_state)
+    _validate_param_shapes(pruned, model_state)
+
+    flat_pruned = flax.traverse_util.flatten_dict(pruned)
+    flat_model = flax.traverse_util.flatten_dict(pure_state)
+    flat_shardings = flax.traverse_util.flatten_dict(shardings_dict)
+
+    result_flat: flax.typing.FlatPyTree[jax.Array] = {}
+    for k, model_leaf in flat_model.items():
+      if k in flat_pruned:
+        val = jnp.astype(flat_pruned[k], dtype)
+      else:
+        val = jnp.zeros(model_leaf.shape, dtype=dtype)
+
+      if (
+          mesh is not None
+          and k in flat_shardings
+          and flat_shardings[k] is not None
+      ):
+        val = jax.lax.with_sharding_constraint(val, flat_shardings[k])
+      result_flat[k] = val
+
+    return flax.traverse_util.unflatten_dict(result_flat)
+
+  with _mesh_context(mesh):
+    typed = _jit_transform(raw_params)
+  _log_phase('_jit_transform (map + stack + prune + cast + shard)')
 
   nnx.update(abs_model, typed)
-
   _log_phase('nnx.update (typed)')
-
-  # partial_restore may leave ShapeDtypeStructs for unused keys (e.g. vision
-  # weights in a text-only model). Replace them with zeros so subsequent
-  # nnx.jit calls don't hit TraceContextErrors.
-  def _materialize(x: jax.ShapeDtypeStruct | jax.Array) -> jax.Array:
-    if isinstance(x, jax.ShapeDtypeStruct):
-      return jnp.zeros(
-          x.shape,
-          dtype=x.dtype,
-          device=getattr(x, 'sharding', None),
-      )
-    return x
-
-  state: nnx.State[
-      flax.typing.PathParts,
-      nnx.Variable[jax.Array] | nnx.Variable[jax.ShapeDtypeStruct],
-  ] = nnx.state(abs_model)
-  nnx.update(abs_model, jax.tree_util.tree_map(_materialize, state))
-
-  _log_phase('materialize ShapeDtypeStructs')
 
   logging.info(
       '[TIMING] create_model_from_checkpoint: %.1fs',
