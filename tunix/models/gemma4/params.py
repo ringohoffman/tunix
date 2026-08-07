@@ -574,6 +574,19 @@ def create_model_from_checkpoint(
     A Gemma4 model instance with loaded weights.
   """
   t0 = time.monotonic()
+  _t_prev = t0
+
+  def _log_phase(phase_name: str) -> None:
+    nonlocal _t_prev
+    now = time.monotonic()
+    logging.info(
+        '[TIMING] %s: %.1fs (cumulative: %.1fs)',
+        phase_name,
+        now - _t_prev,
+        now - t0,
+    )
+    _t_prev = now
+
   # GCSFuse mount paths must be translated to gs:// URIs for TensorStore.
   checkpoint_path = checkpoint_manager.gcsfuse_to_gs_path(checkpoint_path)
   logging.info('Creating model from checkpoint path %s', checkpoint_path)
@@ -586,6 +599,8 @@ def create_model_from_checkpoint(
     resolved_path = str(epath.Path(clean_path) / 'model_params')
   else:
     resolved_path = clean_path
+
+  _log_phase('path_resolution')
 
   with (
       nnx.use_eager_sharding(True),
@@ -605,8 +620,12 @@ def create_model_from_checkpoint(
       flax.typing.PathParts, nnx.Variable[jax.ShapeDtypeStruct]
   ] = nnx.state(abs_model)
 
+  _log_phase('eval_shape + model_state')
+
   if _try_restore_native_tunix(resolved_path, abs_model, mesh, t0):
     return abs_model
+
+  _log_phase('_try_restore_native_tunix (skipped)')
 
   if mesh is not None:
     target, ckptr = _build_sharded_restore_target(
@@ -615,19 +634,24 @@ def create_model_from_checkpoint(
         mesh,
         model_config,
     )
+    _log_phase('_build_sharded_restore_target')
     raw_params = ckptr.restore(
         resolved_path,
         target=target,
         partial_restore=True,
     )
+    _log_phase('ckptr.restore (I/O)')
   else:
     raw_params = ocp.PyTreeCheckpointer().restore(resolved_path)
+    _log_phase('PyTreeCheckpointer.restore (I/O)')
 
   mapped = map_from_upstream_checkpoint(
       raw_params,
       model_config=model_config,
       stack_kv=lambda k, v: jnp.stack([k, v], axis=0),
   )
+
+  _log_phase('map_from_upstream_checkpoint')
 
   if (
       model_config.attention_pattern is not None
@@ -639,15 +663,19 @@ def create_model_from_checkpoint(
         len(model_config.attention_pattern),
         model_config.frac_shared_layers,
     )
+    _log_phase('_stack_layers_for_scan')
 
   pruned = _prune_to_model_keys(mapped, model_state)
   _validate_param_shapes(pruned, model_state)
+
+  _log_phase('prune + validate')
 
   pure_state = nnx.to_pure_dict(model_state)
 
   if mesh is not None:
     with _mesh_context(mesh):
       shardings = nnx.to_pure_dict(nnx.get_named_sharding(model_state, mesh))
+      _log_phase('get_named_sharding')
       # Fill missing leaves (e.g. vision weights absent from text-only ckpt)
       flat_pure = flax.traverse_util.flatten_dict(pure_state)
       flat_pruned = flax.traverse_util.flatten_dict(pruned)
@@ -655,18 +683,23 @@ def create_model_from_checkpoint(
         if k not in flat_pruned:
           flat_pruned[k] = jnp.zeros(v.shape, dtype=dtype)
       complete_params = flax.traverse_util.unflatten_dict(flat_pruned)
+      _log_phase('flatten + fill missing + unflatten')
       typed = jax.tree_util.tree_map_with_path(
           lambda p, x, s: jnp.asarray(x, device=s, dtype=dtype),
           complete_params,
           shardings,
       )
+      _log_phase('jnp.asarray (dtype cast + shard placement)')
   else:
     typed = jax.tree_util.tree_map(
         lambda x: jnp.asarray(x, dtype=dtype),
         pruned,
     )
+    _log_phase('jnp.asarray (dtype cast)')
 
   nnx.update(abs_model, typed)
+
+  _log_phase('nnx.update (typed)')
 
   # partial_restore may leave ShapeDtypeStructs for unused keys (e.g. vision
   # weights in a text-only model). Replace them with zeros so subsequent
@@ -685,6 +718,8 @@ def create_model_from_checkpoint(
       nnx.Variable[jax.Array] | nnx.Variable[jax.ShapeDtypeStruct],
   ] = nnx.state(abs_model)
   nnx.update(abs_model, jax.tree_util.tree_map(_materialize, state))
+
+  _log_phase('materialize ShapeDtypeStructs')
 
   logging.info(
       '[TIMING] create_model_from_checkpoint: %.1fs',
