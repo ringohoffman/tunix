@@ -129,11 +129,18 @@ def _find_gcsfuse_mount(path: str) -> tuple[str, str] | None:
   return None
 
 
+@functools.cache
 def is_gcs_or_gcsfuse_path(path: str) -> bool:
   """Returns True if path is a ``gs://`` URI or mounted via GCSFuse.
 
   Uses a cached set of mount points from ``/proc/mounts`` — no per-call
   I/O and no log spam regardless of how many paths are checked.
+
+  Cached with ``@functools.cache`` because checking paths walks up parent
+  directories and resolves ``os.path.realpath()`` (which issues multiple
+  ``lstat`` syscalls per directory level on each call). Caching eliminates
+  redundant filesystem traversal on repeated lookups while using negligible
+  memory (~135 bytes per path).
   """
   if path.startswith("gs://"):
     return True
