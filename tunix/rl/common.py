@@ -14,7 +14,6 @@
 """Common RL helper classes and functions."""
 
 import inspect
-from functools import partial  # pylint: disable=g-importing-member
 from typing import Any, Iterable, Literal, overload
 
 import flax
@@ -214,7 +213,6 @@ def get_per_token_logps(
 
 # TODO(abheesht): This is computed 4 times - twice in `compute_per_token_logps`
 # and twice in `compute_score`. We can factor this out and compute it just once.
-@partial(jax.jit, static_argnames=("pad_id", "eos_id"))
 def process_ids(
     prompt_tokens: jax.Array,
     completion_tokens: jax.Array,
@@ -307,16 +305,6 @@ def compute_per_token_logps(
 ) -> tuple[jax.Array, jax.Array]: ...
 
 
-@partial(
-    jax.jit,
-    static_argnames=(
-        "pad_id",
-        "eos_id",
-        "stop_gradient",
-        "return_logits",
-        "temperature",
-    ),
-)
 def compute_per_token_logps(
     model: nnx.Module,
     prompt_tokens: jax.Array,
@@ -368,6 +356,20 @@ def compute_per_token_logps(
       segment_ids,
       segment_positions,
   )
+
+  # Pin batch dimension to fsdp axis so GSPMD cannot partially all-gather it.
+  # Without this, the SPMD partitioner may reduce batch sharding (e.g. 32→4),
+  # inflating per-device activation memory and causing OOM.
+  _data_pspec = jax.sharding.PartitionSpec("fsdp", None)
+  input_tokens = jax.lax.with_sharding_constraint(input_tokens, _data_pspec)
+  calculated_positions = jax.lax.with_sharding_constraint(
+      calculated_positions, _data_pspec
+  )
+  if attn_mask is not None:
+    attn_mask = jax.lax.with_sharding_constraint(
+        attn_mask,
+        jax.sharding.PartitionSpec("fsdp", None, None),
+    )
 
   model_kwargs = {
       "positions": calculated_positions,
