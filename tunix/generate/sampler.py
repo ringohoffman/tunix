@@ -17,18 +17,18 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Sequence
 import dataclasses
 import inspect
-from collections.abc import Sequence
 from typing import Any, TypeGuard, TypeVar
 import warnings
 
 import flax
-import flax.struct
 from flax import nnx
 from flax.nnx import filterlib
 from flax.nnx import graph
 from flax.nnx import statelib
+import flax.struct
 import flax.typing
 import jax
 import jax.numpy as jnp
@@ -41,7 +41,7 @@ import tunix.generate.beam_search as beam_search_lib
 import tunix.generate.tokenizer_adapter as tok_adapter
 from tunix.processors import image_processor as image_processor_lib
 
-_ParamT = TypeVar("_ParamT", jax.Array, jax.ShapeDtypeStruct)
+_ParamT = TypeVar('_ParamT', jax.Array, jax.ShapeDtypeStruct)
 
 LayerCache = dict[str, jaxtyping.Array]
 Cache = dict[str, LayerCache]
@@ -110,8 +110,11 @@ class _SamplingState:
   constraint_state: jnp.ndarray | None = None
   """Constraint DFA state per batch element, shape [B], int32."""
 
+  constraint_active_tokens: jnp.ndarray | None = None
+  """Active token IDs array, shape [K], int32."""
+
   constraint_transitions: jnp.ndarray | None = None
-  """Token-level constraint transition table, shape [S, V], int32.
+  """Token-level constraint transition table, shape [S, K], int32.
   Constant across decode steps; carried in state so it is visible
   inside the jax.lax.while_loop.
   """
@@ -571,6 +574,7 @@ class Sampler(base_sampler.BaseSampler):
         self.compile_constraint(constraint) if constraint is not None else None
     )
     constraint_state: jnp.ndarray | None = None
+    constraint_active_tokens: jnp.ndarray | None = None
     constraint_transitions: jnp.ndarray | None = None
     unique_state: constrained.UniqueItemsLoopState | None = None
     token_bounds_state: constrained.TokenBoundsLoopState | None = None
@@ -582,6 +586,9 @@ class Sampler(base_sampler.BaseSampler):
     if constraint_tables is not None:
       constraint_state = jnp.full(
           (batch_size,), constraint_tables.initial_state, dtype=jnp.int32
+      )
+      constraint_active_tokens = jnp.array(
+          constraint_tables.active_tokens, dtype=jnp.int32
       )
       constraint_transitions = jnp.array(
           constraint_tables.token_transitions, dtype=jnp.int32
@@ -612,6 +619,7 @@ class Sampler(base_sampler.BaseSampler):
         sampling_mode=sampling_mode,
         beam_search_sampling_state=None,
         constraint_state=constraint_state,
+        constraint_active_tokens=constraint_active_tokens,
         constraint_transitions=constraint_transitions,
         unique_state=unique_state,
         token_bounds_state=token_bounds_state,
@@ -645,11 +653,13 @@ class Sampler(base_sampler.BaseSampler):
       logits = logits.at[:, :, sampler_state.forbidden_token_ids].set(-jnp.inf)
 
     if sampler_state.constraint_transitions is not None:
+      assert sampler_state.constraint_active_tokens is not None
       if sampler_state.unique_state is not None:
         logits = constrained.constrained_logits_unique(
             logits,
             sampler_state.constraint_state,
             sampler_state.constraint_transitions,
+            sampler_state.constraint_active_tokens,
             sampler_state.unique_state,
             token_bounds_state=sampler_state.token_bounds_state,
         )
@@ -658,6 +668,7 @@ class Sampler(base_sampler.BaseSampler):
             logits,
             sampler_state.constraint_state,
             sampler_state.constraint_transitions,
+            sampler_state.constraint_active_tokens,
             token_bounds_state=sampler_state.token_bounds_state,
         )
 
@@ -707,6 +718,7 @@ class Sampler(base_sampler.BaseSampler):
     unique_state = sampler_state.unique_state
     token_bounds_state = sampler_state.token_bounds_state
     if sampler_state.constraint_transitions is not None:
+      assert sampler_state.constraint_active_tokens is not None
       if sampler_state.token_bounds_state is not None:
         token_bounds_state = constrained.advance_token_bounds_state(
             sampler_state.token_bounds_state
@@ -716,6 +728,7 @@ class Sampler(base_sampler.BaseSampler):
             sampler_state.constraint_state,
             next_token_candidate,
             sampler_state.constraint_transitions,
+            sampler_state.constraint_active_tokens,
             sampler_state.unique_state,
         )
       else:
@@ -723,6 +736,7 @@ class Sampler(base_sampler.BaseSampler):
             sampler_state.constraint_state,
             next_token_candidate,
             sampler_state.constraint_transitions,
+            sampler_state.constraint_active_tokens,
         )
 
     done = done | jnp.isin(token_buffer[:, decoding_step + 1], self.eos_tokens)
@@ -743,6 +757,7 @@ class Sampler(base_sampler.BaseSampler):
         sampling_mode=sampler_state.sampling_mode,
         beam_search_sampling_state=beam_search_state,
         constraint_state=constraint_state,
+        constraint_active_tokens=sampler_state.constraint_active_tokens,
         constraint_transitions=sampler_state.constraint_transitions,
         unique_state=unique_state,
         token_bounds_state=token_bounds_state,
@@ -857,6 +872,7 @@ class Sampler(base_sampler.BaseSampler):
         sampling_mode=sampler_state.sampling_mode,
         beam_search_sampling_state=beam_search_sampling_state,
         constraint_state=sampler_state.constraint_state,
+        constraint_active_tokens=sampler_state.constraint_active_tokens,
         constraint_transitions=sampler_state.constraint_transitions,
         unique_state=sampler_state.unique_state,
         token_bounds_state=sampler_state.token_bounds_state,

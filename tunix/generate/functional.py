@@ -109,6 +109,7 @@ def _apply_constraints_and_forbidden_tokens(
     forbidden_token_ids: jax.Array | None = None,
     constraint_state: jax.Array | None = None,
     constraint_transitions: jax.Array | None = None,
+    constraint_active_tokens: jax.Array | None = None,
     unique_state: constrained.UniqueItemsLoopState | None = None,
     token_bounds_state: constrained.TokenBoundsLoopState | None = None,
 ) -> jax.Array:
@@ -118,7 +119,8 @@ def _apply_constraints_and_forbidden_tokens(
     logits: Shape ``[B, 1, V]``.
     forbidden_token_ids: 1-D int32 array of forbidden vocab indices, or None.
     constraint_state: Per-batch DFA state ``[B]``, or None.
-    constraint_transitions: DFA transition table ``[S, V]``, or None.
+    constraint_transitions: DFA transition table ``[S, K]``, or None.
+    constraint_active_tokens: Active token IDs ``[K]``, or None.
     unique_state: Unique-items loop state, or None.
     token_bounds_state: Token-bounds loop state, or None.
 
@@ -131,12 +133,17 @@ def _apply_constraints_and_forbidden_tokens(
   if forbidden_token_ids is not None:
     logits = logits.at[:, :, forbidden_token_ids].set(-jnp.inf)
 
-  if constraint_transitions is not None and constraint_state is not None:
+  if (
+      constraint_transitions is not None
+      and constraint_state is not None
+      and constraint_active_tokens is not None
+  ):
     if unique_state is not None:
       logits = constrained.constrained_logits_unique(
           logits,
           constraint_state,
           constraint_transitions,
+          constraint_active_tokens,
           unique_state,
           token_bounds_state=token_bounds_state,
       )
@@ -145,6 +152,7 @@ def _apply_constraints_and_forbidden_tokens(
           logits,
           constraint_state,
           constraint_transitions,
+          constraint_active_tokens,
           token_bounds_state=token_bounds_state,
       )
   return logits
@@ -154,6 +162,7 @@ def _advance_constraint_state(
     next_token: jax.Array,
     constraint_state: jax.Array | None,
     constraint_transitions: jax.Array | None,
+    constraint_active_tokens: jax.Array | None,
     unique_state: constrained.UniqueItemsLoopState | None,
     token_bounds_state: constrained.TokenBoundsLoopState | None,
 ) -> tuple[
@@ -162,7 +171,11 @@ def _advance_constraint_state(
     constrained.TokenBoundsLoopState | None,
 ]:
   """Advances DFA + unique + bounds state after selecting ``next_token``."""
-  if constraint_transitions is None or constraint_state is None:
+  if (
+      constraint_transitions is None
+      or constraint_state is None
+      or constraint_active_tokens is None
+  ):
     return constraint_state, unique_state, token_bounds_state
 
   if token_bounds_state is not None:
@@ -175,6 +188,7 @@ def _advance_constraint_state(
         constraint_state,
         next_token,
         constraint_transitions,
+        constraint_active_tokens,
         unique_state,
     )
   else:
@@ -182,6 +196,7 @@ def _advance_constraint_state(
         constraint_state,
         next_token,
         constraint_transitions,
+        constraint_active_tokens,
     )
   return constraint_state, unique_state, token_bounds_state
 
@@ -271,9 +286,9 @@ def generate(
     beam_size: Beam width for beam search.  ``None`` → sampling mode.
     return_logits: If ``True``, accumulate per-step logits.
     return_logprobs: If ``True``, accumulate per-step log-probabilities.
-    return_cache: If ``True``, include the final KV cache in the output.
-      Allows callers to explicitly manage cache lifecycle (keep, delete,
-      or offload to host) rather than having it implicitly freed.
+    return_cache: If ``True``, include the final KV cache in the output. Allows
+      callers to explicitly manage cache lifecycle (keep, delete, or offload to
+      host) rather than having it implicitly freed.
 
   Returns:
     A ``GenerateOutput`` containing generated tokens and optional
@@ -310,12 +325,16 @@ def generate(
     )
 
   constraint_state: jax.Array | None = None
+  constraint_active_tokens: jax.Array | None = None
   constraint_transitions: jax.Array | None = None
   unique_state: constrained.UniqueItemsLoopState | None = None
   token_bounds_state: constrained.TokenBoundsLoopState | None = None
   if constraint_tables is not None:
     constraint_state = jnp.full(
         (batch_size,), constraint_tables.initial_state, dtype=jnp.int32
+    )
+    constraint_active_tokens = jnp.array(
+        constraint_tables.active_tokens, dtype=jnp.int32
     )
     constraint_transitions = jnp.array(
         constraint_tables.token_transitions, dtype=jnp.int32
@@ -420,6 +439,7 @@ def generate(
       forbidden_token_ids=forbidden_token_ids,
       constraint_state=constraint_state,
       constraint_transitions=constraint_transitions,
+      constraint_active_tokens=constraint_active_tokens,
       unique_state=unique_state,
       token_bounds_state=token_bounds_state,
   )
@@ -468,6 +488,7 @@ def generate(
           first_token,
           constraint_state=constraint_state,
           constraint_transitions=constraint_transitions,
+          constraint_active_tokens=constraint_active_tokens,
           unique_state=unique_state,
           token_bounds_state=token_bounds_state,
       )
@@ -524,6 +545,7 @@ def generate(
         forbidden_token_ids=forbidden_token_ids,
         constraint_state=state.constraint_state,
         constraint_transitions=constraint_transitions,
+        constraint_active_tokens=constraint_active_tokens,
         unique_state=state.unique_state,
         token_bounds_state=state.token_bounds_state,
     )
@@ -582,6 +604,7 @@ def generate(
             next_token,
             constraint_state=state.constraint_state,
             constraint_transitions=constraint_transitions,
+            constraint_active_tokens=constraint_active_tokens,
             unique_state=state.unique_state,
             token_bounds_state=state.token_bounds_state,
         )

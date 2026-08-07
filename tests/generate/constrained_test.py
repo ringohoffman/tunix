@@ -298,7 +298,7 @@ class ConstrainedSamplerTest(parameterized.TestCase):
         constraint, token_id_to_str=sampler.tokenizer.token_id_to_str
     )
     self.assertEqual(diag["num_states"], constraint.num_states)
-    self.assertEqual(diag["vocab_size"], vocab.GetPieceSize())
+    self.assertEqual(diag["vocab_size"], len(constraint.active_tokens))
     self.assertIsInstance(diag["per_state"], list)
     self.assertIsInstance(diag["dead_end_states"], list)
 
@@ -308,9 +308,10 @@ class ConstrainedSamplerTest(parameterized.TestCase):
 
     self.assertEqual(
         constraint.token_transitions.shape,
-        (constraint.num_states, vocab.GetPieceSize()),
+        (constraint.num_states, len(constraint.active_tokens)),
     )
     self.assertEqual(constraint.token_transitions.dtype, np.int32)
+    self.assertEqual(constraint.active_tokens.dtype, np.int32)
     self.assertGreater(constraint.num_states, 0)
     self.assertLen(constraint.accept_states, 1)  # single accept state
 
@@ -504,7 +505,13 @@ class RegexEngineTest(absltest.TestCase):
     # Trace ["spam"] through the transition table.
     state = tables.initial_state
     for tok in [0, 2, 5, 2, 1]:  # [, ", spam, ", ]
-      state = tt[state, tok]
+      idx = np.searchsorted(tables.active_tokens, tok)
+      state = (
+          tt[state, idx]
+          if idx < len(tables.active_tokens)
+          and tables.active_tokens[idx] == tok
+          else constrained.INVALID_STATE
+      )
       self.assertNotEqual(
           state, constrained.INVALID_STATE, f"Failed at token {tok}"
       )
@@ -513,15 +520,20 @@ class RegexEngineTest(absltest.TestCase):
     # Trace ["none", "gore"] — multi-category.
     state = tables.initial_state
     for tok in [0, 2, 4, 2, 3, 2, 6, 2, 1]:
-      state = tt[state, tok]
+      idx = np.searchsorted(tables.active_tokens, tok)
+      state = (
+          tt[state, idx]
+          if idx < len(tables.active_tokens)
+          and tables.active_tokens[idx] == tok
+          else constrained.INVALID_STATE
+      )
       self.assertNotEqual(
           state, constrained.INVALID_STATE, f"Failed at token {tok}"
       )
     self.assertIn(state, tables.accept_states)
 
-    # 'hello' should be invalid from all states.
-    for s in range(tables.num_states):
-      self.assertEqual(tt[s, 7], constrained.INVALID_STATE)
+    # 'hello' (token 7) should not be an active token
+    self.assertNotIn(7, tables.active_tokens)
 
   def test_verify_fast_forward_multi_char_analysis(self):
     """Verify multi-character fast-forward state identification and transitions."""
@@ -558,7 +570,8 @@ class RegexEngineTest(absltest.TestCase):
     valid_mask = tables.token_transitions != constrained.INVALID_STATE
     ff_map = {}
     for state in range(tables.num_states):
-      valid_tids = np.where(valid_mask[state])[0]
+      valid_col_indices = np.where(valid_mask[state])[0]
+      valid_tids = [tables.active_tokens[c] for c in valid_col_indices]
       multi_char = [t for t in valid_tids if len(vocab_map.get(int(t), "")) > 1]
       if multi_char:
         best_tid = max(multi_char, key=lambda t: len(vocab_map.get(int(t), "")))
@@ -569,7 +582,8 @@ class RegexEngineTest(absltest.TestCase):
     init_s = tables.initial_state
     self.assertIn(init_s, ff_map)
     # Fast forward from initial state advances DFA
-    next_s = tables.token_transitions[init_s, ff_map[init_s]]
+    best_col = np.searchsorted(tables.active_tokens, ff_map[init_s])
+    next_s = tables.token_transitions[init_s, best_col]
     self.assertNotEqual(next_s, constrained.INVALID_STATE)
 
   def test_constrained_logits_jit(self):
@@ -582,10 +596,13 @@ class RegexEngineTest(absltest.TestCase):
         eos_token_ids=[2],
     )
     jax_tt = jnp.array(tables.token_transitions)
+    active_toks = jnp.array(tables.active_tokens, dtype=jnp.int32)
     logits = jnp.ones((1, 1, 3))
     states = jnp.array([tables.initial_state], dtype=jnp.int32)
 
-    result = jax.jit(constrained.constrained_logits)(logits, states, jax_tt)
+    result = jax.jit(constrained.constrained_logits)(
+        logits, states, jax_tt, active_toks
+    )
     self.assertEqual(result.shape, (1, 1, 3))
 
   def test_while_loop_compatible(self):
@@ -598,13 +615,16 @@ class RegexEngineTest(absltest.TestCase):
         eos_token_ids=[2],
     )
     jax_tt = jnp.array(tables.token_transitions)
+    active_toks = jnp.array(tables.active_tokens, dtype=jnp.int32)
     target = jnp.array([0, 1, 2])  # a, b, EOS
     n = len(target)
 
     def body(carry):
       state, step, buf = carry
       tok = target[step]
-      new_state = constrained.advance_state(state[None], tok[None], jax_tt)[0]
+      new_state = constrained.advance_state(
+          state[None], tok[None], jax_tt, active_toks
+      )[0]
       buf = buf.at[step].set(tok)
       return new_state, step + 1, buf
 
@@ -942,6 +962,7 @@ class RegexEngineTest(absltest.TestCase):
     self.assertEqual(tables.num_states, 29)
 
     tt = jnp.array(tables.token_transitions, dtype=jnp.int32)
+    active_toks = jnp.array(tables.active_tokens, dtype=jnp.int32)
     unique_state = constrained.init_unique_items_loop_state(
         unique, batch_size=1
     )
@@ -950,7 +971,7 @@ class RegexEngineTest(absltest.TestCase):
     # Generate ["apple", and advance state + seen_mask
     for tok in [0, 4, 2, 3]:  # [, "apple", ,, ' '
       state, unique_state = constrained.advance_state_unique(
-          state, jnp.array([tok]), tt, unique_state
+          state, jnp.array([tok]), tt, active_toks, unique_state
       )
     self.assertEqual(int(unique_state.seen_mask[0]), 0b001)
 
@@ -958,7 +979,7 @@ class RegexEngineTest(absltest.TestCase):
     # "banana" (5) & "cherry" (6) valid
     logits = jnp.zeros((1, 1, vocab_size))
     masked = constrained.constrained_logits_unique(
-        logits, state, tt, unique_state
+        logits, state, tt, active_toks, unique_state
     )
     valid = jnp.where(masked[0, 0] > -jnp.inf)[0].tolist()
     self.assertNotIn(4, valid)
@@ -967,13 +988,14 @@ class RegexEngineTest(absltest.TestCase):
 
     # Pick "banana", check that at after-item, ] is allowed (count=2 >= min=2)
     state, unique_state = constrained.advance_state_unique(
-        state, jnp.array([5]), tt, unique_state
+        state, jnp.array([5]), tt, active_toks, unique_state
     )
     self.assertEqual(int(unique_state.seen_mask[0]), 0b011)
     masked2 = constrained.constrained_logits_unique(
         jnp.zeros((1, 1, vocab_size)),
         state,
         tt,
+        active_toks,
         unique_state,
     )
     valid2 = jnp.where(masked2[0, 0] > -jnp.inf)[0].tolist()
@@ -983,15 +1005,16 @@ class RegexEngineTest(absltest.TestCase):
     # Continue with "," and " ", check at next boundary only "cherry" (6) is
     # valid
     state, unique_state = constrained.advance_state_unique(
-        state, jnp.array([2]), tt, unique_state
+        state, jnp.array([2]), tt, active_toks, unique_state
     )
     state, unique_state = constrained.advance_state_unique(
-        state, jnp.array([3]), tt, unique_state
+        state, jnp.array([3]), tt, active_toks, unique_state
     )
     masked3 = constrained.constrained_logits_unique(
         jnp.zeros((1, 1, vocab_size)),
         state,
         tt,
+        active_toks,
         unique_state,
     )
     valid3 = jnp.where(masked3[0, 0] > -jnp.inf)[0].tolist()
@@ -1021,6 +1044,7 @@ class RegexEngineTest(absltest.TestCase):
     )
     unique = tables.unique_items
     tt = jnp.array(tables.token_transitions, dtype=jnp.int32)
+    active_toks = jnp.array(tables.active_tokens, dtype=jnp.int32)
     unique_state = constrained.init_unique_items_loop_state(
         unique, batch_size=1
     )
@@ -1029,13 +1053,13 @@ class RegexEngineTest(absltest.TestCase):
     # 1. Advance through "[" and '"apple"' -> count = 1 (< min_items=2)
     for tok in [0, 4]:
       state, unique_state = constrained.advance_state_unique(
-          state, jnp.array([tok]), tt, unique_state
+          state, jnp.array([tok]), tt, active_toks, unique_state
       )
     self.assertEqual(int(unique_state.seen_mask[0]), 0b0001)
 
     # At count=1, ']' (1) must be BLOCKED because min_items=2; ',' (2) must be allowed
     masked1 = constrained.constrained_logits_unique(
-        jnp.zeros((1, 1, vocab_size)), state, tt, unique_state
+        jnp.zeros((1, 1, vocab_size)), state, tt, active_toks, unique_state
     )
     valid1 = jnp.where(masked1[0, 0] > -jnp.inf)[0].tolist()
     self.assertNotIn(1, valid1, "']' should be blocked when count < min_items")
@@ -1044,13 +1068,13 @@ class RegexEngineTest(absltest.TestCase):
     # 2. Advance through "," and " " and '"banana"' -> count = 2 (== max_items=2)
     for tok in [2, 3, 5]:
       state, unique_state = constrained.advance_state_unique(
-          state, jnp.array([tok]), tt, unique_state
+          state, jnp.array([tok]), tt, active_toks, unique_state
       )
     self.assertEqual(int(unique_state.seen_mask[0]), 0b0011)
 
     # At count=2, ']' (1) must be ALLOWED (min_items satisfied); ',' (2) must be BLOCKED (max_items reached)
     masked2 = constrained.constrained_logits_unique(
-        jnp.zeros((1, 1, vocab_size)), state, tt, unique_state
+        jnp.zeros((1, 1, vocab_size)), state, tt, active_toks, unique_state
     )
     valid2 = jnp.where(masked2[0, 0] > -jnp.inf)[0].tolist()
     self.assertIn(1, valid2, "']' should be allowed when count >= min_items")
@@ -1089,6 +1113,7 @@ class RegexEngineTest(absltest.TestCase):
         eos_token_ids=[],
     )
     tt = jnp.array(tables.token_transitions, dtype=jnp.int32)
+    active_toks = jnp.array(tables.active_tokens, dtype=jnp.int32)
     unique = tables.unique_items
     init_u = constrained.init_unique_items_loop_state(unique, batch_size=1)
 
@@ -1100,7 +1125,7 @@ class RegexEngineTest(absltest.TestCase):
     # [ " apple ",  <-- tokens 0, 4, 7, 5 (the last one spans completion+comma)
     for tok in [0, 4, 7, 5]:
       state, u = constrained.advance_state_unique(
-          state, jnp.array([tok]), tt, u
+          state, jnp.array([tok]), tt, active_toks, u
       )
     # "apple" should be marked as seen even though completion happened mid-token
     self.assertNotEqual(
@@ -1115,7 +1140,7 @@ class RegexEngineTest(absltest.TestCase):
     # ' "' (token 6) then banana (token 8) then '",' (token 5)
     for tok in [6, 8, 5]:
       state, u = constrained.advance_state_unique(
-          state, jnp.array([tok]), tt, u
+          state, jnp.array([tok]), tt, active_toks, u
       )
     self.assertEqual(
         int(u.seen_mask[0]) & 0b011,
@@ -1125,9 +1150,13 @@ class RegexEngineTest(absltest.TestCase):
 
     # At this point, only "cherry" should be valid.  Verify via logits masking.
     # After '",' we need ' "' (token 6) to start the next item.
-    state, u = constrained.advance_state_unique(state, jnp.array([6]), tt, u)
+    state, u = constrained.advance_state_unique(
+        state, jnp.array([6]), tt, active_toks, u
+    )
     logits = jnp.zeros((1, 1, vocab_size))
-    masked = constrained.constrained_logits_unique(logits, state, tt, u)
+    masked = constrained.constrained_logits_unique(
+        logits, state, tt, active_toks, u
+    )
     valid = jnp.where(masked[0, 0] > -jnp.inf)[0].tolist()
 
     # "cherry" (9) should be allowed; "apple" (7) and "banana" (8) should be blocked
@@ -1177,6 +1206,7 @@ class RegexEngineTest(absltest.TestCase):
         eos_token_ids=[],
     )
     tt = jnp.array(tables.token_transitions, dtype=jnp.int32)
+    active_toks = jnp.array(tables.active_tokens, dtype=jnp.int32)
     init_unique = constrained.init_unique_items_loop_state(
         tables.unique_items, batch_size=1
     )
@@ -1194,13 +1224,13 @@ class RegexEngineTest(absltest.TestCase):
       logits = jnp.zeros((1, 1, vocab_size))
       dfa_st_arr = jnp.array([dfa_st], dtype=jnp.int32)
       masked = constrained.constrained_logits_unique(
-          logits, dfa_st_arr, tt, u_state
+          logits, dfa_st_arr, tt, active_toks, u_state
       )
       valid_tokens = jnp.where(masked[0, 0] > -jnp.inf)[0].tolist()
 
       for next_tok in valid_tokens:
         next_dfa_arr, next_u_state = constrained.advance_state_unique(
-            dfa_st_arr, jnp.array([next_tok]), tt, u_state
+            dfa_st_arr, jnp.array([next_tok]), tt, active_toks, u_state
         )
         stack.append(
             (int(next_dfa_arr[0]), next_u_state, tok_history + [next_tok])
@@ -1243,6 +1273,7 @@ class RegexEngineTest(absltest.TestCase):
         eos_token_ids=[],
     )
     tt = jnp.array(tables.token_transitions, dtype=jnp.int32)
+    active_toks = jnp.array(tables.active_tokens, dtype=jnp.int32)
     init_unique = constrained.init_unique_items_loop_state(
         tables.unique_items, batch_size=1
     )
@@ -1261,13 +1292,13 @@ class RegexEngineTest(absltest.TestCase):
       logits = jnp.zeros((1, 1, vocab_size))
       dfa_st_arr = jnp.array([dfa_st], dtype=jnp.int32)
       masked = constrained.constrained_logits_unique(
-          logits, dfa_st_arr, tt, u_state
+          logits, dfa_st_arr, tt, active_toks, u_state
       )
       valid_tokens = jnp.where(masked[0, 0] > -jnp.inf)[0].tolist()
 
       for next_tok in valid_tokens:
         next_dfa_arr, next_u_state = constrained.advance_state_unique(
-            dfa_st_arr, jnp.array([next_tok]), tt, u_state
+            dfa_st_arr, jnp.array([next_tok]), tt, active_toks, u_state
         )
         stack.append(
             (int(next_dfa_arr[0]), next_u_state, tok_history + [next_tok])
@@ -1547,7 +1578,9 @@ class RegexEngineTest(absltest.TestCase):
     # 2 states: state 0 (non-accept), state 1 (accept)
     # Vocab size 2: token 0 -> state 0, token 1 -> state 1 (accept)
     tt = np.array([[0, 1], [1, 1]], dtype=np.int32)
+    active_tokens = np.array([0, 1], dtype=np.int32)
     tables = constrained.ConstraintTables(
+        active_tokens=active_tokens,
         token_transitions=tt,
         initial_state=0,
         num_states=2,
@@ -1559,6 +1592,7 @@ class RegexEngineTest(absltest.TestCase):
 
     logits = jnp.zeros((1, 1, 2), dtype=jnp.float32)
     state = jnp.array([0], dtype=jnp.int32)
+    active_tokens_jax = jnp.array(active_tokens, dtype=jnp.int32)
 
     # Step 0 (< min_tokens=2): token 1 (accept transition) should be masked
     bounds_state_0 = constrained.TokenBoundsLoopState(
@@ -1569,7 +1603,7 @@ class RegexEngineTest(absltest.TestCase):
         max_tokens=4,
     )
     masked_0 = constrained.constrained_logits(
-        logits, state, tt, token_bounds_state=bounds_state_0
+        logits, state, tt, active_tokens_jax, token_bounds_state=bounds_state_0
     )
     self.assertTrue(jnp.isinf(masked_0[0, 0, 1]))
     self.assertEqual(masked_0[0, 0, 0], 0.0)
@@ -1583,7 +1617,7 @@ class RegexEngineTest(absltest.TestCase):
         max_tokens=4,
     )
     masked_4 = constrained.constrained_logits(
-        logits, state, tt, token_bounds_state=bounds_state_4
+        logits, state, tt, active_tokens_jax, token_bounds_state=bounds_state_4
     )
     self.assertTrue(jnp.isinf(masked_4[0, 0, 0]))
     self.assertEqual(masked_4[0, 0, 1], 0.0)
@@ -1603,6 +1637,7 @@ class RegexEngineTest(absltest.TestCase):
 
     # Simulate generation paths
     tt = jnp.array(tables.token_transitions, dtype=jnp.int32)
+    active_tokens_jax = jnp.array(tables.active_tokens, dtype=jnp.int32)
     init_bounds = constrained.init_token_bounds_loop_state(tables, batch_size=1)
     stack = [(tables.initial_state, init_bounds, [])]
     accepted_histories = []
@@ -1623,13 +1658,15 @@ class RegexEngineTest(absltest.TestCase):
           logits,
           c_state,
           tt,
+          active_tokens_jax,
           token_bounds_state=bounds_st,
       )
       valid_next_tokens = jnp.where(masked[0, 0] > -jnp.inf)[0].tolist()
 
       next_bounds_st = constrained.advance_token_bounds_state(bounds_st)
       for tok in valid_next_tokens:
-        next_state = int(tt[curr_state, tok])
+        tok_idx = int(np.searchsorted(tables.active_tokens, tok))
+        next_state = int(tt[curr_state, tok_idx])
         stack.append((next_state, next_bounds_st, history + [tok]))
 
     # PROOF 1: Every accepted path has at least min_tokens (2)
@@ -1694,6 +1731,40 @@ class RegexEngineTest(absltest.TestCase):
     has_force = np.any(tables.force_accept_mask, axis=1)
     # The initial state must have force-accept paths leading toward acceptance
     self.assertTrue(has_force[tables.initial_state])
+
+  def test_compact_constraint_tables_properties(self):
+    """Test that ConstraintTables is compact by definition."""
+    vocab_map = {
+        0: "Safe",
+        1: "Unsafe",
+        2: "Bullying",
+        3: "\n",
+        4: "<turn|>",
+        5: "random",
+        6: "token",
+    }
+    token_id_to_str = {i: vocab_map.get(i, f"tok_{i}") for i in range(100)}
+    tables = constrained.build_unique_items_constraint(
+        choices=["Safe", "Unsafe", "Bullying"],
+        min_items=1,
+        max_items=3,
+        token_id_to_str=token_id_to_str,
+        vocab_size=100,
+        eos_token_ids=[4],
+    )
+
+    self.assertIsInstance(tables, constrained.ConstraintTables)
+    self.assertLess(len(tables.active_tokens), 100)
+    self.assertGreater(len(tables.active_tokens), 0)
+    self.assertEqual(
+        tables.token_transitions.shape,
+        (tables.num_states, len(tables.active_tokens)),
+    )
+    self.assertIsNotNone(tables.unique_items)
+    self.assertEqual(
+        tables.unique_items.token_completions.shape,
+        (tables.num_states, len(tables.active_tokens)),
+    )
 
 
 if __name__ == "__main__":

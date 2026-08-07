@@ -724,11 +724,11 @@ def _compile_token_transitions(
     token_id_to_str: Mapping[int, str],
     vocab_size: int,
     eos_token_ids: Sequence[int],
-) -> np.ndarray:
-  """Compile character-level DFA transitions into a token-level table.
+) -> tuple[np.ndarray, np.ndarray]:
+  """Compile character-level DFA transitions into a compact token-level table.
 
-  Uses a Numba JIT kernel to simulate all (state, token) transitions in
-  compiled code, eliminating Python loop overhead for 256k+ vocabularies.
+  Uses a Numba JIT kernel to simulate all (state, token) transitions and
+  returns only the active token IDs and their compact transitions table.
   """
   table = np.full((num_states, vocab_size), INVALID_STATE, dtype=np.int32)
   eos_set = set(eos_token_ids)
@@ -766,33 +766,36 @@ def _compile_token_transitions(
     byte_chunks.append(encoded)
     total_bytes += len(encoded)
 
-  if total_bytes == 0:
-    return table
+  if total_bytes > 0:
+    token_bytes_flat = np.frombuffer(b"".join(byte_chunks), dtype=np.uint8)
+    _simulate_tokens_numba(
+        char_table,
+        token_bytes_flat,
+        token_offsets,
+        token_lengths,
+        table,
+        num_states,
+        vocab_size,
+    )
 
-  token_bytes_flat = np.frombuffer(b"".join(byte_chunks), dtype=np.uint8)
-
-  # 3. Run Numba JIT kernel
-  _simulate_tokens_numba(
-      char_table,
-      token_bytes_flat,
-      token_offsets,
-      token_lengths,
-      table,
-      num_states,
-      vocab_size,
-  )
-
-  return table
+  active_mask = (table != INVALID_STATE).any(axis=0)
+  active_tokens = np.where(active_mask)[0].astype(np.int32)
+  compact_table = table[:, active_tokens]
+  return active_tokens, compact_table
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
 class ConstraintTables:
-  """Pre-compiled constraint tables for regex-guided decoding.
+  """Pre-compiled compact constraint tables for regex-guided decoding.
 
   Attributes:
-      token_transitions: Array of shape ``(num_states, vocab_size)`` with dtype
-        ``int32``. Entry ``[s, t]`` is the DFA state after processing token
-        ``t`` from state ``s``, or ``INVALID_STATE`` if the token is forbidden.
+      active_tokens: Array of shape ``(num_active_tokens,)`` with dtype
+        ``int32`` containing the sorted token IDs that trigger valid DFA
+        transitions.
+      token_transitions: Array of shape ``(num_states, num_active_tokens)`` with
+        dtype ``int32``. Entry ``[s, k]`` is the DFA state after processing
+        token ``active_tokens[k]`` from state ``s``, or ``INVALID_STATE`` if
+        forbidden.
       initial_state: The DFA start state.
       num_states: Total number of DFA states.
       accept_states: Set of accepting DFA state ids.
@@ -800,13 +803,14 @@ class ConstraintTables:
         enforcing uniqueItems.
       min_tokens: Minimum tokens to generate before accepting state is allowed.
       max_tokens: Maximum tokens allowed after which accepting state is forced.
-      accept_mask: Optional boolean array [num_states, vocab_size] indicating
-        transitions that enter an accept state.
-      force_accept_mask: Optional boolean array [num_states, vocab_size]
+      accept_mask: Optional boolean array [num_states, num_active_tokens]
+        indicating transitions that enter an accept state.
+      force_accept_mask: Optional boolean array [num_states, num_active_tokens]
         indicating transitions that move closer to an accept state.
   """
 
-  token_transitions: np.ndarray  # [num_states, vocab_size], int32
+  active_tokens: np.ndarray  # [num_active_tokens], int32
+  token_transitions: np.ndarray  # [num_states, num_active_tokens], int32
   initial_state: int
   num_states: int
   accept_states: frozenset[int]
@@ -815,6 +819,14 @@ class ConstraintTables:
   max_tokens: int | None = None
   accept_mask: np.ndarray | None = None
   force_accept_mask: np.ndarray | None = None
+
+  def dense_token_transitions(self, vocab_size: int) -> np.ndarray:
+    """Reconstruct dense [num_states, vocab_size] transition matrix if needed."""
+    dense = np.full(
+        (self.num_states, vocab_size), INVALID_STATE, dtype=np.int32
+    )
+    dense[:, self.active_tokens] = self.token_transitions
+    return dense
 
 
 _TOKEN_QUANTIFIER_RE = re.compile(r"\{\{(\d*)(?:,(\d*))?\}\}")
@@ -964,7 +976,9 @@ def diagnose_constraint_tables(
     row = tt[state]
     valid_mask = row != INVALID_STATE
     valid_count = int(valid_mask.sum())
-    valid_tids = list(np.where(valid_mask)[0])
+    valid_tids = [
+        int(tables.active_tokens[idx]) for idx in np.where(valid_mask)[0]
+    ]
 
     examples = []
     if token_id_to_str is not None:
@@ -987,7 +1001,7 @@ def diagnose_constraint_tables(
 
   return {
       "num_states": num_states,
-      "vocab_size": vocab_size,
+      "vocab_size": len(tables.active_tokens),
       "accept_states": sorted(tables.accept_states),
       "dead_end_states": dead_end_states,
       "per_state": per_state,
@@ -1435,16 +1449,16 @@ def init_token_bounds_loop_state(
     return None
 
   num_states = tables.num_states
-  vocab_size = tables.token_transitions.shape[1]
+  num_active = len(tables.active_tokens)
   accept_mask = (
       jnp.array(tables.accept_mask, dtype=jnp.bool_)
       if tables.accept_mask is not None
-      else jnp.zeros((num_states, vocab_size), dtype=jnp.bool_)
+      else jnp.zeros((num_states, num_active), dtype=jnp.bool_)
   )
   force_accept_mask = (
       jnp.array(tables.force_accept_mask, dtype=jnp.bool_)
       if tables.force_accept_mask is not None
-      else jnp.zeros((num_states, vocab_size), dtype=jnp.bool_)
+      else jnp.zeros((num_states, num_active), dtype=jnp.bool_)
   )
   return TokenBoundsLoopState(
       count=jnp.zeros((batch_size,), dtype=jnp.int32),
@@ -1684,8 +1698,8 @@ def build_unique_items_constraint(
       max_items,
   )
 
-  # Compile token-level transitions (reuse existing compiler).
-  token_transitions = _compile_token_transitions(
+  # Compile compact token-level transitions (reuse existing compiler).
+  active_tokens, token_transitions = _compile_token_transitions(
       char_transitions,
       num_states,
       accept_states,
@@ -1760,7 +1774,6 @@ def build_unique_items_constraint(
   )
 
   eos_set = set(eos_token_ids)
-  all_states = np.arange(num_states, dtype=np.int32)
   # Pre-compute item completion bitmasks for each state
   has_completion = item_completion_map >= 0
   item_bitmask = np.where(
@@ -1769,17 +1782,18 @@ def build_unique_items_constraint(
       np.int32(0),
   )
 
-  # Pre-encode token bytes for Numba kernel (reuse trigger-byte filter)
+  # Pre-encode only active token bytes for Numba kernel
   byte_chunks: list[bytes] = []
-  tc_token_offsets = np.zeros(vocab_size, dtype=np.int32)
-  tc_token_lengths = np.zeros(vocab_size, dtype=np.int32)
+  num_active = len(active_tokens)
+  tc_token_offsets = np.zeros(num_active, dtype=np.int32)
+  tc_token_lengths = np.zeros(num_active, dtype=np.int32)
   total_bytes = 0
   trigger_bytes_arr = np.array(sorted(item_completion_bytes), dtype=np.uint8)
 
-  for token_id in range(vocab_size):
+  for idx, token_id in enumerate(active_tokens):
     if token_id in eos_set:
       continue
-    token_str = token_id_to_str.get(token_id)
+    token_str = token_id_to_str.get(int(token_id))
     if not token_str:
       continue
     encoded = token_str.encode("utf-8", errors="replace")
@@ -1787,12 +1801,12 @@ def build_unique_items_constraint(
         b in item_completion_bytes for b in encoded
     ):
       continue
-    tc_token_offsets[token_id] = total_bytes
-    tc_token_lengths[token_id] = len(encoded)
+    tc_token_offsets[idx] = total_bytes
+    tc_token_lengths[idx] = len(encoded)
     byte_chunks.append(encoded)
     total_bytes += len(encoded)
 
-  token_completions = np.zeros((num_states, vocab_size), dtype=np.int32)
+  token_completions = np.zeros((num_states, num_active), dtype=np.int32)
   if total_bytes > 0:
     tc_bytes_flat = np.frombuffer(b"".join(byte_chunks), dtype=np.uint8)
     _simulate_token_completions_numba(
@@ -1803,15 +1817,13 @@ def build_unique_items_constraint(
         item_bitmask,
         token_completions,
         num_states,
-        vocab_size,
+        num_active,
     )
 
   # Build leads_to_close and leads_to_continue at token level.
   # These are computed for ALL states, not just after-item states, because
   # multi-character tokens can span from mid-item through completion to the
   # separator or closing bracket.
-  valid_trans = token_transitions != INVALID_STATE
-  safe_next = np.where(valid_trans, token_transitions, 0)
   needs_enforcement = is_after_item[:, None] | (token_completions != 0)
   leads_to_close = valid_trans & needs_enforcement & is_done[safe_next]
   leads_to_continue = (
@@ -1832,6 +1844,7 @@ def build_unique_items_constraint(
   )
 
   return ConstraintTables(
+      active_tokens=active_tokens,
       token_transitions=token_transitions,
       initial_state=initial_state,
       num_states=num_states,
@@ -1940,17 +1953,23 @@ def _chain_constraints_uncached(
     offsets.append(current_offset)
     current_offset += stage.num_states
 
+  all_active_tokens = np.unique(
+      np.concatenate([stage.active_tokens for stage in compiled_stages])
+  ).astype(np.int32)
+  num_active = len(all_active_tokens)
+
   combined_token_transitions = np.full(
-      (total_states, vocab_size), INVALID_STATE, dtype=np.int32
+      (total_states, num_active), INVALID_STATE, dtype=np.int32
   )
 
   for stage_index, stage in enumerate(compiled_stages):
     offset = offsets[stage_index]
     stt = stage.token_transitions
+    stage_cols = np.searchsorted(all_active_tokens, stage.active_tokens)
     valid = stt != INVALID_STATE
-    combined_token_transitions[offset : offset + stage.num_states] = np.where(
-        valid, stt + offset, INVALID_STATE
-    )
+    combined_token_transitions[
+        offset : offset + stage.num_states, stage_cols
+    ] = np.where(valid, stt + offset, INVALID_STATE)
 
   for stage_index in range(len(compiled_stages) - 1):
     current_stage = compiled_stages[stage_index]
@@ -1958,15 +1977,16 @@ def _chain_constraints_uncached(
     current_offset = offsets[stage_index]
     next_offset = offsets[stage_index + 1]
 
+    next_cols = np.searchsorted(all_active_tokens, next_stage.active_tokens)
     next_init_row = next_stage.token_transitions[next_stage.initial_state]
     next_valid = next_init_row != INVALID_STATE
 
     for accept_state in current_stage.accept_states:
       global_accept_state = current_offset + accept_state
-      combined_token_transitions[global_accept_state] = np.where(
+      combined_token_transitions[global_accept_state, next_cols] = np.where(
           next_valid,
           next_offset + next_init_row,
-          combined_token_transitions[global_accept_state],
+          combined_token_transitions[global_accept_state, next_cols],
       )
 
   initial_state = offsets[0] + compiled_stages[0].initial_state
@@ -1981,18 +2001,19 @@ def _chain_constraints_uncached(
     if stage.unique_items is not None:
       unique_items = stage.unique_items
       offset = offsets[stage_index]
+      stage_cols = np.searchsorted(all_active_tokens, stage.active_tokens)
       if unique_info is None:
         chained_token_completions = np.zeros(
-            (total_states, vocab_size), dtype=np.int32
+            (total_states, num_active), dtype=np.int32
         )
         chained_can_lead_to_items = np.zeros(
-            (total_states, vocab_size), dtype=np.int32
+            (total_states, num_active), dtype=np.int32
         )
         chained_leads_to_close = np.zeros(
-            (total_states, vocab_size), dtype=bool
+            (total_states, num_active), dtype=bool
         )
         chained_leads_to_continue = np.zeros(
-            (total_states, vocab_size), dtype=bool
+            (total_states, num_active), dtype=bool
         )
         unique_min_items = unique_items.min_items
         unique_max_items = unique_items.max_items
@@ -2006,18 +2027,18 @@ def _chain_constraints_uncached(
         unique_max_items = unique_items.max_items
         unique_num_items = unique_items.num_items
 
-      chained_token_completions[offset : offset + stage.num_states, :] = (
-          unique_items.token_completions
-      )
-      chained_can_lead_to_items[offset : offset + stage.num_states, :] = (
-          unique_items.can_lead_to_items
-      )
-      chained_leads_to_close[offset : offset + stage.num_states, :] = (
+      chained_token_completions[
+          offset : offset + stage.num_states, stage_cols
+      ] = unique_items.token_completions
+      chained_can_lead_to_items[
+          offset : offset + stage.num_states, stage_cols
+      ] = unique_items.can_lead_to_items
+      chained_leads_to_close[offset : offset + stage.num_states, stage_cols] = (
           unique_items.leads_to_close
       )
-      chained_leads_to_continue[offset : offset + stage.num_states, :] = (
-          unique_items.leads_to_continue
-      )
+      chained_leads_to_continue[
+          offset : offset + stage.num_states, stage_cols
+      ] = unique_items.leads_to_continue
 
       unique_info = UniqueItemsConstraint(
           token_completions=chained_token_completions,
@@ -2038,6 +2059,7 @@ def _chain_constraints_uncached(
   max_tokens = min(max_tokens_list) if max_tokens_list else None
 
   tables = ConstraintTables(
+      active_tokens=all_active_tokens,
       token_transitions=combined_token_transitions,
       initial_state=initial_state,
       num_states=total_states,
@@ -2183,21 +2205,22 @@ def constrained_logits_unique(
     logits: jnp.ndarray,
     constraint_state: jnp.ndarray,
     token_transitions: jnp.ndarray,
+    active_tokens: jnp.ndarray,
     unique_state: UniqueItemsLoopState,
     token_bounds_state: TokenBoundsLoopState | None = None,
 ) -> jnp.ndarray:
   """Mask logits enforcing both structural DFA and uniqueness constraints.
 
-  All uniqueness metadata is token-level ``[S, V]`` to correctly handle
-  multi-character tokens that span item boundaries.  No state-level gates
-  are used.
+  Uses compact token-level tables of shape ``[S, K]`` where ``K`` is the number
+  of active tokens, significantly speeding up masking and reducing memory.
 
   Pure JAX, safe for ``jax.lax.while_loop``.
 
   Args:
       logits: Shape ``[B, 1, V]``.
       constraint_state: Shape ``[B]``, current DFA state.
-      token_transitions: Shape ``[S, V]``, structural DFA transitions.
+      token_transitions: Shape ``[S, K]``, compact structural DFA transitions.
+      active_tokens: Shape ``[K]``, sorted active token IDs.
       unique_state: Bundled unique-items loop state.
       token_bounds_state: Optional TokenBoundsLoopState carrying dynamic step
         counts and static masks.
@@ -2205,9 +2228,9 @@ def constrained_logits_unique(
   Returns:
       Masked logits, same shape as input.
   """
-  # 1. Structural DFA constraint (same as constrained_logits).
-  allowed_next = token_transitions[constraint_state]  # [B, V]
-  structural_mask = allowed_next != INVALID_STATE  # [B, V]
+  # 1. Structural DFA constraint on active tokens [B, K]
+  allowed_next = token_transitions[constraint_state]  # [B, K]
+  structural_mask = allowed_next != INVALID_STATE  # [B, K]
 
   if token_bounds_state is not None:
     if token_bounds_state.min_tokens > 0:
@@ -2226,60 +2249,69 @@ def constrained_logits_unique(
           max_force, structural_mask & force_mask_curr, structural_mask
       )
 
-  # 2. Uniqueness constraint — token-level, no state-level gates.
-  # Block tokens that can ONLY lead to already-seen items.
-  cli = unique_state.can_lead_to_items[constraint_state]  # [B, V] bitmasks
-  # remaining = items this token can lead to that are NOT yet seen
-  remaining = cli & ~unique_state.seen_mask[:, None]  # [B, V]
-  # Block if: token leads to some item AND no unseen item reachable
+  # 2. Uniqueness constraint — token-level on active tokens [B, K]
+  cli = unique_state.can_lead_to_items[constraint_state]  # [B, K] bitmasks
+  remaining = cli & ~unique_state.seen_mask[:, None]  # [B, K]
   uniqueness_block = (cli != 0) & (remaining == 0)
 
-  # 3. Min/max enforcement — token-level, no state-level gates.
+  # 3. Min/max enforcement on active tokens [B, K]
   count = jax.lax.population_count(unique_state.seen_mask)  # [B]
-  ltc = unique_state.leads_to_close[constraint_state]  # [B, V]
-  ltk = unique_state.leads_to_continue[constraint_state]  # [B, V]
-  # Block close-path tokens if count < min_items
+  ltc = unique_state.leads_to_close[constraint_state]  # [B, K]
+  ltk = unique_state.leads_to_continue[constraint_state]  # [B, K]
   close_block = ltc & (count < unique_state.min_items)[:, None]
-  # Block continue-path tokens if count >= max_items
   continue_block = ltk & (count >= unique_state.max_items)[:, None]
 
-  # Combine all masks.
-  final_mask = (
+  # Combine active masks [B, K]
+  final_active_mask = (
       structural_mask & ~uniqueness_block & ~close_block & ~continue_block
   )
-  return jnp.where(final_mask[:, None, :], logits, -jnp.inf)
+
+  # Scatter to full vocabulary [B, V]
+  batch_size, _, vocab_size = logits.shape
+  full_mask = jnp.zeros((batch_size, vocab_size), dtype=jnp.bool_)
+  full_mask = full_mask.at[:, active_tokens].set(final_active_mask)
+  return jnp.where(full_mask[:, None, :], logits, -jnp.inf)
 
 
 def advance_state_unique(
     constraint_state: jnp.ndarray,
     next_token: jnp.ndarray,
     token_transitions: jnp.ndarray,
+    active_tokens: jnp.ndarray,
     unique_state: UniqueItemsLoopState,
 ) -> tuple[jnp.ndarray, UniqueItemsLoopState]:
   """Advance the DFA state and update the unique-items seen_mask.
 
-  Uses ``token_completions[state, token]`` to capture item completions
-  that occur at intermediate character positions within multi-character
-  tokens.
+  Uses binary search over active_tokens to look up transitions and completions
+  in compact ``[S, K]`` tables.
 
   Pure JAX, safe for ``jax.lax.while_loop``.
 
   Args:
       constraint_state: Shape ``[B]``, current DFA state.
       next_token: Shape ``[B]``, selected token id.
-      token_transitions: Shape ``[S, V]``, DFA transition table.
+      token_transitions: Shape ``[S, K]``, DFA transition table.
+      active_tokens: Shape ``[K]``, sorted active token IDs.
       unique_state: Bundled unique-items loop state.
 
   Returns:
       Tuple of (new_constraint_state, updated_unique_state).
   """
-  new_state = token_transitions[constraint_state, next_token]  # [B]
+  idx = jnp.searchsorted(active_tokens, next_token)
+  idx_clipped = jnp.clip(idx, 0, active_tokens.shape[0] - 1)
+  is_active = active_tokens[idx_clipped] == next_token
 
-  # Look up the bitmask of items completed during this token's character
-  # simulation (including intermediate states).
-  completed_bitmask = unique_state.token_completions[
-      constraint_state, next_token
-  ]  # [B]
+  new_state = jnp.where(
+      is_active,
+      token_transitions[constraint_state, idx_clipped],
+      INVALID_STATE,
+  )
+
+  completed_bitmask = jnp.where(
+      is_active,
+      unique_state.token_completions[constraint_state, idx_clipped],
+      0,
+  )
   new_seen = unique_state.seen_mask | completed_bitmask
 
   return new_state, dataclasses.replace(unique_state, seen_mask=new_seen)
@@ -2491,7 +2523,7 @@ def build_regex_constraint(
   char_transitions, initial_state, accept_states, num_states = _minimize_dfa(
       char_transitions, initial_state, accept_states, num_states
   )
-  token_transitions = _compile_token_transitions(
+  active_tokens, token_transitions = _compile_token_transitions(
       char_transitions,
       num_states,
       accept_states,
@@ -2500,6 +2532,7 @@ def build_regex_constraint(
       eos_token_ids,
   )
   tables = ConstraintTables(
+      active_tokens=active_tokens,
       token_transitions=token_transitions,
       initial_state=initial_state,
       num_states=num_states,
@@ -2514,6 +2547,7 @@ def constrained_logits(
     logits: jnp.ndarray,
     constraint_state: jnp.ndarray,
     token_transitions: jnp.ndarray,
+    active_tokens: jnp.ndarray,
     token_bounds_state: TokenBoundsLoopState | None = None,
 ) -> jnp.ndarray:
   """Mask logits to enforce a regex constraint.
@@ -2527,17 +2561,18 @@ def constrained_logits(
   Args:
       logits: Logit array of shape ``[B, 1, V]``.
       constraint_state: Current DFA state per batch element, shape ``[B]``.
-      token_transitions: Token-level transition table of shape ``[S, V]`` where
-        ``S`` is the number of DFA states and ``V`` is vocab size.
+      token_transitions: Compact transition table of shape ``[S, K]`` where
+        ``S`` is the number of DFA states and ``K`` is number of active tokens.
+      active_tokens: Shape ``[K]``, sorted active token IDs.
       token_bounds_state: Optional TokenBoundsLoopState carrying dynamic step
         counts, static masks, and bounds.
 
   Returns:
       Masked logits of the same shape as *logits*.
   """
-  # allowed_next: [B, V] — look up the transition row for each batch item.
-  allowed_next = token_transitions[constraint_state]  # [B, V]
-  mask = allowed_next != INVALID_STATE  # [B, V]
+  # allowed_next: [B, K] — look up the transition row for each batch item.
+  allowed_next = token_transitions[constraint_state]  # [B, K]
+  mask = allowed_next != INVALID_STATE  # [B, K]
 
   if token_bounds_state is not None:
     if token_bounds_state.min_tokens > 0:
@@ -2554,13 +2589,17 @@ def constrained_logits(
       )
       mask = jnp.where(max_force, mask & force_mask_curr, mask)
 
-  return jnp.where(mask[:, None, :], logits, -jnp.inf)
+  batch_size, _, vocab_size = logits.shape
+  full_mask = jnp.zeros((batch_size, vocab_size), dtype=jnp.bool_)
+  full_mask = full_mask.at[:, active_tokens].set(mask)
+  return jnp.where(full_mask[:, None, :], logits, -jnp.inf)
 
 
 def advance_state(
     constraint_state: jnp.ndarray,
     next_token: jnp.ndarray,
     token_transitions: jnp.ndarray,
+    active_tokens: jnp.ndarray,
 ) -> jnp.ndarray:
   """Advance the constraint DFA state after selecting a token.
 
@@ -2570,9 +2609,17 @@ def advance_state(
   Args:
       constraint_state: Current DFA state per batch element, shape ``[B]``.
       next_token: Selected token id per batch element, shape ``[B]``.
-      token_transitions: Token-level transition table of shape ``[S, V]``.
+      token_transitions: Compact transition table of shape ``[S, K]``.
+      active_tokens: Shape ``[K]``, sorted active token IDs.
 
   Returns:
       Updated constraint state of shape ``[B]``.
   """
-  return token_transitions[constraint_state, next_token]
+  idx = jnp.searchsorted(active_tokens, next_token)
+  idx_clipped = jnp.clip(idx, 0, active_tokens.shape[0] - 1)
+  is_active = active_tokens[idx_clipped] == next_token
+  return jnp.where(
+      is_active,
+      token_transitions[constraint_state, idx_clipped],
+      INVALID_STATE,
+  )
