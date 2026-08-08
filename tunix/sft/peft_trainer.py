@@ -124,9 +124,11 @@ class Kernel(Generic[P, R]):
   ) -> None:
     if isinstance(fn, functools.partial):
       target = getattr(fn, "func", fn)
+
       @functools.wraps(target)
       def _wrapped(*args: Any, **kwargs: Any) -> Any:
         return fn(*args, **kwargs)
+
       self._fn = _wrapped
     else:
       self._fn = fn
@@ -574,7 +576,7 @@ class PeftTrainer(Generic[ModuleT]):
 
   def train(
       self,
-      train_ds: Iterable[Any],
+      train_ds: Iterable[Any] | None = None,
       eval_ds: Iterable[Any] | None = None,
       *,
       cache_nnx_graph: bool = True,
@@ -597,7 +599,7 @@ class PeftTrainer(Generic[ModuleT]):
     for hook in self.training_hooks:
       hook.on_train_start(self)
 
-    train_iterator = iter(train_ds)
+    train_iterator = iter(train_ds) if train_ds is not None else iter(())
     index = 0
     last_step_completion_time = time.perf_counter()
     while True:
