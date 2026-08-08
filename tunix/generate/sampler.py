@@ -1204,10 +1204,10 @@ class Sampler(base_sampler.BaseSampler):
           max_prompt_length,
           max_len,
       )
-      out_tokens, lengths = jax.device_get(out_tokens), jax.device_get(lengths)
+      host_tokens, lengths = jax.device_get(out_tokens), jax.device_get(lengths)
       decoded_outputs = [
           self.tokenizer.decode(tokens[:length].tolist())
-          for tokens, length in zip(out_tokens, lengths)
+          for tokens, length in zip(host_tokens, lengths)
       ]
       out_logprobs: list[jax.Array] = []
       if return_logprobs:

@@ -34,13 +34,11 @@ class SamplerOutput:
   # Decoded samples from the model.
   text: list[str]
 
-  # Per-step logits used during sampling.
-  logits: Optional[list[jax.Array] | jax.Array]
+  # Per-step logits used during sampling on device.
+  logits: jax.Array | None
 
-  # Tokens corresponding to the generated samples.
-  # Since tokens need to be transfered to RAM for decoding, we use numpy array
-  # here.
-  tokens: list[np.ndarray] | np.ndarray
+  # Tokens corresponding to the generated samples on device.
+  tokens: jax.Array
 
   # Left padded prompt tokens.
   padded_prompt_tokens: np.ndarray
