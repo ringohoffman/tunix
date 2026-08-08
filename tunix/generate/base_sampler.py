@@ -43,7 +43,8 @@ class SamplerOutput:
   # Left padded prompt tokens.
   padded_prompt_tokens: np.ndarray
 
-  logprobs: Optional[list[float]]
+  # Per-token log probabilities on device.
+  logprobs: jax.Array | None = None
 
 
 class BaseSampler(ABC):

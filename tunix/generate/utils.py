@@ -187,6 +187,7 @@ def find_last_non_pad_idx(ids, pad_id):
     jax.jit,
     static_argnames=(
         'return_logits',
+        'return_logprobs',
         'echo',
         'pad_value',
         'max_prompt_length',
@@ -196,41 +197,26 @@ def find_last_non_pad_idx(ids, pad_id):
 def padded_fill_tokens_and_logits(
     token_buffers: jax.Array,
     logits_buffers: jax.Array | None,
+    logprobs_buffers: jax.Array | None,
     return_logits: bool,
+    return_logprobs: bool,
     echo: bool,
     pad_value: int,
     eos_value: int | jax.Array,
     max_prompt_length: int,
     max_total_length: int,
-) -> tuple[jax.Array, jax.Array, jax.Array | None]:
-  """Truncates the token_buffers and logits_buffers to the valid output.
-
-  For the token_buffers, find the valid output tokens from the start_idx to the
-  end_idx. Then pad the valid output tokens to the max_total_length. Similar
-  operation for the logits_buffers if return_logits is True.
-
-  Args:
-    token_buffers: The token buffers from the sampler. [B, L2]
-    logits_buffers: The logits buffers from the sampler. [B, L2, V]
-    return_logits: Whether to return the logits.
-    echo: Whether to echo the input prompt in the output.
-    pad_value: The value to use for padding.
-    eos_value: The value to use for EOS.
-    max_prompt_length: The maximum length of the input prompt.
-    max_total_length: The maximum total length of the output.
-
-  Returns:
-    The shape of the valid output tokens, the output tokens and the output
-    logits.
-  """
+) -> tuple[jax.Array, jax.Array, jax.Array | None, jax.Array | None]:
+  """Truncates token_buffers, logits_buffers, and logprobs_buffers to valid output."""
   return jax.vmap(
       single_padded_fill_tokens_and_logits,
-      in_axes=(0, 0, None, None, None, None, None, None),
-      out_axes=(0, 0, 0),
+      in_axes=(0, 0, 0, None, None, None, None, None, None, None),
+      out_axes=(0, 0, 0, 0),
   )(
       token_buffers,
       logits_buffers,
+      logprobs_buffers,
       return_logits,
+      return_logprobs,
       echo,
       pad_value,
       eos_value,
@@ -242,14 +228,16 @@ def padded_fill_tokens_and_logits(
 def single_padded_fill_tokens_and_logits(
     token_buffer: jax.Array,
     logits_buffer: jax.Array | None,
+    logprobs_buffer: jax.Array | None,
     return_logits: bool,
+    return_logprobs: bool,
     echo: bool,
     pad_value: int,
     eos_value: int | jax.Array,
     max_prompt_length: int,
     max_total_length: int,
-) -> tuple[jax.Array, jax.Array, jax.Array | None]:
-  """Generates tokens and logits from the input token_buffer and logits_buffer."""
+) -> tuple[jax.Array, jax.Array, jax.Array | None, jax.Array | None]:
+  """Generates tokens, logits, and logprobs from input buffers on device."""
   start_idx = (
       find_first_non_pad_idx(token_buffer, pad_value)
       if echo
@@ -279,9 +267,20 @@ def single_padded_fill_tokens_and_logits(
     output_logit = lax.dynamic_slice(
         padded_logits_buffer, (start_idx, 0), (max_total_length, dim)
     )
-    mask = mask[:, None]
-    output_logit = jnp.where(mask, output_logit, 0)
-  return jnp.array(length), output_token, output_logit
+    output_logit = jnp.where(mask[:, None], output_logit, 0)
+
+  output_logprob = None
+  if return_logprobs:
+    assert logprobs_buffer is not None
+    padded_logprobs_buffer = jnp.pad(
+        logprobs_buffer, (0, max_total_length), constant_values=0.0
+    )
+    output_logprob = lax.dynamic_slice(
+        padded_logprobs_buffer, (start_idx,), (max_total_length,)
+    )
+    output_logprob = jnp.where(mask, output_logprob, 0.0)
+
+  return jnp.array(length), output_token, output_logit, output_logprob
 
 
 def build_positions_from_mask(input_mask: jax.Array) -> jax.Array:

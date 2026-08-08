@@ -1194,49 +1194,25 @@ class Sampler(base_sampler.BaseSampler):
       del sampling_state
     if pad_output:
       max_len = total_sampling_steps if echo else max_generation_steps
-      lengths, out_tokens, out_logits = utils.padded_fill_tokens_and_logits(
-          token_buffers,
-          logits_buffers,
-          return_logits,
-          echo,
-          self.tokenizer.pad_id(),
-          self.eos_tokens,
-          max_prompt_length,
-          max_len,
+      lengths, out_tokens, out_logits, out_logprobs = (
+          utils.padded_fill_tokens_and_logits(
+              token_buffers,
+              logits_buffers,
+              final_logprobs_buffer if return_logprobs else None,
+              return_logits,
+              return_logprobs,
+              echo,
+              self.tokenizer.pad_id(),
+              self.eos_tokens,
+              max_prompt_length,
+              max_len,
+          )
       )
       host_tokens, lengths = jax.device_get(out_tokens), jax.device_get(lengths)
       decoded_outputs = [
           self.tokenizer.decode(tokens[:length].tolist())
           for tokens, length in zip(host_tokens, lengths)
       ]
-      out_logprobs: list[jax.Array] = []
-      if return_logprobs:
-        token_buffers = jax.device_get(token_buffers)
-        final_logprobs_buffer = jax.device_get(final_logprobs_buffer)
-        for i in range(len(token_buffers)):
-          start_idx = (
-              utils.np_find_first_non_pad_idx(
-                  token_buffers[i], self.tokenizer.pad_id()
-              )
-              if echo
-              else max_prompt_length
-          )
-          end_idx = (
-              utils.np_find_first_eos_idx(
-                  token_buffers[i][max_prompt_length:], self.eos_tokens
-              )
-              + max_prompt_length
-          )
-          length = end_idx - start_idx
-          # Slice logprobs and pad to max_len
-          sliced_logprobs = final_logprobs_buffer[i][start_idx:end_idx]
-          padded_logprobs = np.pad(
-              sliced_logprobs,
-              (0, max_len - length),
-              mode='constant',
-              constant_values=0.0,
-          )
-          out_logprobs.append(padded_logprobs.tolist())
 
     else:
       out_tokens: list[jax.Array] = []
@@ -1277,7 +1253,7 @@ class Sampler(base_sampler.BaseSampler):
 
     result = base_sampler.SamplerOutput(
         text=decoded_outputs,
-        logits=out_logits if return_logits else [],
+        logits=out_logits if return_logits else None,
         tokens=out_tokens,
         padded_prompt_tokens=all_input_ids,
         logprobs=out_logprobs if return_logprobs else None,
