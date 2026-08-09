@@ -126,7 +126,7 @@ class GemmaInput(TypedDict):
   """Optional attention mask array."""
   decode_only_last_token: NotRequired[bool]
   """If True, only compute logits for the final token position."""
-  segment_ids: NotRequired[jaxtyping.Array | None]
+  segment_ids: NotRequired[jaxtyping.Array | splash.SegmentIds | None]
   """Optional document segment IDs for packed sequence attention masking."""
   target_indices: NotRequired[jaxtyping.Array | None]
   """Optional target token indices for sparse logit computation."""
@@ -996,7 +996,7 @@ class Attention(nnx.Module):
       kv_override: LayerKV | LayerCache | None = None,
       use_kv_override: jaxtyping.Array | bool | None = None,
       skip_kv_projection: bool = False,
-      segment_ids: jaxtyping.Array | None = None,
+      segment_ids: jaxtyping.Array | splash.SegmentIds | None = None,
   ) -> tuple[
       LayerKV | LayerCache | None,
       jaxtyping.Array,
@@ -1240,13 +1240,28 @@ class Attention(nnx.Module):
             q_seg_block: jaxtyping.Array,
             kv_seg_block: jaxtyping.Array,
         ) -> jaxtyping.Array:
-          seg_ids = splash.SegmentIds(
-              q=q_seg_block,
-              kv=kv_seg_block,
-              prefix_segment_id=_prefix_segment_id,
-          )
-          result = jax.vmap(kernel)(
-              q_block, k_block, v_block, segment_ids=seg_ids
+          def _single_batch_kernel(
+              q: jaxtyping.Array,
+              k: jaxtyping.Array,
+              v: jaxtyping.Array,
+              q_seg: jaxtyping.Array,
+              kv_seg: jaxtyping.Array,
+          ) -> splash.SplashCustomReturnType:
+            prefix_id: int | None = (
+                int(_prefix_segment_id)
+                if _prefix_segment_id is not None
+                and isinstance(_prefix_segment_id, (int, np.integer))
+                else (0 if _prefix_segment_id is not None else None)
+            )
+            seg_ids = splash.SegmentIds(
+                q=q_seg,
+                kv=kv_seg,
+                prefix_segment_id=prefix_id,
+            )
+            return kernel(q, k, v, segment_ids=seg_ids)
+
+          result = jax.vmap(_single_batch_kernel)(
+              q_block, k_block, v_block, q_seg_block, kv_seg_block
           )
           # vmap(kernel) returns SplashCustomReturnType (Array | tuple);
           # without residuals it's always a plain Array.
@@ -1407,7 +1422,7 @@ class Attention(nnx.Module):
       kv_override: LayerKV | LayerCache | None = None,
       use_kv_override: jaxtyping.Array | bool | None = None,
       skip_kv_projection: bool = False,
-      segment_ids: jaxtyping.Array | None = None,
+      segment_ids: jaxtyping.Array | splash.SegmentIds | None = None,
   ) -> tuple[
       LayerKV | LayerCache | None,
       jaxtyping.Array,
@@ -1655,7 +1670,7 @@ class DecoderLayer(nnx.Module):
       kv_override: LayerKV | LayerCache | None = None,
       use_kv_override: jaxtyping.Array | bool | None = None,
       skip_kv_projection: bool = False,
-      segment_ids: jaxtyping.Array | None = None,
+      segment_ids: jaxtyping.Array | splash.SegmentIds | None = None,
   ) -> tuple[
       LayerKV | LayerCache | None,
       jaxtyping.Array,
@@ -1711,7 +1726,7 @@ class DecoderLayer(nnx.Module):
       kv_override: LayerKV | LayerCache | None = None,
       use_kv_override: jaxtyping.Array | bool | None = None,
       skip_kv_projection: bool = False,
-      segment_ids: jaxtyping.Array | None = None,
+      segment_ids: jaxtyping.Array | splash.SegmentIds | None = None,
   ) -> tuple[
       LayerKV | LayerCache | None,
       jaxtyping.Array,
@@ -1810,7 +1825,7 @@ class ScanLayerGroup(nnx.Module):
       new_group_kvs: dict[int, LayerKV] | None = None,
       origin_kv_global: LayerKV | LayerCache | None = None,
       origin_kv_local: LayerKV | LayerCache | None = None,
-      segment_ids: jaxtyping.Array | None = None,
+      segment_ids: jaxtyping.Array | splash.SegmentIds | None = None,
   ) -> jaxtyping.Array:
     """Run one pattern-group of layers with full scan compatibility."""
     for sub_idx, layer in enumerate(self.sub_layers):
@@ -2157,7 +2172,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
       new_cache: Cache,
       transient_kvs: TransientKVs,
       is_prefill: bool,
-      segment_ids: jaxtyping.Array | None,
+      segment_ids: jaxtyping.Array | splash.SegmentIds | None,
   ) -> tuple[jaxtyping.Array, Cache]:
     """For-loop forward pass over layers with full feature parity and pre-merged scan layers."""
     num_layers = self.config.num_layers
@@ -2240,7 +2255,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
       new_cache: Cache,
       transient_kvs: TransientKVs,
       is_prefill: bool,
-      segment_ids: jaxtyping.Array | None,
+      segment_ids: jaxtyping.Array | splash.SegmentIds | None,
   ) -> tuple[jaxtyping.Array, Cache | StackedCache | None]:
     """Scan-based forward pass compiling into a single XLA while_loop in HLO (or unrolled for cache generation)."""
     num_layers = self.config.num_layers
@@ -2441,7 +2456,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
           attn_mask: jaxtyping.Array | None,
           sharing_meta: tuple[jaxtyping.Array, jaxtyping.Array] | None,
           group_per_layer_inputs: jaxtyping.Array | None,
-          segment_ids: jaxtyping.Array | None,
+          segment_ids: jaxtyping.Array | splash.SegmentIds | None,
       ) -> tuple[
           tuple[jaxtyping.Array, tuple[LayerCache, ...]] | jaxtyping.Array,
           tuple[LayerCache, ...],
@@ -2681,7 +2696,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
           positions: jaxtyping.Array,
           attn_mask: jaxtyping.Array | None,
           group_per_layer_inputs: jaxtyping.Array | None,
-          segment_ids: jaxtyping.Array | None,
+          segment_ids: jaxtyping.Array | splash.SegmentIds | None,
       ) -> jaxtyping.Array:
         return group(
             x,
@@ -2776,7 +2791,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
           positions: jaxtyping.Array,
           attn_mask: jaxtyping.Array | None,
           group_per_layer_inputs: jaxtyping.Array | None,
-          segment_ids: jaxtyping.Array | None,
+          segment_ids: jaxtyping.Array | splash.SegmentIds | None,
       ) -> tuple[jaxtyping.Array, OriginKV]:
         x_curr, _ = carry
         new_group_kvs: dict[int, LayerKV] = {}
@@ -2821,7 +2836,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
           attn_mask: jaxtyping.Array | None,
           origin_kvs: OriginKV,
           group_per_layer_inputs: jaxtyping.Array | None,
-          segment_ids: jaxtyping.Array | None,
+          segment_ids: jaxtyping.Array | splash.SegmentIds | None,
       ) -> jaxtyping.Array:
         return group(
             x,
