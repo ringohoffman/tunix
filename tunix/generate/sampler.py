@@ -125,6 +125,13 @@ class _SamplingState:
   token_bounds_state: constrained.TokenBoundsLoopState | None = None
   """Token-level min/max bounds side-channel."""
 
+  logit_gather_ids: jax.Array | None = None
+  """[D] int32 token IDs to gather from full-vocab logits before writing to
+  logits_buffer. When set, logits_buffer has shape [B, L, D] instead of
+  [B, L, V]. Constant across decode steps; carried in state so it is
+  visible inside the jax.lax.while_loop.
+  """
+
 
 @dataclasses.dataclass(frozen=True)
 class CacheConfig:
@@ -497,6 +504,7 @@ class Sampler(base_sampler.BaseSampler):
       beam_size: int | None,
       include_logprobs: bool = False,
       constraint: constrained.Constraint | None = None,
+      logit_gather_ids: jax.Array | None = None,
   ) -> _SamplingState:
     """Initializes the sampling state given input prompts."""
     batch_size, num_input_tokens, *_ = all_input_ids.shape
@@ -545,17 +553,21 @@ class Sampler(base_sampler.BaseSampler):
           data_sharding=self.data_sharding,
       )
 
-    logits_buffer = (
-        jax.device_put(
-            jnp.zeros(
-                (batch_size, total_sampling_steps, self.transformer.num_embed),
-                dtype=jnp.float32,
-            ),
-            self.logits_sharding,
-        )
-        if include_logits
-        else None
-    )
+    if include_logits:
+      vocab_dim = (
+          logit_gather_ids.shape[0]
+          if logit_gather_ids is not None
+          else self.transformer.num_embed
+      )
+      logits_buffer = jax.device_put(
+          jnp.zeros(
+              (batch_size, total_sampling_steps, vocab_dim),
+              dtype=jnp.float32,
+          ),
+          self.logits_sharding,
+      )
+    else:
+      logits_buffer = None
 
     logprobs_buffer = (
         jax.device_put(
@@ -623,6 +635,7 @@ class Sampler(base_sampler.BaseSampler):
         constraint_transitions=constraint_transitions,
         unique_state=unique_state,
         token_bounds_state=token_bounds_state,
+        logit_gather_ids=logit_gather_ids,
     )
 
   def tokenize(self, input_string: str) -> np.ndarray | list[int]:
@@ -761,6 +774,7 @@ class Sampler(base_sampler.BaseSampler):
         constraint_transitions=sampler_state.constraint_transitions,
         unique_state=unique_state,
         token_bounds_state=token_bounds_state,
+        logit_gather_ids=sampler_state.logit_gather_ids,
     )
 
   def _prefill_fn(
@@ -826,9 +840,12 @@ class Sampler(base_sampler.BaseSampler):
       start_idx = (
           sampler_state.num_input_tokens if decode_only_last_token else 1
       )
+      logits_to_store = logits
+      if sampler_state.logit_gather_ids is not None:
+        logits_to_store = logits_to_store[:, :, sampler_state.logit_gather_ids]
       logits_buffer = jax.lax.dynamic_update_slice(
           sampler_state.logits_buffer,
-          logits.astype(sampler_state.logits_buffer.dtype),
+          logits_to_store.astype(sampler_state.logits_buffer.dtype),
           (0, start_idx, 0),
       )
     else:
@@ -876,6 +893,7 @@ class Sampler(base_sampler.BaseSampler):
         constraint_transitions=sampler_state.constraint_transitions,
         unique_state=sampler_state.unique_state,
         token_bounds_state=sampler_state.token_bounds_state,
+        logit_gather_ids=sampler_state.logit_gather_ids,
     )
     updated_sampler_state = self._sample(
         logits=logits,
@@ -963,6 +981,8 @@ class Sampler(base_sampler.BaseSampler):
 
     if updated_sampler_state.logits_buffer is not None:
       next_logits = jnp.squeeze(logits, 1)
+      if updated_sampler_state.logit_gather_ids is not None:
+        next_logits = next_logits[:, updated_sampler_state.logit_gather_ids]
       logits_buffer = updated_sampler_state.logits_buffer.at[
           :, decoding_step + 1
       ].set(next_logits)
@@ -1063,6 +1083,7 @@ class Sampler(base_sampler.BaseSampler):
       return_logprobs: bool = False,
       pad_output: bool = False,
       constraint: constrained.Constraint | None = None,
+      logit_gather_ids: jax.Array | None = None,
   ) -> base_sampler.SamplerOutput:
     """Generate from pre-tokenized, pre-padded token arrays."""
     forbidden_token_ids = tuple(forbidden_tokens) if forbidden_tokens else None
@@ -1092,6 +1113,7 @@ class Sampler(base_sampler.BaseSampler):
         pad_output=pad_output,
         processed_images=None,
         constraint_tables=compiled_tables,
+        logit_gather_ids=logit_gather_ids,
     )
 
   def _generate_impl(
@@ -1112,6 +1134,7 @@ class Sampler(base_sampler.BaseSampler):
       pad_output: bool = False,
       processed_images: jnp.ndarray | None = None,
       constraint_tables: constrained.ConstraintTables | None = None,
+      logit_gather_ids: jnp.ndarray | None = None,
   ) -> base_sampler.SamplerOutput:
     """Core generation logic shared by __call__ and generate_from_tokens.
 
@@ -1156,6 +1179,7 @@ class Sampler(base_sampler.BaseSampler):
         beam_size=beam_size,
         include_logprobs=return_logprobs,
         constraint=constraint_tables,
+        logit_gather_ids=logit_gather_ids,
     )
     if constraint_tables is not None:
       compiled_prefill_fn = nnx.jit(self._prefill_fn, static_argnames=('echo',))

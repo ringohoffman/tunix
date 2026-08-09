@@ -1240,7 +1240,11 @@ class Attention(nnx.Module):
             q_seg_block: jaxtyping.Array,
             kv_seg_block: jaxtyping.Array,
         ) -> jaxtyping.Array:
-          seg_ids = splash.SegmentIds(q=q_seg_block, kv=kv_seg_block)
+          seg_ids = splash.SegmentIds(
+              q=q_seg_block,
+              kv=kv_seg_block,
+              prefix_segment_id=_prefix_segment_id,
+          )
           result = jax.vmap(kernel)(
               q_block, k_block, v_block, segment_ids=seg_ids
           )
@@ -1252,10 +1256,12 @@ class Attention(nnx.Module):
         if isinstance(segment_ids, splash.SegmentIds):
           q_seg = segment_ids.q
           kv_seg = segment_ids.kv
+          _prefix_segment_id = segment_ids.prefix_segment_id
         else:
           assert segment_ids is not None
           q_seg = segment_ids
           kv_seg = segment_ids
+          _prefix_segment_id = None
 
         qkv = sharded_splash_attn_with_seg(
             splash_attn_kernel,
@@ -2023,7 +2029,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
       positions: jaxtyping.Array | None = None,
       cache: Cache | StackedCache | None = None,
       attention_mask: jaxtyping.Array | None = None,
-      segment_ids: jaxtyping.Array | None = None,
+      segment_ids: jaxtyping.Array | splash.SegmentIds | None = None,
   ) -> tuple[jaxtyping.Array, Cache | StackedCache | None]:
     """Forward pass through the backbone only (embed → layers → final norm).
 
@@ -2086,7 +2092,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
       cache: Cache | StackedCache | None = None,
       attention_mask: jaxtyping.Array | None = None,
       decode_only_last_token: bool = False,
-      segment_ids: jaxtyping.Array | None = None,
+      segment_ids: jaxtyping.Array | splash.SegmentIds | None = None,
       *,
       target_indices: jaxtyping.Array | None = None,
       return_hidden_states: bool = False,
