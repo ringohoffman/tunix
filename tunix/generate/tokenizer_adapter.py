@@ -49,6 +49,13 @@ class TokenizerAdapter(Generic[TokenizerT]):
       return self._tokenizer.DecodeIds(ids, **kwargs)
     return self._tokenizer.decode(ids, **kwargs)
 
+  def batch_decode(
+      self, sequences: Any, **kwargs: Any
+  ) -> list[str]:
+    if hasattr(self._tokenizer, 'batch_decode'):
+      return self._tokenizer.batch_decode(sequences, **kwargs)
+    return [self.decode(seq, **kwargs) for seq in sequences]
+
   def bos_id(self) -> int:
     if isinstance(self._tokenizer, transformers.PreTrainedTokenizerBase):
       return self._tokenizer.bos_token_id

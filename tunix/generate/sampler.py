@@ -1474,10 +1474,9 @@ class Sampler(base_sampler.BaseSampler):
           )
       )
       host_tokens, lengths = jax.device_get(out_tokens), jax.device_get(lengths)
-      decoded_outputs = [
-          self.tokenizer.decode(tokens[:length].tolist())
-          for tokens, length in zip(host_tokens, lengths)
-      ]
+      decoded_outputs = self.tokenizer.batch_decode(
+          [tokens[:length] for tokens, length in zip(host_tokens, lengths)]
+      )
 
     else:
       out_tokens: list[jax.Array] = []
@@ -1512,9 +1511,7 @@ class Sampler(base_sampler.BaseSampler):
               final_logprobs_buffer[i][start_idx:end_idx].tolist()
           )
 
-      decoded_outputs = [
-          self.tokenizer.decode(tokens.tolist()) for tokens in out_tokens
-      ]
+      decoded_outputs = self.tokenizer.batch_decode(out_tokens)
 
     result = base_sampler.SamplerOutput(
         text=decoded_outputs,
