@@ -783,7 +783,7 @@ class SamplerTest(parameterized.TestCase):
 
     # 2. Prefix-cached generation with full input_ids [B, P+S]
     prefix_cache = sampler.prefill_prefix(prefix)
-    self.assertEqual(prefix_cache.prefix_length, len(prefix))
+    self.assertEqual(prefix_cache.prefix_tokens.shape[-1], len(prefix))
 
     res_cached = sampler.generate_from_tokens(
         input_ids,

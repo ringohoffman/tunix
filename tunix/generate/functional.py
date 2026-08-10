@@ -46,14 +46,11 @@ KVCache: TypeAlias = Cache | StackedCache | None
 class PrefixCache:
   """Cached KV state and metadata for a pre-computed token prefix."""
 
-  # Cached key/value state populated up to prefix_length.
+  # Cached key/value state populated for prefix tokens.
   cache: KVCache
 
-  # Number of prefix tokens.
-  prefix_length: int
-
-  # Optional prefix token array of shape [P].
-  prefix_tokens: jax.Array | None = None
+  # Prefix token array of shape [P].
+  prefix_tokens: jax.Array
 
 
 @jax.tree_util.register_dataclass
@@ -330,7 +327,6 @@ def prefill_prefix(
   )
   return PrefixCache(
       cache=cache,
-      prefix_length=pfx_len,
       prefix_tokens=prefix_arr[0],
   )
 
@@ -392,30 +388,34 @@ def generate(
   batch_size = input_ids.shape[0]
   in_len = input_ids.shape[1]
 
-  prefix_len = 0
+  prefix_length = 0
   prefix_tokens_arr = None
   raw_cache = None
   if prefix_cache is not None:
     if isinstance(prefix_cache, PrefixCache):
-      prefix_len = prefix_cache.prefix_length
       prefix_tokens_arr = prefix_cache.prefix_tokens
+      prefix_length = int(prefix_tokens_arr.shape[-1])
       raw_cache = prefix_cache.cache
     elif isinstance(prefix_cache, dict) and "v" in prefix_cache:
       raw_cache = prefix_cache
-      prefix_len = int(prefix_cache.get("end_index", [0])[0])
+      prefix_length = int(prefix_cache.get("end_index", [0])[0])
     else:
       raw_cache = prefix_cache
 
-  if prefix_len > 0 and in_len <= prefix_len and prefix_tokens_arr is not None:
+  if (
+      prefix_length > 0
+      and in_len <= prefix_length
+      and prefix_tokens_arr is not None
+  ):
     # Suffix-only tokens passed as input_ids: [B, S]
     suffix_len = in_len
-    prompt_len = prefix_len + suffix_len
+    prompt_len = prefix_length + suffix_len
     total_len = prompt_len + max_new_tokens
     token_buffer = jnp.full((batch_size, total_len), pad_id, dtype=jnp.int32)
-    token_buffer = token_buffer.at[:, :prefix_len].set(
+    token_buffer = token_buffer.at[:, :prefix_length].set(
         prefix_tokens_arr[None, :]
     )
-    token_buffer = token_buffer.at[:, prefix_len:prompt_len].set(input_ids)
+    token_buffer = token_buffer.at[:, prefix_length:prompt_len].set(input_ids)
   else:
     # Full prompt passed as input_ids: [B, prompt_len] (or no prefix cache)
     prompt_len = in_len
@@ -501,20 +501,20 @@ def generate(
   except (ValueError, TypeError):
     pass
 
-  if prefix_len > 0:
-    suffix_len = prompt_len - prefix_len
-    suffix_tokens = token_buffer[:, prefix_len:prompt_len]
-    suffix_positions = positions[:, prefix_len:prompt_len]
+  if prefix_length > 0:
+    suffix_len = prompt_len - prefix_length
+    suffix_tokens = token_buffer[:, prefix_length:prompt_len]
+    suffix_positions = positions[:, prefix_length:prompt_len]
     suffix_mask = suffix_tokens != pad_id
 
     attention_mask = jnp.zeros(
         (batch_size, suffix_len, cache_size), dtype=jnp.bool_
     )
-    attention_mask = attention_mask.at[:, :, :prefix_len].set(True)
+    attention_mask = attention_mask.at[:, :, :prefix_length].set(True)
     causal_suffix = jnp.tril(
         jnp.ones((suffix_len, suffix_len), dtype=jnp.bool_)
     )[None, ...]
-    attention_mask = attention_mask.at[:, :, prefix_len:prompt_len].set(
+    attention_mask = attention_mask.at[:, :, prefix_length:prompt_len].set(
         causal_suffix & suffix_mask[:, None, :]
     )
 

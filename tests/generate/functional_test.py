@@ -482,7 +482,7 @@ class FunctionalGenerateTest(parameterized.TestCase):
         cache_size=64,
         dtype=jnp.float32,
     )
-    self.assertEqual(pfx_cache.prefix_length, len(prefix))
+    self.assertEqual(pfx_cache.prefix_tokens.shape[-1], len(prefix))
 
     # 3. Generate with full input_ids [B, P+S] and prefix_cache
     out_cached = functional.generate(

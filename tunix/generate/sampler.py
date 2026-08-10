@@ -448,7 +448,6 @@ class Sampler(base_sampler.BaseSampler):
     )
     return functional.PrefixCache(
         cache=prefix_cache,
-        prefix_length=P,
         prefix_tokens=jnp.asarray(prefix_tokens, dtype=jnp.int32),
     )
 
@@ -672,7 +671,7 @@ class Sampler(base_sampler.BaseSampler):
       seed = jax.random.key(seed)
 
     if prefix_cache is not None:
-      P = prefix_cache.prefix_length
+      P = int(prefix_cache.prefix_tokens.shape[-1])
       if all_input_ids.shape[1] > P:
         num_input_tokens = all_input_ids.shape[1]
         token_buffer = jnp.full(
@@ -1393,7 +1392,7 @@ class Sampler(base_sampler.BaseSampler):
       SamplerOutput.
     """
     if prefix_cache is not None:
-      P = prefix_cache.prefix_length
+      P = int(prefix_cache.prefix_tokens.shape[-1])
       if all_input_ids.shape[1] > P:
         total_prompt_length = all_input_ids.shape[1]
       else:
