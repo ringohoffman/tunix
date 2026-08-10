@@ -291,6 +291,19 @@ def prefill_prefix(
   if pfx_batch != 1:
     raise ValueError(f"prefix_ids must have batch size 1, got {pfx_batch}")
 
+  # Keep the original (unpadded) prefix tokens for downstream callers.
+  original_prefix_tokens = prefix_arr[0]
+
+  # Pad prefix to flash attention block alignment so the prefill can use
+  # Splash Attention instead of standard O(n²) attention.
+  block_size = getattr(getattr(model, "config", None),
+                       "flash_attention_block_size", None)
+  if block_size is not None and pfx_len % block_size != 0:
+    padded_len = pfx_len + block_size - (pfx_len % block_size)
+    if padded_len <= cache_size:
+      prefix_arr = jnp.pad(prefix_arr, ((0, 0), (0, padded_len - pfx_len)))
+      pfx_len = padded_len
+
   cache = None
   if hasattr(model, "init_cache"):
     cache = model.init_cache(1, cache_size, dtype=dtype)
@@ -327,7 +340,7 @@ def prefill_prefix(
   )
   return PrefixCache(
       cache=cache,
-      prefix_tokens=prefix_arr[0],
+      prefix_tokens=original_prefix_tokens,
   )
 
 

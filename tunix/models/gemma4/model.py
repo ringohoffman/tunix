@@ -1098,8 +1098,16 @@ class Attention(nnx.Module):
             "k": cache_k,
             "end_index": cache["end_index"] + seq_len,
         }
-        value_proj = cache_v
-        key_proj = cache_k
+        # Only expand K/V to full cache for standard attention.  When flash
+        # attention will handle this prefill, K/V must stay at the original
+        # [B, seq_len, H, D] shape so Q and KV dimensions match for
+        # self-attention.
+        if not (
+            self.config.use_flash_attention
+            and seq_len % self.config.flash_attention_block_size == 0
+        ):
+          value_proj = cache_v
+          key_proj = cache_k
       else:  # decode (seq_len == 1)
         slice_indices = (0, end_index % cache_len, 0, 0)
         value_proj = jax.lax.dynamic_update_slice(
@@ -1155,7 +1163,6 @@ class Attention(nnx.Module):
     if (
         self.config.use_flash_attention
         and seq_len > 1
-        and cache is None
         and (seq_len % self.config.flash_attention_block_size == 0)
     ):
       b, _, qh, _ = query_proj.shape
