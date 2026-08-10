@@ -296,8 +296,9 @@ def prefill_prefix(
 
   # Pad prefix to flash attention block alignment so the prefill can use
   # Splash Attention instead of standard O(n²) attention.
-  block_size = getattr(getattr(model, "config", None),
-                       "flash_attention_block_size", None)
+  block_size = getattr(
+      getattr(model, "config", None), "flash_attention_block_size", None
+  )
   if block_size is not None and pfx_len % block_size != 0:
     padded_len = pfx_len + block_size - (pfx_len % block_size)
     if padded_len <= cache_size:
@@ -453,10 +454,16 @@ def generate(
   cache: KVCache = None
   if raw_cache is not None:
 
+    is_stacked_cache = isinstance(raw_cache, (tuple, list))
+
     def _broadcast_cache(leaf):
       if not isinstance(leaf, (jax.Array, jnp.ndarray)):
         return leaf
-      if leaf.ndim >= 2 and leaf.shape[1] == 1 and leaf.shape[0] > 1:
+      if (
+          (is_stacked_cache or leaf.ndim >= 2)
+          and leaf.ndim >= 2
+          and leaf.shape[1] == 1
+      ):
         return jnp.broadcast_to(
             leaf, (leaf.shape[0], batch_size, *leaf.shape[2:])
         )

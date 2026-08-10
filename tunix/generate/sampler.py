@@ -457,12 +457,13 @@ class Sampler(base_sampler.BaseSampler):
       batch_size: int,
   ) -> functional.KVCache:
     """Broadcasts a 1-sequence PrefixCache across the batch dimension."""
+    is_stacked_cache = isinstance(prefix_cache.cache, (tuple, list))
 
     def _broadcast_leaf(x):
       if not isinstance(x, (jax.Array, jnp.ndarray, np.ndarray)):
         return x
       # Scan-group cache: shape [num_scan_groups, 1, max_seq_len, ...] or [num_scan_groups, 1]
-      if x.ndim >= 2 and x.shape[1] == 1 and x.shape[0] > 1:
+      if (is_stacked_cache or x.ndim >= 2) and x.ndim >= 2 and x.shape[1] == 1:
         new_shape = (x.shape[0], batch_size, *x.shape[2:])
         broadcasted = jnp.broadcast_to(x, new_shape)
         if hasattr(self, 'data_sharding') and not self.data_sharding.mesh.empty:

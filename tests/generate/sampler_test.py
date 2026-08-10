@@ -821,6 +821,63 @@ class SamplerTest(parameterized.TestCase):
       self.assertEqual(l_std.shape, l_suf.shape)
       np.testing.assert_allclose(l_std, l_suf, atol=1e-5, rtol=1e-5)
 
+  def test_generate_from_tokens_prefix_caching_with_single_scan_group(self):
+    config = gemma4_model_lib.ModelConfig(
+        num_layers=1,
+        num_embed=100,
+        embed_dim=16,
+        hidden_dim=32,
+        num_heads=2,
+        head_dim=8,
+        num_kv_heads=2,
+        sliding_window_size=16,
+        param_dtype=jnp.bfloat16,
+        attention_pattern=(gemma4_model_lib.AttentionType.GLOBAL,),
+        frac_shared_layers=0.0,
+        use_scan_layers=True,
+        final_logit_softcap=30.0,
+        local_rope_proportion=1.0,
+        global_rope_proportion=0.25,
+        global_key_size=16,
+        k_eq_v_global=False,
+        local_base_frequency=10000,
+        global_base_frequency=1000000,
+        local_scale_factor=1.0,
+        global_scale_factor=1.0,
+    )
+    rngs = nnx.Rngs(42)
+    model = gemma4_model_lib.Gemma4(config, rngs=rngs)
+    cache_config = sampler_lib.CacheConfig(
+        cache_size=64,
+        num_layers=config.num_layers,
+        num_kv_heads=config.num_kv_heads,
+        head_dim=config.head_dim,
+    )
+    mock_tokenizer = tc.MockVocab()
+    mock_tokenizer.DecodeIds = lambda x: ' '.join(map(str, x))
+
+    sampler = sampler_lib.Sampler(model, mock_tokenizer, cache_config)
+
+    prefix = [5, 6, 7, 8]
+    prompt1 = prefix + [11, 12]
+    prompt2 = prefix + [14, 15]
+
+    input_ids = np.array([prompt1, prompt2], dtype=np.int32)
+
+    prefix_cache = sampler.prefill_prefix(prefix)
+    self.assertEqual(prefix_cache.prefix_tokens.shape[-1], len(prefix))
+
+    res_cached = sampler.generate_from_tokens(
+        input_ids,
+        max_generation_steps=6,
+        return_logits=True,
+        temperature=0.0,
+        prefix_cache=prefix_cache,
+    )
+    self.assertEqual(len(res_cached.tokens), 2)
+    for t in res_cached.tokens:
+      self.assertEqual(len(t), 6)
+
 
 if __name__ == '__main__':
   absltest.main()
