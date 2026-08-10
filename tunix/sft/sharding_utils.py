@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import jax
 from jax.interpreters import pxla
-import jax.sharding as shd
+import jax.sharding
 import numpy as np
 
 
@@ -35,11 +35,11 @@ def shard_input(
   Returns:
     The sharded TrainingInput.
   """
-  mesh = pxla.thread_resources.env.physical_mesh
+  mesh = jax.sharding.get_mesh()
   if mesh.empty:
     return input_data
 
-  pspec = shd.PartitionSpec(*data_sharding_axis)
+  pspec = jax.sharding.PartitionSpec(*data_sharding_axis)
   # Check if the input is already sharded with the target mesh to avoid
   # re-sharding.
   is_sharded = jax.tree.map(
@@ -75,21 +75,21 @@ def shard_input(
 
 def get_sharding(
     x: np.ndarray | jax.Array,
-    mesh: shd.Mesh,
-    pspec: shd.PartitionSpec,
+    mesh: jax.sharding.Mesh,
+    pspec: jax.sharding.PartitionSpec,
     *,
     strict: bool = False,
-) -> shd.NamedSharding:
+) -> jax.sharding.NamedSharding:
   """Get a sharding for a tensor given a mesh and partition spec.
 
   Args:
     x: The array to determine sharding for.
     mesh: The device mesh to shard across.
     pspec: The desired partition spec.
-    strict: If True, raise ``ValueError`` when the array's shape is not
-      evenly divisible by the mesh axis sizes (instead of silently falling
-      back to full replication).  Enable this for data batches where an
-      indivisible dimension indicates a configuration bug.
+    strict: If True, raise ``ValueError`` when the array's shape is not evenly
+      divisible by the mesh axis sizes (instead of silently falling back to full
+      replication).  Enable this for data batches where an indivisible dimension
+      indicates a configuration bug.
 
   Returns:
     A ``NamedSharding`` matching ``pspec`` if the array is compatible,
@@ -102,11 +102,15 @@ def get_sharding(
   """
   # Only shard arrays with rank > 0.
   if not isinstance(x, (np.ndarray, jax.Array)) or x.ndim == 0:
-    return shd.NamedSharding(mesh, shd.PartitionSpec())  # Replicated
+    return jax.sharding.NamedSharding(
+        mesh, jax.sharding.PartitionSpec()
+    )  # Replicated
 
   # Don't shard if rank is not sufficient.
   if x.ndim < len(pspec):
-    return shd.NamedSharding(mesh, shd.PartitionSpec())  # Replicated
+    return jax.sharding.NamedSharding(
+        mesh, jax.sharding.PartitionSpec()
+    )  # Replicated
 
   # Check for divisibility for all sharded axes.
   for i, axis_name in enumerate(pspec):
@@ -120,8 +124,8 @@ def get_sharding(
                 f"Array dimension {i} (size={x.shape[i]}) is not evenly "
                 f"divisible by mesh axis '{name}' (size={axis_size}). "
                 f"Array shape: {x.shape}, pspec: {pspec}. "
-                f"This usually means the batch size is misconfigured."
+                "This usually means the batch size is misconfigured."
             )
           # Replicate if not evenly divisible.
-          return shd.NamedSharding(mesh, shd.PartitionSpec())
-  return shd.NamedSharding(mesh, pspec)
+          return jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+  return jax.sharding.NamedSharding(mesh, pspec)

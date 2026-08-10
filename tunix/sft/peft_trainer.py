@@ -30,7 +30,7 @@ import flax.struct
 import jax
 from jax.interpreters import pxla
 import jax.numpy as jnp
-import jax.sharding as shd
+import jax.sharding
 import jax.stages
 import numpy as np
 import optax
@@ -462,7 +462,7 @@ class PeftTrainer(Generic[ModuleT]):
       return loss, aux
     return out, None
 
-  def _shard_optimizer(self, mesh: shd.Mesh) -> None:
+  def _shard_optimizer(self, mesh: jax.sharding.Mesh | None = None) -> None:
     """Optimizer states should be sharded before calling the jit function.
 
     If not, the _train_step will be compiled 2 times.
@@ -470,6 +470,8 @@ class PeftTrainer(Generic[ModuleT]):
     Args:
       mesh: The mesh used for sharding.
     """
+    if mesh is None or mesh.empty:
+      mesh = jax.sharding.get_mesh()
     if mesh.empty:
       return
     optimizer_state = nnx.state(self.optimizer, nnx.optimizer.OptState)
@@ -490,14 +492,16 @@ class PeftTrainer(Generic[ModuleT]):
 
     optimizer_pspecs = nnx.get_partition_spec(optimizer_state)
 
-    def _to_sharding(spec: Any) -> shd.Sharding:
-      if isinstance(spec, shd.Sharding):
+    def _to_sharding(spec: Any) -> jax.sharding.Sharding:
+      if isinstance(spec, jax.sharding.Sharding):
         return spec
-      if isinstance(spec, shd.PartitionSpec):
-        return shd.NamedSharding(mesh, spec)
+      if isinstance(spec, jax.sharding.PartitionSpec):
+        return jax.sharding.NamedSharding(mesh, spec)
       if isinstance(spec, tuple):
-        return shd.NamedSharding(mesh, shd.PartitionSpec(*spec))
-      return shd.NamedSharding(mesh, shd.PartitionSpec())
+        return jax.sharding.NamedSharding(
+            mesh, jax.sharding.PartitionSpec(*spec)
+        )
+      return jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
     optimizer_shardings = jax.tree.map(_to_sharding, optimizer_pspecs)
     optimizer_sharded_state = jax.device_put(
@@ -521,7 +525,7 @@ class PeftTrainer(Generic[ModuleT]):
     if self._compiled:
       return
 
-    self._shard_optimizer(pxla.thread_resources.env.physical_mesh)
+    self._shard_optimizer(jax.sharding.get_mesh())
 
     opts: dict[str, Any] = dict(
         compiler_options=self.config.compiler_options,
@@ -585,9 +589,10 @@ class PeftTrainer(Generic[ModuleT]):
 
     Calls ``compile()`` automatically if not already compiled.
     """
+    mesh = jax.sharding.get_mesh()
     logging.log_first_n(
         logging.INFO,
-        f"Training with mesh: {pxla.thread_resources.env.physical_mesh}",
+        f"Training with mesh: {mesh}",
         1,
     )
 
@@ -670,10 +675,10 @@ class PeftTrainer(Generic[ModuleT]):
 
         with self._perf_tracer.span(
             "peft_train_step",
-            pxla.thread_resources.env.physical_mesh.devices,
+            mesh.devices,
         ) as span, self._perf_tracer_v2.span(
             perf_constants.PEFT_TRAIN,
-            pxla.thread_resources.env.physical_mesh.devices,
+            mesh.devices,
             tags=tags,
         ) as span_v2:
           train_loss, aux, grad_norm = self.train_step(train_example)
