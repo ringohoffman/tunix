@@ -1158,6 +1158,8 @@ class Attention(nnx.Module):
         and cache is None
         and (seq_len % self.config.flash_attention_block_size == 0)
     ):
+      b, _, qh, _ = query_proj.shape
+      _, _, kh, _ = key_proj.shape
       query_proj = query_proj.transpose(0, 2, 1, 3)
       key_proj = key_proj.transpose(0, 2, 1, 3)
       value_proj = value_proj.transpose(0, 2, 1, 3)
