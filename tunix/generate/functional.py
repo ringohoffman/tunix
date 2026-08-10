@@ -33,13 +33,27 @@ import jax
 import jax.numpy as jnp
 from tunix.generate import beam_search as beam_search_lib
 from tunix.generate import constrained
-from tunix.generate import sampler as sampler_lib
 from tunix.generate import utils
 
 LayerCache: TypeAlias = dict[str, jax.Array]
 Cache: TypeAlias = dict[str, LayerCache]
 StackedCache: TypeAlias = tuple[LayerCache | None, ...]
 KVCache: TypeAlias = Cache | StackedCache | None
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class PrefixCache:
+  """Cached KV state and metadata for a pre-computed token prefix."""
+
+  # Cached key/value state populated up to prefix_length.
+  cache: KVCache
+
+  # Number of prefix tokens.
+  prefix_length: int
+
+  # Optional prefix token array of shape [P].
+  prefix_tokens: jax.Array | None = None
 
 
 @jax.tree_util.register_dataclass
@@ -238,6 +252,8 @@ def _sample_token(
   else:
     logits = logits[:, -1:]
 
+  from tunix.generate import sampler as sampler_lib
+
   if temperature == 0.0:
     return sampler_lib.sample_best(logits, return_logprobs=return_logprobs)
 
@@ -249,6 +265,73 @@ def _sample_token(
       top_p=top_p,
       top_k=top_k,
       return_logprobs=return_logprobs,
+  )
+
+
+def prefill_prefix(
+    model: nnx.Module,
+    prefix_ids: jax.Array | Sequence[int],
+    cache_size: int,
+    dtype: jnp.dtype = jnp.bfloat16,
+) -> PrefixCache:
+  """Prefill a constant prefix with batch size 1 and return a PrefixCache.
+
+  Args:
+    model: Transformer model NNX module.
+    prefix_ids: 1-D array or sequence of prefix token IDs.
+    cache_size: KV cache capacity.
+    dtype: KV cache data type.
+
+  Returns:
+    A ``PrefixCache`` dataclass containing the prefilled KV cache, prefix
+    length,
+    and prefix token array.
+  """
+  prefix_arr = jnp.asarray(prefix_ids, dtype=jnp.int32)
+  if prefix_arr.ndim == 1:
+    prefix_arr = prefix_arr[None, :]
+  pfx_batch, pfx_len = prefix_arr.shape
+  if pfx_batch != 1:
+    raise ValueError(f"prefix_ids must have batch size 1, got {pfx_batch}")
+
+  cache = None
+  if hasattr(model, "init_cache"):
+    cache = model.init_cache(1, cache_size, dtype=dtype)
+
+  positions = jnp.arange(pfx_len, dtype=jnp.int32)[None, :]
+  prefix_mask = prefix_arr != 0
+
+  if hasattr(model, "get_attention_mask"):
+    attn_mask = model.get_attention_mask(prefix_arr, inputs_mask=prefix_mask)
+    seq_len = attn_mask.shape[-1]
+    padding = cache_size - seq_len
+    attn_mask = jnp.pad(
+        attn_mask,
+        (*((0, 0) for _ in range(attn_mask.ndim - 1)), (0, padding)),
+    )
+  else:
+    attn_mask = utils.make_causal_attn_mask(prefix_mask, cache_size)
+
+  prefill_kwargs: dict[str, object] = {}
+  try:
+    if "decode_only_last_token" in inspect.signature(model.__call__).parameters:
+      prefill_kwargs["decode_only_last_token"] = True
+  except (ValueError, TypeError):
+    pass
+
+  _, cache = _unpack_model_output(
+      model(
+          prefix_arr,
+          positions,
+          cache,
+          attn_mask,
+          **prefill_kwargs,
+      )
+  )
+  return PrefixCache(
+      cache=cache,
+      prefix_length=pfx_len,
+      prefix_tokens=prefix_arr[0],
   )
 
 
@@ -270,6 +353,7 @@ def generate(
     return_logits: bool = False,
     return_logprobs: bool = False,
     return_cache: bool = False,
+    prefix_cache: PrefixCache | KVCache = None,
 ) -> GenerateOutput:
   """Autoregressive generation as a pure JAX function.
 
@@ -279,7 +363,8 @@ def generate(
   Args:
     model: An NNX module implementing the standard transformer interface
       ``model(tokens, positions, cache, attention_mask) -> (logits, cache)``.
-    input_ids: Left-padded prompt token IDs, shape ``[B, prompt_len]``.
+    input_ids: Left-padded prompt token IDs, shape ``[B, prompt_len]`` (or
+      suffix-only ``[B, S]`` when ``prefix_cache`` is provided).
     max_new_tokens: Maximum number of new tokens to generate.
     pad_id: Padding token ID.
     eos_id: End-of-sequence token ID.
@@ -297,13 +382,46 @@ def generate(
     return_cache: If ``True``, include the final KV cache in the output. Allows
       callers to explicitly manage cache lifecycle (keep, delete, or offload to
       host) rather than having it implicitly freed.
+    prefix_cache: Optional ``PrefixCache`` containing precomputed KV cache for a
+      shared prefix. When provided, prefill only executes for suffix tokens.
 
   Returns:
     A ``GenerateOutput`` containing generated tokens and optional
     logits / log-probabilities / KV cache.
   """
-  batch_size, prompt_len = input_ids.shape
-  total_len = prompt_len + max_new_tokens
+  batch_size = input_ids.shape[0]
+  in_len = input_ids.shape[1]
+
+  prefix_len = 0
+  prefix_tokens_arr = None
+  raw_cache = None
+  if prefix_cache is not None:
+    if isinstance(prefix_cache, PrefixCache):
+      prefix_len = prefix_cache.prefix_length
+      prefix_tokens_arr = prefix_cache.prefix_tokens
+      raw_cache = prefix_cache.cache
+    elif isinstance(prefix_cache, dict) and "v" in prefix_cache:
+      raw_cache = prefix_cache
+      prefix_len = int(prefix_cache.get("end_index", [0])[0])
+    else:
+      raw_cache = prefix_cache
+
+  if prefix_len > 0 and in_len <= prefix_len and prefix_tokens_arr is not None:
+    # Suffix-only tokens passed as input_ids: [B, S]
+    suffix_len = in_len
+    prompt_len = prefix_len + suffix_len
+    total_len = prompt_len + max_new_tokens
+    token_buffer = jnp.full((batch_size, total_len), pad_id, dtype=jnp.int32)
+    token_buffer = token_buffer.at[:, :prefix_len].set(
+        prefix_tokens_arr[None, :]
+    )
+    token_buffer = token_buffer.at[:, prefix_len:prompt_len].set(input_ids)
+  else:
+    # Full prompt passed as input_ids: [B, prompt_len] (or no prefix cache)
+    prompt_len = in_len
+    total_len = prompt_len + max_new_tokens
+    token_buffer = jnp.full((batch_size, total_len), pad_id, dtype=jnp.int32)
+    token_buffer = token_buffer.at[:, :prompt_len].set(input_ids)
 
   if max_new_tokens <= 0:
     return GenerateOutput(
@@ -320,7 +438,21 @@ def generate(
     key = jax.random.key(0)
 
   cache: KVCache = None
-  if hasattr(model, "init_cache"):
+  if raw_cache is not None:
+
+    def _broadcast_cache(leaf):
+      if not isinstance(leaf, (jax.Array, jnp.ndarray)):
+        return leaf
+      if leaf.ndim >= 2 and leaf.shape[1] == 1 and leaf.shape[0] > 1:
+        return jnp.broadcast_to(
+            leaf, (leaf.shape[0], batch_size, *leaf.shape[2:])
+        )
+      elif leaf.shape[0] == 1 and batch_size > 1:
+        return jnp.broadcast_to(leaf, (batch_size, *leaf.shape[1:]))
+      return leaf
+
+    cache = jax.tree.map(_broadcast_cache, raw_cache)
+  elif hasattr(model, "init_cache"):
     model_dtype = (
         model.config.dtype
         if hasattr(model, "config") and hasattr(model.config, "dtype")
@@ -360,34 +492,8 @@ def generate(
           constraint_tables.unique_items, batch_size
       )
 
-  token_buffer = jnp.full(
-      (batch_size, total_len),
-      pad_id,
-      dtype=jnp.int32,
-  )
-  token_buffer = token_buffer.at[:, :prompt_len].set(input_ids)
   positions = utils.build_positions_from_mask(token_buffer != pad_id)
-  input_mask = input_ids != pad_id
 
-  vocab_size_hint = getattr(model, "num_embed", None)
-  logits_buffer: jax.Array | None = None
-  logprobs_buffer: jax.Array | None = None
-
-  if hasattr(model, "get_attention_mask"):
-    attention_mask = model.get_attention_mask(input_ids, inputs_mask=input_mask)
-    seq_len = attention_mask.shape[-1]
-    padding = cache_size - seq_len
-    attention_mask = jnp.pad(
-        attention_mask,
-        (*((0, 0) for _ in range(attention_mask.ndim - 1)), (0, padding)),
-    )
-  else:
-    attention_mask = utils.make_causal_attn_mask(input_mask, cache_size)
-
-  # Only project the last prompt position through the LM head during
-  # prefill — we discard all other logits anyway (line ``last_logits =
-  # logits[:, -1:]`` below).  This saves (prompt_len - 1) * batch_size
-  # linear projections through the vocabulary projection layer.
   prefill_kwargs: dict[str, object] = {}
   try:
     if "decode_only_last_token" in inspect.signature(model.__call__).parameters:
@@ -395,17 +501,59 @@ def generate(
   except (ValueError, TypeError):
     pass
 
-  out = model(
-      input_ids,
-      positions[:, :prompt_len],
-      cache,
-      attention_mask,
-      **prefill_kwargs,
-  )
-  logits, cache = _unpack_model_output(out)
+  if prefix_len > 0:
+    suffix_len = prompt_len - prefix_len
+    suffix_tokens = token_buffer[:, prefix_len:prompt_len]
+    suffix_positions = positions[:, prefix_len:prompt_len]
+    suffix_mask = suffix_tokens != pad_id
+
+    attention_mask = jnp.zeros(
+        (batch_size, suffix_len, cache_size), dtype=jnp.bool_
+    )
+    attention_mask = attention_mask.at[:, :, :prefix_len].set(True)
+    causal_suffix = jnp.tril(
+        jnp.ones((suffix_len, suffix_len), dtype=jnp.bool_)
+    )[None, ...]
+    attention_mask = attention_mask.at[:, :, prefix_len:prompt_len].set(
+        causal_suffix & suffix_mask[:, None, :]
+    )
+
+    out = model(
+        suffix_tokens,
+        suffix_positions,
+        cache,
+        attention_mask,
+        **prefill_kwargs,
+    )
+    logits, cache = _unpack_model_output(out)
+  else:
+    input_mask = input_ids != pad_id
+    if hasattr(model, "get_attention_mask"):
+      attention_mask = model.get_attention_mask(
+          input_ids, inputs_mask=input_mask
+      )
+      seq_len = attention_mask.shape[-1]
+      padding = cache_size - seq_len
+      attention_mask = jnp.pad(
+          attention_mask,
+          (*((0, 0) for _ in range(attention_mask.ndim - 1)), (0, padding)),
+      )
+    else:
+      attention_mask = utils.make_causal_attn_mask(input_mask, cache_size)
+
+    out = model(
+        input_ids,
+        positions[:, :prompt_len],
+        cache,
+        attention_mask,
+        **prefill_kwargs,
+    )
+    logits, cache = _unpack_model_output(out)
 
   # Initialise logits/logprobs buffers now that we know the vocab size.
   actual_vocab_size = logits.shape[-1]
+  logits_buffer: jax.Array | None = None
+  logprobs_buffer: jax.Array | None = None
   if return_logits:
     logits_buffer = jnp.zeros(
         (batch_size, total_len, actual_vocab_size),

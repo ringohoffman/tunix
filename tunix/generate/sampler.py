@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
-from collections.abc import Sequence
 import dataclasses
 import inspect
 from typing import Any, TypeGuard, TypeVar
@@ -36,6 +35,7 @@ import jaxtyping
 import numpy as np
 from tunix.generate import base_sampler
 from tunix.generate import constrained
+from tunix.generate import functional
 from tunix.generate import utils
 import tunix.generate.beam_search as beam_search_lib
 import tunix.generate.tokenizer_adapter as tok_adapter
@@ -137,6 +137,9 @@ class _SamplingState:
   [B, L, V]. Constant across decode steps; carried in state so it is
   visible inside the jax.lax.while_loop.
   """
+
+  prefill_start_idx: int = flax.struct.field(pytree_node=False, default=0)
+  """Starting token index for the prefill step (0 for full prefill, P for prefix-cached prefill)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -347,10 +350,157 @@ class Sampler(base_sampler.BaseSampler):
         donate_argnums=(1,),
         static_argnames=('echo',),
     )
+    self._compiled_prefix_prefill_fn = jax.jit(self._prefix_prefill_fn)
     self._supports_decode_only_last_token = (
         'decode_only_last_token'
         in inspect.signature(transformer.__call__).parameters
     )
+
+  def _prefix_prefill_fn(
+      self,
+      params: Sequence[nnx.Variable[_ParamT]],
+      tokens: jax.Array,
+      positions: jax.Array,
+      cache: functional.KVCache,
+      attention_mask: jax.Array,
+  ) -> tuple[jax.Array, functional.KVCache]:
+    """Internal function to prefill a token prefix (to be jitted)."""
+    transformer = nnx.merge(self._transformer_graphdef, params)
+    logits, new_cache = transformer(
+        tokens,
+        positions,
+        cache,
+        attention_mask,
+    )
+    return logits, new_cache
+
+  def prefill_prefix(
+      self,
+      prefix: str | Sequence[int] | np.ndarray | jax.Array,
+  ) -> functional.PrefixCache:
+    """Prefills a shared token prefix once, producing a reusable PrefixCache.
+
+    Args:
+      prefix: Input prompt string or 1D token IDs array of shape [P].
+
+    Returns:
+      PrefixCache containing the populated KV cache up to position P.
+    """
+    if isinstance(prefix, str):
+      prefix_tokens = np.asarray(self.tokenizer.encode(prefix), dtype=np.int32)
+    else:
+      prefix_tokens = np.asarray(prefix, dtype=np.int32)
+
+    if prefix_tokens.ndim > 1:
+      prefix_tokens = np.squeeze(prefix_tokens)
+    if prefix_tokens.ndim != 1:
+      raise ValueError(
+          f'prefix_tokens must be 1D, got shape {prefix_tokens.shape}'
+      )
+
+    P = int(prefix_tokens.shape[0])
+    if P <= 0:
+      raise ValueError('prefix_tokens must be non-empty.')
+    if P > self.cache_config.cache_size:
+      raise ValueError(
+          f'Prefix length {P} exceeds cache_size'
+          f' {self.cache_config.cache_size}.'
+      )
+
+    if hasattr(self.transformer, 'init_cache'):
+      cache = self.transformer.init_cache(
+          1, self.cache_config.cache_size, self.dtype
+      )
+    else:
+      cache = _init_cache(
+          n_layers=self.cache_config.num_layers,
+          cache_size=self.cache_config.cache_size,
+          batch_size=1,
+          num_kv_heads=self.cache_config.num_kv_heads,
+          head_dim=self.cache_config.head_dim,
+          dtype=self.dtype,
+      )
+
+    tokens = jnp.array(prefix_tokens[None, :], dtype=jnp.int32)
+    positions = jnp.arange(P, dtype=jnp.int32)[None, :]
+    input_mask = jnp.ones((1, P), dtype=jnp.bool_)
+    if hasattr(self.transformer, 'get_attention_mask'):
+      attention_mask = self.transformer.get_attention_mask(
+          tokens, inputs_mask=input_mask
+      )
+      seq_len = attention_mask.shape[-1]
+      padding = self.cache_config.cache_size - seq_len
+      attention_mask = jnp.pad(
+          attention_mask,
+          (*((0, 0) for _ in range(attention_mask.ndim - 1)), (0, padding)),
+      )
+    else:
+      attention_mask = utils.make_causal_attn_mask(
+          input_mask, self.cache_config.cache_size
+      )
+
+    _, prefix_cache = self._compiled_prefix_prefill_fn(
+        self._flattened_transformer_state,
+        tokens,
+        positions,
+        cache,
+        attention_mask,
+    )
+    return functional.PrefixCache(
+        cache=prefix_cache,
+        prefix_length=P,
+        prefix_tokens=jnp.asarray(prefix_tokens, dtype=jnp.int32),
+    )
+
+  def _broadcast_prefix_cache(
+      self,
+      prefix_cache: functional.PrefixCache,
+      batch_size: int,
+  ) -> functional.KVCache:
+    """Broadcasts a 1-sequence PrefixCache across the batch dimension."""
+
+    def _broadcast_leaf(x):
+      if not isinstance(x, (jax.Array, jnp.ndarray, np.ndarray)):
+        return x
+      # Scan-group cache: shape [num_scan_groups, 1, max_seq_len, ...] or [num_scan_groups, 1]
+      if x.ndim >= 2 and x.shape[1] == 1 and x.shape[0] > 1:
+        new_shape = (x.shape[0], batch_size, *x.shape[2:])
+        broadcasted = jnp.broadcast_to(x, new_shape)
+        if hasattr(self, 'data_sharding') and not self.data_sharding.mesh.empty:
+          batch_axis = (
+              self.data_sharding.spec[0]
+              if len(self.data_sharding.spec) > 0
+              else None
+          )
+          if x.ndim == 2:  # end_index
+            shd = jax.sharding.NamedSharding(
+                self.data_sharding.mesh,
+                jax.sharding.PartitionSpec(None, batch_axis),
+            )
+            return jax.lax.with_sharding_constraint(broadcasted, shd)
+          else:
+            shd = jax.sharding.NamedSharding(
+                self.data_sharding.mesh,
+                jax.sharding.PartitionSpec(None, batch_axis, None, None, None),
+            )
+            return jax.lax.with_sharding_constraint(broadcasted, shd)
+        return broadcasted
+      elif x.shape[0] == 1:
+        new_shape = (batch_size, *x.shape[1:])
+        broadcasted = jnp.broadcast_to(x, new_shape)
+        if hasattr(self, 'data_sharding') and not self.data_sharding.mesh.empty:
+          if x.ndim == 1:  # end_index
+            return jax.lax.with_sharding_constraint(
+                broadcasted, self.batch_sharding
+            )
+          else:
+            return jax.lax.with_sharding_constraint(
+                broadcasted, self.data_sharding
+            )
+        return broadcasted
+      return x
+
+    return jax.tree.map(_broadcast_leaf, prefix_cache.cache)
 
   def compile_constraint(
       self,
@@ -511,21 +661,72 @@ class Sampler(base_sampler.BaseSampler):
       include_logprobs: bool = False,
       constraint: constrained.Constraint | None = None,
       logit_gather_ids: jax.Array | None = None,
+      prefix_cache: functional.PrefixCache | None = None,
   ) -> _SamplingState:
     """Initializes the sampling state given input prompts."""
-    batch_size, num_input_tokens, *_ = all_input_ids.shape
+    batch_size = all_input_ids.shape[0]
 
     if seed is None:
       seed = jax.random.key(0)
     elif not hasattr(seed, 'dtype'):
       seed = jax.random.key(seed)
 
-    token_buffer = jnp.full(
-        (batch_size, total_sampling_steps),
-        self.tokenizer.pad_id(),
-        dtype=jnp.int32,
-    )
-    token_buffer = token_buffer.at[:, :num_input_tokens].set(all_input_ids)
+    if prefix_cache is not None:
+      P = prefix_cache.prefix_length
+      if all_input_ids.shape[1] > P:
+        num_input_tokens = all_input_ids.shape[1]
+        token_buffer = jnp.full(
+            (batch_size, total_sampling_steps),
+            self.tokenizer.pad_id(),
+            dtype=jnp.int32,
+        )
+        token_buffer = token_buffer.at[:, :num_input_tokens].set(all_input_ids)
+      else:
+        S = all_input_ids.shape[1]
+        num_input_tokens = P + S
+        token_buffer = jnp.full(
+            (batch_size, total_sampling_steps),
+            self.tokenizer.pad_id(),
+            dtype=jnp.int32,
+        )
+        if prefix_cache.prefix_tokens is not None:
+          pfx = jnp.asarray(prefix_cache.prefix_tokens, dtype=jnp.int32)
+          if pfx.ndim == 1:
+            pfx = pfx[None, :]
+          token_buffer = token_buffer.at[:, :P].set(pfx)
+        token_buffer = token_buffer.at[:, P:num_input_tokens].set(all_input_ids)
+      prefill_start_idx = P
+      cache = self._broadcast_prefix_cache(prefix_cache, batch_size)
+    else:
+      num_input_tokens = all_input_ids.shape[1]
+      prefill_start_idx = 0
+      token_buffer = jnp.full(
+          (batch_size, total_sampling_steps),
+          self.tokenizer.pad_id(),
+          dtype=jnp.int32,
+      )
+      token_buffer = token_buffer.at[:, :num_input_tokens].set(all_input_ids)
+      if hasattr(self.transformer, 'init_cache'):
+        cache = self.transformer.init_cache(
+            batch_size, self.cache_config.cache_size, self.dtype
+        )
+      else:
+        warnings.warn(
+            'Using deprecated _init_cache in Tunix sampler. Models are now'
+            ' required to have their own init_cache attribute.',
+            DeprecationWarning,
+        )
+        cache = _init_cache(
+            n_layers=self.cache_config.num_layers,
+            cache_size=self.cache_config.cache_size,
+            batch_size=batch_size,
+            num_kv_heads=self.cache_config.num_kv_heads,
+            head_dim=self.cache_config.head_dim,
+            dtype=self.dtype,
+            batch_sharding=self.batch_sharding,
+            data_sharding=self.data_sharding,
+        )
+
     token_buffer = jax.device_put(token_buffer, self.data_sharding)
 
     positions = jax.device_put(
@@ -537,27 +738,6 @@ class Sampler(base_sampler.BaseSampler):
     done = jax.device_put(
         jnp.zeros((batch_size,), dtype=jnp.bool_), self.batch_sharding
     )
-
-    if hasattr(self.transformer, 'init_cache'):
-      cache = self.transformer.init_cache(
-          batch_size, self.cache_config.cache_size, self.dtype
-      )
-    else:
-      warnings.warn(
-          'Using deprecated _init_cache in Tunix sampler. Models are now'
-          ' required to have their own init_cache attribute.',
-          DeprecationWarning,
-      )
-      cache = _init_cache(
-          n_layers=self.cache_config.num_layers,
-          cache_size=self.cache_config.cache_size,
-          batch_size=batch_size,
-          num_kv_heads=self.cache_config.num_kv_heads,
-          head_dim=self.cache_config.head_dim,
-          dtype=self.dtype,
-          batch_sharding=self.batch_sharding,
-          data_sharding=self.data_sharding,
-      )
 
     if include_logits:
       vocab_dim = (
@@ -648,6 +828,7 @@ class Sampler(base_sampler.BaseSampler):
         unique_state=unique_state,
         token_bounds_state=token_bounds_state,
         logit_gather_ids=logit_gather_ids,
+        prefill_start_idx=prefill_start_idx,
     )
 
   def tokenize(self, input_string: str) -> np.ndarray | list[int]:
@@ -804,37 +985,59 @@ class Sampler(base_sampler.BaseSampler):
     """Performs prefill."""
     batch_size = sampler_state.token_buffer.shape[0]
 
-    tokens = jax.lax.dynamic_slice(
-        sampler_state.token_buffer,
-        start_indices=jnp.zeros(
-            (sampler_state.token_buffer.ndim,), dtype=jnp.int32
-        ),
-        slice_sizes=(batch_size, sampler_state.num_input_tokens),
-    )
-    step_positions = jax.lax.dynamic_slice(
-        sampler_state.positions,
-        start_indices=jnp.zeros(
-            (sampler_state.token_buffer.ndim,), dtype=jnp.int32
-        ),
-        slice_sizes=(batch_size, sampler_state.num_input_tokens),
-    )
-
-    input_mask = tokens != self.tokenizer.pad_id()
-
-    if hasattr(self.transformer, 'get_attention_mask'):
-      attention_mask = self.transformer.get_attention_mask(
-          tokens, inputs_mask=input_mask
+    if sampler_state.prefill_start_idx > 0:
+      P = sampler_state.prefill_start_idx
+      S = sampler_state.num_input_tokens - P
+      tokens = jax.lax.dynamic_slice(
+          sampler_state.token_buffer,
+          (0, P),
+          (batch_size, S),
       )
-      seq_len = attention_mask.shape[-1]
-      padding = self.cache_config.cache_size - seq_len
-      attention_mask = jnp.pad(
-          attention_mask,
-          (*((0, 0) for _ in range(attention_mask.ndim - 1)), (0, padding)),
+      step_positions = jax.lax.dynamic_slice(
+          sampler_state.positions,
+          (0, P),
+          (batch_size, S),
       )
+      input_mask = tokens != self.tokenizer.pad_id()
+      attention_mask = jnp.zeros(
+          (batch_size, S, self.cache_config.cache_size), dtype=jnp.bool_
+      )
+      attention_mask = attention_mask.at[:, :, :P].set(True)
+      causal_suffix = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))[None, ...]
+      valid_causal = causal_suffix & input_mask[:, None, :]
+      attention_mask = attention_mask.at[:, :, P : P + S].set(valid_causal)
     else:
-      attention_mask = utils.make_causal_attn_mask(
-          input_mask, self.cache_config.cache_size
+      tokens = jax.lax.dynamic_slice(
+          sampler_state.token_buffer,
+          start_indices=jnp.zeros(
+              (sampler_state.token_buffer.ndim,), dtype=jnp.int32
+          ),
+          slice_sizes=(batch_size, sampler_state.num_input_tokens),
       )
+      step_positions = jax.lax.dynamic_slice(
+          sampler_state.positions,
+          start_indices=jnp.zeros(
+              (sampler_state.token_buffer.ndim,), dtype=jnp.int32
+          ),
+          slice_sizes=(batch_size, sampler_state.num_input_tokens),
+      )
+
+      input_mask = tokens != self.tokenizer.pad_id()
+
+      if hasattr(self.transformer, 'get_attention_mask'):
+        attention_mask = self.transformer.get_attention_mask(
+            tokens, inputs_mask=input_mask
+        )
+        seq_len = attention_mask.shape[-1]
+        padding = self.cache_config.cache_size - seq_len
+        attention_mask = jnp.pad(
+            attention_mask,
+            (*((0, 0) for _ in range(attention_mask.ndim - 1)), (0, padding)),
+        )
+      else:
+        attention_mask = utils.make_causal_attn_mask(
+            input_mask, self.cache_config.cache_size
+        )
 
     # Merge once at the JIT boundary, outside any traced control flow.
     transformer = nnx.merge(self._transformer_graphdef, params)
@@ -855,7 +1058,9 @@ class Sampler(base_sampler.BaseSampler):
     beam_search_sampling_state = None
     if sampler_state.logits_buffer is not None:
       start_idx = (
-          sampler_state.num_input_tokens if decode_only_last_token else 1
+          sampler_state.num_input_tokens
+          if decode_only_last_token
+          else (sampler_state.prefill_start_idx + 1)
       )
       logits_to_store = logits
       if sampler_state.logit_gather_ids is not None:
@@ -912,6 +1117,7 @@ class Sampler(base_sampler.BaseSampler):
         unique_state=sampler_state.unique_state,
         token_bounds_state=sampler_state.token_bounds_state,
         logit_gather_ids=sampler_state.logit_gather_ids,
+        prefill_start_idx=sampler_state.prefill_start_idx,
     )
     updated_sampler_state = self._sample(
         logits=logits,
@@ -1036,6 +1242,7 @@ class Sampler(base_sampler.BaseSampler):
           | None
       ) = None,
       constraint: constrained.Constraint | None = None,
+      prefix_cache: functional.PrefixCache | None = None,
   ) -> base_sampler.SamplerOutput:
     """Samples a completion of the input string."""
     input_strings = (
@@ -1083,6 +1290,7 @@ class Sampler(base_sampler.BaseSampler):
         pad_output=pad_output,
         processed_images=processed_images,
         constraint_tables=compiled_tables,
+        prefix_cache=prefix_cache,
     )
 
   def generate_from_tokens(
@@ -1102,6 +1310,7 @@ class Sampler(base_sampler.BaseSampler):
       pad_output: bool = False,
       constraint: constrained.Constraint | None = None,
       logit_gather_ids: jax.Array | None = None,
+      prefix_cache: functional.PrefixCache | None = None,
   ) -> base_sampler.SamplerOutput:
     """Generate from pre-tokenized, pre-padded token arrays."""
     forbidden_token_ids = tuple(forbidden_tokens) if forbidden_tokens else None
@@ -1132,6 +1341,7 @@ class Sampler(base_sampler.BaseSampler):
         processed_images=None,
         constraint_tables=compiled_tables,
         logit_gather_ids=logit_gather_ids,
+        prefix_cache=prefix_cache,
     )
 
   def _generate_impl(
@@ -1153,6 +1363,7 @@ class Sampler(base_sampler.BaseSampler):
       processed_images: jnp.ndarray | None = None,
       constraint_tables: constrained.ConstraintTables | None = None,
       logit_gather_ids: jnp.ndarray | None = None,
+      prefix_cache: functional.PrefixCache | None = None,
   ) -> base_sampler.SamplerOutput:
     """Core generation logic shared by __call__ and generate_from_tokens.
 
@@ -1174,11 +1385,23 @@ class Sampler(base_sampler.BaseSampler):
       seed: Random seed (int, PRNGKey, or None).
       pad_output: Pad output to max length.
       processed_images: Pre-processed images, or None.
+      constraint_tables: Pre-compiled constraint transition tables.
+      logit_gather_ids: Gather IDs for logit extraction.
+      prefix_cache: Optional PrefixCache containing reusable prefix KV cache.
 
     Returns:
       SamplerOutput.
     """
-    total_sampling_steps = max_prompt_length + max_generation_steps
+    if prefix_cache is not None:
+      P = prefix_cache.prefix_length
+      if all_input_ids.shape[1] > P:
+        total_prompt_length = all_input_ids.shape[1]
+      else:
+        total_prompt_length = P + all_input_ids.shape[1]
+    else:
+      total_prompt_length = max_prompt_length
+
+    total_sampling_steps = total_prompt_length + max_generation_steps
     if total_sampling_steps > self.cache_config.cache_size:
       raise ValueError(
           f'Total sampling steps {total_sampling_steps} must be less than the'
@@ -1198,6 +1421,7 @@ class Sampler(base_sampler.BaseSampler):
         include_logprobs=return_logprobs,
         constraint=constraint_tables,
         logit_gather_ids=logit_gather_ids,
+        prefix_cache=prefix_cache,
     )
     if constraint_tables is not None:
       compiled_prefill_fn = nnx.jit(self._prefill_fn, static_argnames=('echo',))
@@ -1246,7 +1470,7 @@ class Sampler(base_sampler.BaseSampler):
               echo,
               self.tokenizer.pad_id(),
               self.eos_tokens,
-              max_prompt_length,
+              total_prompt_length,
               max_len,
           )
       )
@@ -1272,13 +1496,13 @@ class Sampler(base_sampler.BaseSampler):
                 token_buffer, self.tokenizer.pad_id()
             )
             if echo
-            else max_prompt_length
+            else total_prompt_length
         )
         end_idx = (
             utils.np_find_first_eos_idx(
-                token_buffer[max_prompt_length:], self.eos_tokens
+                token_buffer[total_prompt_length:], self.eos_tokens
             )
-            + max_prompt_length
+            + total_prompt_length
         )
         out_tokens.append(token_buffer[start_idx:end_idx])
         if return_logits:

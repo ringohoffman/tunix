@@ -427,6 +427,100 @@ class FunctionalGenerateTest(parameterized.TestCase):
     )
     self.assertEqual(out.tokens.shape, (2, 3))
 
+  def test_prefix_caching_parity(self):
+    from tunix.models.gemma4 import model as gemma4_model_lib
+
+    config = gemma4_model_lib.ModelConfig(
+        num_layers=2,
+        num_embed=32,
+        embed_dim=16,
+        hidden_dim=16,
+        num_heads=4,
+        head_dim=16,
+        num_kv_heads=1,
+        per_layer_input_dim=16,
+        sliding_window_size=16,
+        param_dtype=jnp.float32,
+        attention_pattern=(
+            gemma4_model_lib.AttentionType.GLOBAL,
+            gemma4_model_lib.AttentionType.GLOBAL,
+        ),
+        final_logit_softcap=30.0,
+        local_rope_proportion=1.0,
+        global_rope_proportion=0.25,
+        global_key_size=16,
+        k_eq_v_global=False,
+        local_base_frequency=10000,
+        global_base_frequency=1000000,
+        local_scale_factor=1.0,
+        global_scale_factor=1.0,
+    )
+    rngs = nnx.Rngs(42)
+    gemma_model = gemma4_model_lib.Gemma4(config, rngs=rngs)
+
+    prefix = [5, 6, 7, 8, 9, 10]
+    prompt1 = prefix + [11, 12, 13]
+    prompt2 = prefix + [14, 15, 16]
+    input_ids = jnp.array([prompt1, prompt2], dtype=jnp.int32)
+
+    # 1. Standard generate (no prefix cache)
+    out_std = functional.generate(
+        gemma_model,
+        input_ids,
+        max_new_tokens=8,
+        pad_id=self.pad_id,
+        eos_id=self.eos_id,
+        cache_size=64,
+        temperature=0.0,
+        return_logits=True,
+    )
+
+    # 2. Prefill prefix cache
+    pfx_cache = functional.prefill_prefix(
+        gemma_model,
+        prefix,
+        cache_size=64,
+        dtype=jnp.float32,
+    )
+    self.assertEqual(pfx_cache.prefix_length, len(prefix))
+
+    # 3. Generate with full input_ids [B, P+S] and prefix_cache
+    out_cached = functional.generate(
+        gemma_model,
+        input_ids,
+        max_new_tokens=8,
+        pad_id=self.pad_id,
+        eos_id=self.eos_id,
+        cache_size=64,
+        temperature=0.0,
+        return_logits=True,
+        prefix_cache=pfx_cache,
+    )
+
+    np.testing.assert_array_equal(out_std.tokens, out_cached.tokens)
+    np.testing.assert_allclose(
+        out_std.logits, out_cached.logits, atol=1e-5, rtol=1e-5
+    )
+
+    # 4. Generate with suffix-only [B, S] and prefix_cache
+    suffix_ids = jnp.array([[11, 12, 13], [14, 15, 16]], dtype=jnp.int32)
+    out_suffix = functional.generate(
+        gemma_model,
+        suffix_ids,
+        max_new_tokens=8,
+        pad_id=self.pad_id,
+        eos_id=self.eos_id,
+        cache_size=64,
+        temperature=0.0,
+        return_logits=True,
+        prefix_cache=pfx_cache,
+    )
+
+    np.testing.assert_array_equal(out_std.tokens, out_suffix.tokens)
+    np.testing.assert_allclose(
+        out_std.logits, out_suffix.logits, atol=1e-5, rtol=1e-5
+    )
+
 
 if __name__ == "__main__":
   absltest.main()

@@ -1065,39 +1065,48 @@ class Attention(nnx.Module):
       assert kv_shared_cache is None
       # Update cache with new kv projections
       cache_len = cache["v"].shape[1]
-      if seq_len > 1:  # prefill
-        if self.config.use_sliding_window_kv_cache:
-          # Sliding window cache update (prefill).
-          # Does not support chunked prefill.
-          valid_len = min(seq_len, cache_len)
-          latest_indices = jnp.arange(seq_len - valid_len, seq_len) % cache_len
-          cache_v = (
-              cache["v"]
-              .at[:, latest_indices, ...]
-              .set(value_proj[:, -valid_len:, ...])
-          )
-          cache_k = (
-              cache["k"]
-              .at[:, latest_indices, ...]
-              .set(key_proj[:, -valid_len:, ...])
-          )
-        else:
-          cache_v = cache["v"].at[:, :seq_len, ...].set(value_proj)
-          cache_k = cache["k"].at[:, :seq_len, ...].set(key_proj)
-
+      end_index = cache["end_index"][0]
+      if seq_len > cache_len:
+        # Prompt longer than cache size (e.g. sliding window cache test)
+        valid_len = cache_len
+        latest_indices = jnp.arange(seq_len - valid_len, seq_len) % cache_len
+        cache_v = (
+            cache["v"]
+            .at[:, latest_indices, ...]
+            .set(value_proj[:, -valid_len:, ...])
+        )
+        cache_k = (
+            cache["k"]
+            .at[:, latest_indices, ...]
+            .set(key_proj[:, -valid_len:, ...])
+        )
         new_cache = {
             "v": cache_v,
             "k": cache_k,
             "end_index": cache["end_index"] + seq_len,
         }
-      else:  # decode
-        end_index = cache["end_index"][0]
+      elif seq_len > 1:  # prefill (seq_len <= cache_len)
+        slice_indices = (0, end_index % cache_len, 0, 0)
+        cache_v = jax.lax.dynamic_update_slice(
+            cache["v"], value_proj.astype(cache["v"].dtype), slice_indices
+        )
+        cache_k = jax.lax.dynamic_update_slice(
+            cache["k"], key_proj.astype(cache["k"].dtype), slice_indices
+        )
+        new_cache = {
+            "v": cache_v,
+            "k": cache_k,
+            "end_index": cache["end_index"] + seq_len,
+        }
+        value_proj = cache_v
+        key_proj = cache_k
+      else:  # decode (seq_len == 1)
         slice_indices = (0, end_index % cache_len, 0, 0)
         value_proj = jax.lax.dynamic_update_slice(
-            cache["v"], value_proj, slice_indices
+            cache["v"], value_proj.astype(cache["v"].dtype), slice_indices
         )
         key_proj = jax.lax.dynamic_update_slice(
-            cache["k"], key_proj, slice_indices
+            cache["k"], key_proj.astype(cache["k"].dtype), slice_indices
         )
         new_cache = {
             "v": value_proj,
@@ -1115,14 +1124,15 @@ class Attention(nnx.Module):
     # and suppress the cache write so the shared layer's output cache
     # contains the origin's cache rather than its own wasted projections.
     if kv_override is not None and use_kv_override is not None:
-      if seq_len > 1:  # prefill: key_proj is raw [B, seq_len, H, D]
+      if cache is None or seq_len > cache["v"].shape[1]:
+        # prefill without prior cache: key_proj is raw [B, seq_len, H, D]
         key_proj = jnp.where(
             use_kv_override, kv_override["k"][:, :seq_len], key_proj
         )
         value_proj = jnp.where(
             use_kv_override, kv_override["v"][:, :seq_len], value_proj
         )
-      else:  # decode: key_proj is full cache [B, cache_len, H, D]
+      else:  # decode or cache-enabled prefill: key_proj is full cache [B, cache_len, H, D]
         key_proj = jnp.where(use_kv_override, kv_override["k"], key_proj)
         value_proj = jnp.where(use_kv_override, kv_override["v"], value_proj)
       if cache is not None:
@@ -1335,8 +1345,12 @@ class Attention(nnx.Module):
         logits = jnp.einsum("BTNH,BSNH->BTNS", query_proj, key_proj)
 
       assert attn_mask is not None, "attn_mask required for non-flash path"
-      if seq_len > 1 and attn_mask is not None:
-        # Only compute attention scores for the actual sequence length.
+      if (
+          attn_mask is not None
+          and (cache is None or seq_len > cache["v"].shape[1])
+      ):
+        # Only compute attention scores for the actual sequence length when not
+        # using a cache-backed representation.
         attn_mask = attn_mask[..., :seq_len]
 
       if self.attn_type == AttentionType.LOCAL_SLIDING:

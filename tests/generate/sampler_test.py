@@ -726,6 +726,101 @@ class SamplerTest(parameterized.TestCase):
       self.assertEqual(l_opt.shape, l_unopt.shape)
       np.testing.assert_allclose(l_opt, l_unopt, atol=1e-5, rtol=1e-5)
 
+  def test_prefix_caching_consistency(self):
+    """Verifies that prefix caching produces bitwise identical generations and logits."""
+    config = gemma4_model_lib.ModelConfig(
+        num_layers=2,
+        num_embed=32,
+        embed_dim=16,
+        hidden_dim=16,
+        num_heads=4,
+        head_dim=16,
+        num_kv_heads=1,
+        per_layer_input_dim=16,
+        sliding_window_size=16,
+        param_dtype=jnp.bfloat16,
+        attention_pattern=(
+            gemma4_model_lib.AttentionType.GLOBAL,
+            gemma4_model_lib.AttentionType.GLOBAL,
+        ),
+        final_logit_softcap=30.0,
+        local_rope_proportion=1.0,
+        global_rope_proportion=0.25,
+        global_key_size=16,
+        k_eq_v_global=False,
+        local_base_frequency=10000,
+        global_base_frequency=1000000,
+        local_scale_factor=1.0,
+        global_scale_factor=1.0,
+    )
+    rngs = nnx.Rngs(42)
+    model = gemma4_model_lib.Gemma4(config, rngs=rngs)
+    cache_config = sampler_lib.CacheConfig(
+        cache_size=64,
+        num_layers=config.num_layers,
+        num_kv_heads=config.num_kv_heads,
+        head_dim=config.head_dim,
+    )
+    mock_tokenizer = tc.MockVocab()
+    mock_tokenizer.DecodeIds = lambda x: ' '.join(map(str, x))
+
+    sampler = sampler_lib.Sampler(model, mock_tokenizer, cache_config)
+
+    prefix = [5, 6, 7, 8, 9, 10]
+    prompt1 = prefix + [11, 12, 13]
+    prompt2 = prefix + [14, 15, 16]
+
+    # Pre-pad prompts (equal length starting with prefix)
+    input_ids = np.array([prompt1, prompt2], dtype=np.int32)
+
+    # 1. Standard generation (no prefix cache)
+    res_std = sampler.generate_from_tokens(
+        input_ids,
+        max_generation_steps=12,
+        return_logits=True,
+        temperature=0.0,
+    )
+
+    # 2. Prefix-cached generation with full input_ids [B, P+S]
+    prefix_cache = sampler.prefill_prefix(prefix)
+    self.assertEqual(prefix_cache.prefix_length, len(prefix))
+
+    res_cached = sampler.generate_from_tokens(
+        input_ids,
+        max_generation_steps=12,
+        return_logits=True,
+        temperature=0.0,
+        prefix_cache=prefix_cache,
+    )
+
+    # Verify parity
+    self.assertEqual(len(res_std.tokens), len(res_cached.tokens))
+    for t_std, t_cached in zip(res_std.tokens, res_cached.tokens):
+      np.testing.assert_array_equal(t_std, t_cached)
+
+    self.assertEqual(len(res_std.logits), len(res_cached.logits))
+    for l_std, l_cached in zip(res_std.logits, res_cached.logits):
+      self.assertEqual(l_std.shape, l_cached.shape)
+      np.testing.assert_allclose(l_std, l_cached, atol=1e-5, rtol=1e-5)
+
+    # 3. Prefix-cached generation with suffix-only input_ids [B, S]
+    suffix_ids = np.array([[11, 12, 13], [14, 15, 16]], dtype=np.int32)
+    res_suffix_only = sampler.generate_from_tokens(
+        suffix_ids,
+        max_generation_steps=12,
+        return_logits=True,
+        temperature=0.0,
+        prefix_cache=prefix_cache,
+    )
+
+    self.assertEqual(len(res_std.tokens), len(res_suffix_only.tokens))
+    for t_std, t_suf in zip(res_std.tokens, res_suffix_only.tokens):
+      np.testing.assert_array_equal(t_std, t_suf)
+
+    for l_std, l_suf in zip(res_std.logits, res_suffix_only.logits):
+      self.assertEqual(l_std.shape, l_suf.shape)
+      np.testing.assert_allclose(l_std, l_suf, atol=1e-5, rtol=1e-5)
+
 
 if __name__ == '__main__':
   absltest.main()
