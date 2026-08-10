@@ -55,7 +55,7 @@ import dataclasses
 import functools
 import json
 import re
-from typing import Any, Literal, Optional, TypeAlias, TypedDict, cast, overload
+from typing import Any, Literal, TypeAlias, TypedDict, cast, overload
 
 import flax.struct
 import jax
@@ -170,7 +170,7 @@ def _regex_to_nfa(pattern: str) -> tuple[_NfaNode, _NfaNode]:
   """
   pos = 0
 
-  def peek() -> Optional[str]:
+  def peek() -> str | None:
     nonlocal pos
     return pattern[pos] if pos < len(pattern) else None
 
@@ -527,7 +527,7 @@ def _minimize_dfa(
   W: list[set[int]] = [set(s) for s in P]
 
   # Collect all alphabet characters used across all transitions
-  alphabet = set(c for _, c in char_transitions.keys())
+  alphabet = set(c for _, c in char_transitions)
 
   # Build inverse transition map: (target_state, char) -> set of source_states
   inv_trans: dict[tuple[int, str], set[int]] = {}
@@ -629,49 +629,64 @@ def _dfa_step(
   return INVALID_STATE
 
 
-@numba.njit(cache=True)
+def _build_first_byte_index(
+    token_bytes_flat: npt.NDArray[np.uint8],
+    token_offsets: npt.NDArray[np.int32],
+    valid_token_ids: npt.NDArray[np.int32],
+) -> tuple[npt.NDArray[np.int32], npt.NDArray[np.int32]]:
+  """Build first-byte bucket offsets and sorted token IDs for fast simulation."""
+  if len(valid_token_ids) == 0:
+    return np.zeros(257, dtype=np.int32), np.empty(0, dtype=np.int32)
+  first_bytes = token_bytes_flat[token_offsets[valid_token_ids]]
+  sort_idx = np.argsort(first_bytes, kind="stable")
+  sorted_tokens = valid_token_ids[sort_idx].astype(np.int32)
+  sorted_first_bytes = first_bytes[sort_idx]
+  counts = np.bincount(sorted_first_bytes, minlength=256).astype(np.int32)
+  first_byte_offsets = np.zeros(257, dtype=np.int32)
+  first_byte_offsets[1:] = np.cumsum(counts)
+  return first_byte_offsets, sorted_tokens
+
+
+@numba.njit(parallel=True, fastmath=True, cache=True)
 def _simulate_tokens_numba(
     char_table: npt.NDArray[np.int32],
     token_bytes_flat: npt.NDArray[np.uint8],
     token_offsets: npt.NDArray[np.int32],
     token_lengths: npt.NDArray[np.int32],
+    first_byte_offsets: npt.NDArray[np.int32],
+    first_byte_tokens: npt.NDArray[np.int32],
     table: npt.NDArray[np.int32],
     num_states: int,
-    num_tokens: int,
 ) -> None:
-  """Numba JIT kernel: simulate all tokens through char_table in compiled code.
+  """Numba JIT kernel: simulate all tokens through char_table via first-byte index.
 
-  For each token, simulates its byte sequence from every starting DFA state
-  simultaneously. This eliminates all Python loop overhead, dict lookups,
-  and per-token NumPy temporary allocations.
-
-  Args:
-      char_table: Dense byte lookup table of shape (num_states, 256).
-      token_bytes_flat: Flat 1D array of all token byte values concatenated.
-      token_offsets: Start offset into token_bytes_flat for each token.
-      token_lengths: Byte length of each token.
-      table: Output table of shape (num_states, vocab_size) to write into.
-      num_states: Number of DFA states.
-      num_tokens: Number of tokens to process.
+  For each DFA state, tests only tokens whose first byte matches an active
+  outgoing transition from that state.
   """
-  for idx in range(num_tokens):
-    token_id = idx
-    length = token_lengths[idx]
-    if length == 0:
-      continue
-    offset = token_offsets[idx]
+  for s in numba.prange(num_states):
+    for b in range(256):
+      next_s0 = char_table[s, b]
+      if next_s0 == -1:
+        continue
+      tok_start = first_byte_offsets[b]
+      tok_end = first_byte_offsets[b + 1]
+      for i in range(tok_start, tok_end):
+        token_id = first_byte_tokens[i]
+        length = token_lengths[token_id]
+        if length == 1:
+          table[s, token_id] = next_s0
+        else:
+          offset = token_offsets[token_id]
+          cur = next_s0
+          for j in range(1, length):
+            byte_val = token_bytes_flat[offset + j]
+            cur = char_table[cur, byte_val]
+            if cur == -1:
+              break
+          table[s, token_id] = cur
 
-    for s in range(num_states):
-      cur = s
-      for j in range(length):
-        b = token_bytes_flat[offset + j]
-        cur = char_table[cur, b]
-        if cur == -1:
-          break
-      table[s, token_id] = cur
 
-
-@numba.njit(cache=True)
+@numba.njit(parallel=True, fastmath=True, cache=True)
 def _simulate_token_completions_numba(
     char_table: npt.NDArray[np.int32],
     token_bytes_flat: npt.NDArray[np.uint8],
@@ -698,7 +713,7 @@ def _simulate_token_completions_numba(
       num_states: Number of DFA states.
       num_tokens: Number of tokens to process.
   """
-  for token_id in range(num_tokens):
+  for token_id in numba.prange(num_tokens):
     length = token_lengths[token_id]
     if length == 0:
       continue
@@ -731,8 +746,9 @@ def _compile_token_transitions(
 ]:
   """Compile character-level DFA transitions into a compact token-level table.
 
-  Uses a Numba JIT kernel to simulate all (state, token) transitions and
-  returns only the active token IDs and their compact transitions table.
+  Uses a Numba JIT kernel with a first-byte inverted index to simulate all
+  (state, token) transitions and returns only the active token IDs and their
+  compact transitions table.
 
   Returns:
       Tuple of (active_tokens, compact_table, default_transitions).
@@ -763,6 +779,7 @@ def _compile_token_transitions(
   byte_chunks: list[bytes] = []
   token_offsets = np.zeros(vocab_size, dtype=np.int32)
   token_lengths = np.zeros(vocab_size, dtype=np.int32)
+  valid_tokens_list: list[int] = []
   total_bytes = 0
 
   for token_id in range(vocab_size):
@@ -775,18 +792,24 @@ def _compile_token_transitions(
     token_offsets[token_id] = total_bytes
     token_lengths[token_id] = len(encoded)
     byte_chunks.append(encoded)
+    valid_tokens_list.append(token_id)
     total_bytes += len(encoded)
 
   if total_bytes > 0:
     token_bytes_flat = np.frombuffer(b"".join(byte_chunks), dtype=np.uint8)
+    valid_token_ids = np.array(valid_tokens_list, dtype=np.int32)
+    fb_offsets, fb_tokens = _build_first_byte_index(
+        token_bytes_flat, token_offsets, valid_token_ids
+    )
     _simulate_tokens_numba(
         char_table,
         token_bytes_flat,
         token_offsets,
         token_lengths,
+        fb_offsets,
+        fb_tokens,
         table,
         num_states,
-        vocab_size,
     )
 
   active_mask = (table != INVALID_STATE).any(axis=0)
@@ -2513,7 +2536,7 @@ def _schema_to_regex(
 
   if "enum" in schema:
     alts = [_value_to_regex(v) for v in schema["enum"]]
-    return f'({"|".join(alts)})'
+    return f"({'|'.join(alts)})"
 
   if "allOf" in schema:
     merged = _merge_allof(schema["allOf"])
@@ -2525,7 +2548,7 @@ def _schema_to_regex(
 
   if sub_schema := schema.get("anyOf") or schema.get("oneOf"):
     alts = [_schema_to_regex(s, indent, depth) for s in sub_schema]
-    return f'({"|".join(alts)})'
+    return f"({'|'.join(alts)})"
 
   schema_type = schema.get("type")
 
@@ -2534,7 +2557,7 @@ def _schema_to_regex(
         _schema_to_regex({**schema, "type": t}, indent, depth)
         for t in schema_type
     ]
-    return f'({"|".join(alts)})'
+    return f"({'|'.join(alts)})"
 
   if schema_type == "string":
     return _string_schema_to_regex(schema)

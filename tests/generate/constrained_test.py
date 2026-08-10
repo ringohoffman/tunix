@@ -26,8 +26,7 @@ requiring a full Gemma checkpoint.
 
 import re
 
-from absl.testing import absltest
-from absl.testing import parameterized
+from absl.testing import absltest, parameterized
 from flax import nnx
 import jax
 import jax.numpy as jnp
@@ -228,8 +227,8 @@ class ConstrainedSamplerTest(parameterized.TestCase):
     match = re.fullmatch(_CATEGORY_REGEX, unconstrained_text)
     self.assertIsNone(
         match,
-        "Unconstrained output unexpectedly matches regex: "
-        f"{unconstrained_text!r}",
+        "Unconstrained output unexpectedly matches regex:"
+        f" {unconstrained_text!r}",
     )
 
   def test_sampler_compile_constraint_pattern(self):
@@ -1676,6 +1675,8 @@ class RegexEngineTest(absltest.TestCase):
     self.assertEqual(tables.max_tokens, 4)
 
     # Simulate generation paths
+    init_bounds = constrained.init_token_bounds_loop_state(tables, 1)
+    assert init_bounds is not None
     tt = jnp.array(tables.token_transitions, dtype=jnp.int32)
     active_tokens_jax = jnp.array(tables.active_tokens, dtype=jnp.int32)
     stack: list[tuple[int, constrained.TokenBoundsLoopState, list[int]]] = [

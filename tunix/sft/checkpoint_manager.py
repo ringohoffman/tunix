@@ -201,7 +201,8 @@ class CheckpointManager:
     self._checkpoint_manager: ocp.CheckpointManager | None = None
     if root_directory is None:
       return
-    root_directory = gcsfuse_to_gs_path(root_directory)
+    if is_pathways_persistence_enabled():
+      root_directory = gcsfuse_to_gs_path(root_directory)
 
     handler_kwargs: ocp.PyTreeCheckpointHandlerKwargs = {}
     if use_dma := is_pathways_persistence_enabled():

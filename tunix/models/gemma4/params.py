@@ -425,21 +425,28 @@ def _try_restore_native_tunix(
   is not a native Tunix checkpoint and the caller should fall through to
   the upstream mapping path.
   """
-  step_parent = os.path.dirname(resolved_path.rstrip('/'))
-  step_name = os.path.basename(step_parent)
-  is_step_dir = (
-      step_name.isdigit()
-      and os.path.basename(resolved_path.rstrip('/')) == 'model_params'
-  )
-  if not is_step_dir:
+  clean_path = str(resolved_path).rstrip('/')
+  p_clean = epath.Path(clean_path)
+  if p_clean.name == 'model_params':
+    step_dir = str(p_clean.parent)
+    model_params_dir = str(p_clean)
+  else:
+    step_dir = clean_path
+    model_params_dir = str(p_clean / 'model_params')
+
+  step_name = epath.Path(step_dir).name
+  if not step_name.isdigit() or not epath.Path(model_params_dir).exists():
     return False
 
-  ckptr_meta = ocp.PyTreeCheckpointer().metadata(resolved_path)
-  top_keys = (
-      list(ckptr_meta.item_metadata.tree.keys())
-      if ckptr_meta.item_metadata
-      else []
-  )
+  ckptr_meta = ocp.PyTreeCheckpointer().metadata(model_params_dir)
+  if ckptr_meta and ckptr_meta.item_metadata:
+    top_keys = list(ckptr_meta.item_metadata.tree.keys())
+  else:
+    top_keys = list({
+        p.name.split('.')[0]
+        for p in epath.Path(model_params_dir).iterdir()
+        if not p.name.startswith('_')
+    })
   is_native_tunix = (
       'token_embedder' not in top_keys and 'decoder' not in top_keys
   )
@@ -448,7 +455,7 @@ def _try_restore_native_tunix(
 
   from tunix.sft import checkpoint_manager as tunix_ckpt_mgr
 
-  ckpt_root = os.path.dirname(step_parent)
+  ckpt_root = str(epath.Path(step_dir).parent)
   step_num = int(step_name)
   model_config = abs_model.config
 
@@ -587,8 +594,9 @@ def create_model_from_checkpoint(
     )
     _t_prev = now
 
-  # GCSFuse mount paths must be translated to gs:// URIs for TensorStore.
-  checkpoint_path = checkpoint_manager.gcsfuse_to_gs_path(checkpoint_path)
+  # GCSFuse mount paths must be translated to gs:// URIs for TensorStore when on Pathways.
+  if checkpoint_manager.is_pathways_persistence_enabled():
+    checkpoint_path = checkpoint_manager.gcsfuse_to_gs_path(checkpoint_path)
   logging.info('Creating model from checkpoint path %s', checkpoint_path)
 
   clean_path = checkpoint_path.rstrip('/')
