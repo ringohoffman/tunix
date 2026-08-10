@@ -281,6 +281,46 @@ class ConstrainedSamplerTest(parameterized.TestCase):
     )
     self.assertGreater(tables.num_states, 0)
 
+  def test_sampler_wildcard_thinking_constraint(self):
+    """Sampler with chained wildcard thinking block and category output."""
+    vocab_map = dict(_CONSTRAINED_VOCAB_MAPPING)
+    vocab_map["<thought>"] = 19
+    vocab_map["</thought>"] = 20
+    vocab_map["\n"] = 21
+    vocab = _ConcatVocab(vocab_map)
+    model = tc.ToyTransformer(
+        config=tc.ModelConfig(vocab_size=len(vocab_map)),
+        rngs=nnx.Rngs(42),
+    )
+    sampler = sampler_lib.Sampler(
+        transformer=model,
+        tokenizer=vocab,
+        cache_config=sampler_lib.CacheConfig(
+            cache_size=64,
+            num_layers=4,
+            num_kv_heads=4,
+            head_dim=16,
+        ),
+    )
+    pattern = (
+        r"<thought>"
+        + constrained.bounded_until(r"</thought>", max_tokens=2)
+        + r"\n"
+        + _CATEGORY_REGEX
+    )
+    result = sampler(
+        ["input string"],
+        max_generation_steps=20,
+        constraint=pattern,
+    )
+    text = result.text[0]
+    self.assertTrue(
+        re.search(
+            r"<thought>.*?</thought>\n" + _CATEGORY_REGEX, text, re.DOTALL
+        ),
+        f"Output '{text}' did not match thinking + category pattern",
+    )
+
   def test_chain_constraints(self):
     """chain_constraints caches results across identical calls."""
     sampler, vocab, _ = self._make_sampler_and_constraint()
@@ -373,7 +413,7 @@ class ConstrainedSamplerTest(parameterized.TestCase):
 
     # 1. Trace deterministic prefix 'hyperparameter'
     state = init
-    det_prefix_chars = []
+    det_prefix_chars: list[str] = []
     while True:
       valid_chars = [
           chr(b)
@@ -395,7 +435,7 @@ class ConstrainedSamplerTest(parameterized.TestCase):
 
     # 2. Branch choice 'i' -> deterministic suffix 'zation' -> accept state
     state_i = ct[(branch_state, "i")]
-    suffix_i = []
+    suffix_i: list[str] = []
     curr = state_i
     while True:
       valid = [
@@ -677,7 +717,7 @@ class RegexEngineTest(absltest.TestCase):
         eos_token_ids=[17],
     )
 
-    tt = tables.token_transitions
+    tt = tables.dense_token_transitions(18)
     s0 = tables.initial_state
 
     # State 0: min_chars=2 not reached yet.
@@ -710,7 +750,7 @@ class RegexEngineTest(absltest.TestCase):
     ct, init, acc, ns_unbounded = constrained._nfa_to_dfa(nfa_s, nfa_a)
 
     # Build unrolled patterns for max_chars = 5, 10, 20
-    states_minimized = []
+    states_minimized: list[int] = []
     for max_len in [5, 10, 20]:
       schema_bounded = {
           "type": "object",
@@ -1638,9 +1678,10 @@ class RegexEngineTest(absltest.TestCase):
     # Simulate generation paths
     tt = jnp.array(tables.token_transitions, dtype=jnp.int32)
     active_tokens_jax = jnp.array(tables.active_tokens, dtype=jnp.int32)
-    init_bounds = constrained.init_token_bounds_loop_state(tables, batch_size=1)
-    stack = [(tables.initial_state, init_bounds, [])]
-    accepted_histories = []
+    stack: list[tuple[int, constrained.TokenBoundsLoopState, list[int]]] = [
+        (tables.initial_state, init_bounds, [])
+    ]
+    accepted_histories: list[tuple[int, list[int]]] = []
 
     while stack:
       curr_state, bounds_st, history = stack.pop()
@@ -1765,6 +1806,302 @@ class RegexEngineTest(absltest.TestCase):
         tables.unique_items.token_completions.shape,
         (tables.num_states, len(tables.active_tokens)),
     )
+
+  def test_wildcard_compaction_memory_and_defaults(self):
+    """Verify that wildcard thinking DFA compactor generates compact tables with default_transitions."""
+    vocab_map = {
+        0: "<thought>",
+        1: "</thought>",
+        2: "\n",
+        3: '["',
+        4: '"]',
+        5: "Safe",
+        6: "Unsafe",
+    }
+    # Large vocabulary: 500 tokens, but only 7 are structural
+    token_id_to_str = {
+        i: vocab_map.get(i, f"irrelevant_tok_{i}") for i in range(500)
+    }
+    pattern = (
+        r"<thought>"
+        + constrained.bounded_until(r"</thought>")
+        + r"\n\[\"(Safe|Unsafe)\"\]"
+    )
+    tables = constrained.chain_constraints(
+        pattern,
+        token_id_to_str=token_id_to_str,
+        vocab_size=500,
+        eos_token_ids=[499],
+    )
+
+    # 1. Compaction assertion: active_tokens is tiny (< 25 tokens), NOT 500
+    self.assertIsNotNone(tables.default_transitions)
+    self.assertLess(len(tables.active_tokens), 25)
+    self.assertEqual(
+        tables.token_transitions.shape,
+        (tables.num_states, len(tables.active_tokens)),
+    )
+    self.assertEqual(len(tables.default_transitions), tables.num_states)
+
+    # 2. Wildcard states have non-negative default_transitions
+    wildcard_states = np.where(
+        tables.default_transitions != constrained.INVALID_STATE
+    )[0]
+    self.assertGreater(len(wildcard_states), 0)
+
+    # 3. Dense transition expansion correctly overlays defaults and explicit entries
+    dense = tables.dense_token_transitions(500)
+    self.assertEqual(dense.shape, (tables.num_states, 500))
+    for ws in wildcard_states:
+      def_target = tables.default_transitions[ws]
+      # Inactive random token (e.g. 250) should take the default transition
+      self.assertEqual(dense[ws, 250], def_target)
+      # Structural closing tag token (1: </thought>) should transition to its explicit target
+      self.assertNotEqual(dense[ws, 1], constrained.INVALID_STATE)
+
+  def test_jax_wildcard_logits_and_advance_state(self):
+    """Verify JIT-compiled constrained_logits and advance_state with default_transitions."""
+    vocab_map = {
+        0: "<thought>",
+        1: "</thought>",
+        2: "\n",
+        3: "Safe",
+        4: "Unsafe",
+    }
+    vocab_size = 50
+    token_id_to_str = {
+        i: vocab_map.get(i, f"tok_{i}") for i in range(vocab_size)
+    }
+    pattern = (
+        r"<thought>"
+        + constrained.bounded_until(r"</thought>")
+        + r"\n(Safe|Unsafe)"
+    )
+    tables = constrained.chain_constraints(
+        pattern,
+        token_id_to_str=token_id_to_str,
+        vocab_size=vocab_size,
+        eos_token_ids=[49],
+    )
+    self.assertIsNotNone(tables.default_transitions)
+
+    tt = jnp.array(tables.token_transitions, dtype=jnp.int32)
+    active_toks = jnp.array(tables.active_tokens, dtype=jnp.int32)
+    def_trans = jnp.array(tables.default_transitions, dtype=jnp.int32)
+
+    # Step 1: Start at initial state (strict state: only <thought>=0 is allowed)
+    s0 = jnp.array([tables.initial_state], dtype=jnp.int32)
+    dummy_logits = jnp.zeros((1, 1, vocab_size), dtype=jnp.float32)
+
+    masked_s0 = constrained.constrained_logits(
+        dummy_logits, s0, tt, active_toks, default_transitions=def_trans
+    )
+    valid_s0 = jnp.where(masked_s0[0, 0] > -1e9)[0].tolist()
+    self.assertIn(0, valid_s0)  # <thought>
+    self.assertNotIn(25, valid_s0)  # random token is blocked at strict state
+
+    # Step 2: Advance via <thought> into the wildcard thinking state
+    s_think = constrained.advance_state(
+        s0,
+        jnp.array([0], dtype=jnp.int32),
+        tt,
+        active_toks,
+        default_transitions=def_trans,
+    )
+    self.assertGreaterEqual(int(s_think[0]), 0)
+    self.assertNotEqual(int(s_think[0]), constrained.INVALID_STATE)
+
+    # Step 3: At wildcard state, ALL 50 tokens must be valid (unmasked)
+    masked_think = constrained.constrained_logits(
+        dummy_logits, s_think, tt, active_toks, default_transitions=def_trans
+    )
+    valid_think = jnp.where(masked_think[0, 0] > -1e9)[0].tolist()
+    self.assertEqual(len(valid_think), vocab_size)  # all tokens allowed!
+
+    # Step 4: Advance via arbitrary inactive token (25) -> stays in wildcard self-loop
+    s_after_rand = constrained.advance_state(
+        s_think,
+        jnp.array([25], dtype=jnp.int32),
+        tt,
+        active_toks,
+        default_transitions=def_trans,
+    )
+    self.assertEqual(int(s_after_rand[0]), int(def_trans[int(s_think[0])]))
+
+    # Step 5: Advance via explicit </thought> (token 1) -> moves to after-thought state
+    s_after_close = constrained.advance_state(
+        s_think,
+        jnp.array([1], dtype=jnp.int32),
+        tt,
+        active_toks,
+        default_transitions=def_trans,
+    )
+    self.assertGreaterEqual(int(s_after_close[0]), 0)
+    self.assertNotEqual(int(s_after_close[0]), int(s_after_rand[0]))
+
+  def test_chain_constraints_propagates_default_transitions(self):
+    """Verify that multi-stage constraint chaining preserves and correctly offsets default_transitions."""
+    vocab_map = {
+        0: "<thought>",
+        1: "</thought>",
+        2: "\n",
+        3: '["',
+        4: '"]',
+        5: "item_a",
+        6: "item_b",
+    }
+    token_id_to_str = {i: vocab_map.get(i, f"tok_{i}") for i in range(100)}
+    stage1 = r"<thought>" + constrained.bounded_until(r"</thought>") + r"\n"
+    stage2 = {
+        "type": "array",
+        "uniqueItems": True,
+        "items": {"enum": ["item_a", "item_b"]},
+    }
+    tables = constrained.chain_constraints(
+        [stage1, stage2],
+        token_id_to_str=token_id_to_str,
+        vocab_size=100,
+        eos_token_ids=[99],
+    )
+
+    self.assertIsNotNone(tables.default_transitions)
+    self.assertEqual(len(tables.default_transitions), tables.num_states)
+    self.assertIsNotNone(tables.unique_items)
+
+    # Wildcard states from stage1 must have valid default transitions
+    wildcard_states = np.where(
+        tables.default_transitions != constrained.INVALID_STATE
+    )[0]
+    self.assertGreater(len(wildcard_states), 0)
+    for ws in wildcard_states:
+      # Target state must be within total state count
+      self.assertLess(tables.default_transitions[ws], tables.num_states)
+
+  def test_unique_items_with_wildcard_default_transitions(self):
+    """Verify JIT unique_items execution with wildcard default_transitions."""
+    vocab_map = {
+        0: "<thought>",
+        1: "</thought>",
+        2: "\n",
+        3: "[",
+        4: "]",
+        5: ", ",
+        6: '"apple"',
+        7: '"banana"',
+    }
+    vocab_size = 50
+    token_id_to_str = {
+        i: vocab_map.get(i, f"tok_{i}") for i in range(vocab_size)
+    }
+    stage1 = r"<thought>" + constrained.bounded_until(r"</thought>") + r"\n"
+    stage2 = {
+        "type": "array",
+        "uniqueItems": True,
+        "items": {"enum": ["apple", "banana"]},
+    }
+    tables = constrained.chain_constraints(
+        [stage1, stage2],
+        token_id_to_str=token_id_to_str,
+        vocab_size=vocab_size,
+        eos_token_ids=[49],
+    )
+
+    tt = jnp.array(tables.token_transitions, dtype=jnp.int32)
+    active_toks = jnp.array(tables.active_tokens, dtype=jnp.int32)
+    def_trans = jnp.array(tables.default_transitions, dtype=jnp.int32)
+    self.assertIsNotNone(tables.unique_items)
+    u_state = constrained.init_unique_items_loop_state(
+        tables.unique_items, batch_size=1
+    )
+    dfa_state = jnp.array([tables.initial_state], dtype=jnp.int32)
+    dummy_logits = jnp.zeros((1, 1, vocab_size), dtype=jnp.float32)
+
+    # 1. Advance through <thought> (tok 0)
+    dfa_state, u_state = constrained.advance_state_unique(
+        dfa_state,
+        jnp.array([0]),
+        tt,
+        active_toks,
+        u_state,
+        default_transitions=def_trans,
+    )
+    # 2. In thought block, arbitrary token 25 is unmasked
+    masked = constrained.constrained_logits_unique(
+        dummy_logits,
+        dfa_state,
+        tt,
+        active_toks,
+        u_state,
+        default_transitions=def_trans,
+    )
+    valid_tokens = jnp.where(masked[0, 0] > -1e9)[0].tolist()
+    self.assertIn(25, valid_tokens)
+    # 3. Advance through random token inside thought -> stays valid
+    dfa_state, u_state = constrained.advance_state_unique(
+        dfa_state,
+        jnp.array([25]),
+        tt,
+        active_toks,
+        u_state,
+        default_transitions=def_trans,
+    )
+    self.assertNotEqual(int(dfa_state[0]), constrained.INVALID_STATE)
+    # 4. Advance through </thought> (tok 1) and \n (tok 2)
+    dfa_state, u_state = constrained.advance_state_unique(
+        dfa_state,
+        jnp.array([1]),
+        tt,
+        active_toks,
+        u_state,
+        default_transitions=def_trans,
+    )
+    dfa_state, u_state = constrained.advance_state_unique(
+        dfa_state,
+        jnp.array([2]),
+        tt,
+        active_toks,
+        u_state,
+        default_transitions=def_trans,
+    )
+    # 5. Now entering unique_items array: [ (tok 3)
+    dfa_state, u_state = constrained.advance_state_unique(
+        dfa_state,
+        jnp.array([3]),
+        tt,
+        active_toks,
+        u_state,
+        default_transitions=def_trans,
+    )
+    # 6. First item "apple" (tok 6)
+    dfa_state, u_state = constrained.advance_state_unique(
+        dfa_state,
+        jnp.array([6]),
+        tt,
+        active_toks,
+        u_state,
+        default_transitions=def_trans,
+    )
+    # 7. Separator , (tok 5)
+    dfa_state, u_state = constrained.advance_state_unique(
+        dfa_state,
+        jnp.array([5]),
+        tt,
+        active_toks,
+        u_state,
+        default_transitions=def_trans,
+    )
+    # 8. Check logits: "apple" must be blocked (duplicate), "banana" allowed
+    masked_after_apple = constrained.constrained_logits_unique(
+        dummy_logits,
+        dfa_state,
+        tt,
+        active_toks,
+        u_state,
+        default_transitions=def_trans,
+    )
+    valid_after_apple = jnp.where(masked_after_apple[0, 0] > -1e9)[0].tolist()
+    self.assertNotIn(6, valid_after_apple)  # "apple" blocked!
+    self.assertIn(7, valid_after_apple)  # "banana" allowed!
 
 
 if __name__ == "__main__":

@@ -119,6 +119,12 @@ class _SamplingState:
   inside the jax.lax.while_loop.
   """
 
+  constraint_default_transitions: jnp.ndarray | None = None
+  """Default successor per DFA state for wildcard transitions, shape [S], int32.
+  When a state has a valid default, any token not in active_tokens transitions
+  to this successor.  ``None`` when no wildcard states exist.
+  """
+
   unique_state: constrained.UniqueItemsLoopState | None = None
   """Unique items constraint side-channel."""
 
@@ -588,6 +594,7 @@ class Sampler(base_sampler.BaseSampler):
     constraint_state: jnp.ndarray | None = None
     constraint_active_tokens: jnp.ndarray | None = None
     constraint_transitions: jnp.ndarray | None = None
+    constraint_default_transitions: jnp.ndarray | None = None
     unique_state: constrained.UniqueItemsLoopState | None = None
     token_bounds_state: constrained.TokenBoundsLoopState | None = None
     unique_items = (
@@ -605,6 +612,10 @@ class Sampler(base_sampler.BaseSampler):
       constraint_transitions = jnp.array(
           constraint_tables.token_transitions, dtype=jnp.int32
       )
+      if constraint_tables.default_transitions is not None:
+        constraint_default_transitions = jnp.array(
+            constraint_tables.default_transitions, dtype=jnp.int32
+        )
       token_bounds_state = constrained.init_token_bounds_loop_state(
           constraint_tables, batch_size
       )
@@ -633,6 +644,7 @@ class Sampler(base_sampler.BaseSampler):
         constraint_state=constraint_state,
         constraint_active_tokens=constraint_active_tokens,
         constraint_transitions=constraint_transitions,
+        constraint_default_transitions=constraint_default_transitions,
         unique_state=unique_state,
         token_bounds_state=token_bounds_state,
         logit_gather_ids=logit_gather_ids,
@@ -675,6 +687,7 @@ class Sampler(base_sampler.BaseSampler):
             sampler_state.constraint_active_tokens,
             sampler_state.unique_state,
             token_bounds_state=sampler_state.token_bounds_state,
+            default_transitions=sampler_state.constraint_default_transitions,
         )
       else:
         logits = constrained.constrained_logits(
@@ -683,6 +696,7 @@ class Sampler(base_sampler.BaseSampler):
             sampler_state.constraint_transitions,
             sampler_state.constraint_active_tokens,
             token_bounds_state=sampler_state.token_bounds_state,
+            default_transitions=sampler_state.constraint_default_transitions,
         )
 
     if sampler_state.sampling_mode == 'beam_search':
@@ -743,6 +757,7 @@ class Sampler(base_sampler.BaseSampler):
             sampler_state.constraint_transitions,
             sampler_state.constraint_active_tokens,
             sampler_state.unique_state,
+            default_transitions=sampler_state.constraint_default_transitions,
         )
       else:
         constraint_state = constrained.advance_state(
@@ -750,6 +765,7 @@ class Sampler(base_sampler.BaseSampler):
             next_token_candidate,
             sampler_state.constraint_transitions,
             sampler_state.constraint_active_tokens,
+            default_transitions=sampler_state.constraint_default_transitions,
         )
 
     done = done | jnp.isin(token_buffer[:, decoding_step + 1], self.eos_tokens)
@@ -772,6 +788,7 @@ class Sampler(base_sampler.BaseSampler):
         constraint_state=constraint_state,
         constraint_active_tokens=sampler_state.constraint_active_tokens,
         constraint_transitions=sampler_state.constraint_transitions,
+        constraint_default_transitions=sampler_state.constraint_default_transitions,
         unique_state=unique_state,
         token_bounds_state=token_bounds_state,
         logit_gather_ids=sampler_state.logit_gather_ids,
@@ -891,6 +908,7 @@ class Sampler(base_sampler.BaseSampler):
         constraint_state=sampler_state.constraint_state,
         constraint_active_tokens=sampler_state.constraint_active_tokens,
         constraint_transitions=sampler_state.constraint_transitions,
+        constraint_default_transitions=sampler_state.constraint_default_transitions,
         unique_state=sampler_state.unique_state,
         token_bounds_state=sampler_state.token_bounds_state,
         logit_gather_ids=sampler_state.logit_gather_ids,

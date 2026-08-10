@@ -14,6 +14,8 @@
 
 """Tests for functional autoregressive generation in Tunix."""
 
+import re
+
 from absl.testing import absltest
 from absl.testing import parameterized
 from flax import nnx
@@ -238,6 +240,69 @@ class FunctionalGenerateTest(parameterized.TestCase):
     ]
     decoded = ta.decode(generated_ids)
     self.assertIn(decoded.strip(), ("hello", "world"))
+
+  def test_constrained_decoding_with_wildcard_thinking(self):
+    custom_vocab = tc.MockVocab(
+        mapping_text_to_id={
+            "<pad>": 0,
+            "<s>": 1,
+            "</s>": 2,
+            "<thought>": 3,
+            "</thought>": 4,
+            "\n": 5,
+            "Safe": 6,
+            "Unsafe": 7,
+            "random": 8,
+            "filler": 9,
+            "words": 10,
+        }
+    )
+    custom_model = ToyTransformerWithCache(
+        config=tc.ModelConfig(vocab_size=custom_vocab.GetPieceSize()),
+        rngs=nnx.Rngs(42),
+    )
+    ta = tok_adapter.TokenizerAdapter(custom_vocab)
+    pattern = (
+        r"<thought>"
+        + constrained.bounded_until(r"</thought>", max_tokens=2)
+        + r"\n(Safe|Unsafe)"
+    )
+    tables = constrained.chain_constraints(
+        pattern,
+        token_id_to_str=ta.token_id_to_str,
+        vocab_size=ta.vocab_size,
+        eos_token_ids=(custom_vocab.eos_id(),),
+    )
+    self.assertIsNotNone(tables.default_transitions)
+
+    prompt = jnp.array([[1]], dtype=jnp.int32)
+    out = functional.generate(
+        custom_model,
+        prompt,
+        max_new_tokens=8,
+        pad_id=custom_vocab.pad_id(),
+        eos_id=custom_vocab.eos_id(),
+        cache_size=32,
+        temperature=0.0,
+        constraint_tables=tables,
+    )
+    generated_ids = [
+        int(x)
+        for x in out.tokens[0]
+        if int(x) not in (custom_vocab.pad_id(), custom_vocab.eos_id())
+    ]
+    # The first 5 tokens generated must be: <thought>(3), random(8), </thought>(4), \n(5), Unsafe/Safe(7/6)
+    self.assertEqual(generated_ids[:4], [3, 8, 4, 5])
+    self.assertIn(generated_ids[4], (6, 7))
+
+    decoded = ta.decode(generated_ids)
+    # Output must match the constrained pattern
+    self.assertTrue(
+        re.search(
+            r"<thought>.*?</thought>\s*(Safe|Unsafe)", decoded, re.DOTALL
+        ),
+        f"Generated text '{decoded}' does not match pattern",
+    )
 
   def test_return_logits(self):
     prompt = jnp.array([[3, 4, 5]], dtype=jnp.int32)

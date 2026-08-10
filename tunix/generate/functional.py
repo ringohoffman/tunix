@@ -112,6 +112,7 @@ def _apply_constraints_and_forbidden_tokens(
     constraint_active_tokens: jax.Array | None = None,
     unique_state: constrained.UniqueItemsLoopState | None = None,
     token_bounds_state: constrained.TokenBoundsLoopState | None = None,
+    constraint_default_transitions: jax.Array | None = None,
 ) -> jax.Array:
   """Masks logits via forbidden-token and DFA constraints.
 
@@ -123,6 +124,8 @@ def _apply_constraints_and_forbidden_tokens(
     constraint_active_tokens: Active token IDs ``[K]``, or None.
     unique_state: Unique-items loop state, or None.
     token_bounds_state: Token-bounds loop state, or None.
+    constraint_default_transitions: Default successor per state ``[S]``, or
+      None.
 
   Returns:
     Masked logits, same shape as input.
@@ -146,6 +149,7 @@ def _apply_constraints_and_forbidden_tokens(
           constraint_active_tokens,
           unique_state,
           token_bounds_state=token_bounds_state,
+          default_transitions=constraint_default_transitions,
       )
     else:
       logits = constrained.constrained_logits(
@@ -154,6 +158,7 @@ def _apply_constraints_and_forbidden_tokens(
           constraint_transitions,
           constraint_active_tokens,
           token_bounds_state=token_bounds_state,
+          default_transitions=constraint_default_transitions,
       )
   return logits
 
@@ -165,6 +170,7 @@ def _advance_constraint_state(
     constraint_active_tokens: jax.Array | None,
     unique_state: constrained.UniqueItemsLoopState | None,
     token_bounds_state: constrained.TokenBoundsLoopState | None,
+    constraint_default_transitions: jax.Array | None = None,
 ) -> tuple[
     jax.Array | None,
     constrained.UniqueItemsLoopState | None,
@@ -190,6 +196,7 @@ def _advance_constraint_state(
         constraint_transitions,
         constraint_active_tokens,
         unique_state,
+        default_transitions=constraint_default_transitions,
     )
   else:
     constraint_state = constrained.advance_state(
@@ -197,6 +204,7 @@ def _advance_constraint_state(
         next_token,
         constraint_transitions,
         constraint_active_tokens,
+        default_transitions=constraint_default_transitions,
     )
   return constraint_state, unique_state, token_bounds_state
 
@@ -327,6 +335,7 @@ def generate(
   constraint_state: jax.Array | None = None
   constraint_active_tokens: jax.Array | None = None
   constraint_transitions: jax.Array | None = None
+  constraint_default_transitions: jax.Array | None = None
   unique_state: constrained.UniqueItemsLoopState | None = None
   token_bounds_state: constrained.TokenBoundsLoopState | None = None
   if constraint_tables is not None:
@@ -339,6 +348,10 @@ def generate(
     constraint_transitions = jnp.array(
         constraint_tables.token_transitions, dtype=jnp.int32
     )
+    if constraint_tables.default_transitions is not None:
+      constraint_default_transitions = jnp.array(
+          constraint_tables.default_transitions, dtype=jnp.int32
+      )
     token_bounds_state = constrained.init_token_bounds_loop_state(
         constraint_tables, batch_size
     )
@@ -442,6 +455,7 @@ def generate(
       constraint_active_tokens=constraint_active_tokens,
       unique_state=unique_state,
       token_bounds_state=token_bounds_state,
+      constraint_default_transitions=constraint_default_transitions,
   )
 
   if beam_size is not None and beam_size > 1:
@@ -491,6 +505,7 @@ def generate(
           constraint_active_tokens=constraint_active_tokens,
           unique_state=unique_state,
           token_bounds_state=token_bounds_state,
+          constraint_default_transitions=constraint_default_transitions,
       )
   )
 
@@ -548,6 +563,7 @@ def generate(
         constraint_active_tokens=constraint_active_tokens,
         unique_state=state.unique_state,
         token_bounds_state=state.token_bounds_state,
+        constraint_default_transitions=constraint_default_transitions,
     )
 
     # Store logits before beam search potentially reshuffles buffers.
@@ -607,6 +623,7 @@ def generate(
             constraint_active_tokens=constraint_active_tokens,
             unique_state=state.unique_state,
             token_bounds_state=state.token_bounds_state,
+            constraint_default_transitions=constraint_default_transitions,
         )
     )
 
