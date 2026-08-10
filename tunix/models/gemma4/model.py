@@ -1132,8 +1132,9 @@ class Attention(nnx.Module):
     # and suppress the cache write so the shared layer's output cache
     # contains the origin's cache rather than its own wasted projections.
     if kv_override is not None and use_kv_override is not None:
-      if cache is None or seq_len > cache["v"].shape[1]:
-        # prefill without prior cache: key_proj is raw [B, seq_len, H, D]
+      if key_proj.shape[1] == seq_len:
+        # key_proj is raw [B, seq_len, H, D] (cacheless, or flash-attention
+        # prefill where expansion was intentionally skipped).
         key_proj = jnp.where(
             use_kv_override, kv_override["k"][:, :seq_len], key_proj
         )
