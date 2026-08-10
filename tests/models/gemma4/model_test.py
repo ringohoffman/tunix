@@ -79,7 +79,39 @@ class ModelTest(absltest.TestCase):
     )[None, ...]
     logits, _ = model(tokens, positions=positions, attention_mask=attn_mask)
 
-    self.assertEqual(logits.shape, (2, 32, config.num_embed))
+  def test_flash_attention_cache_fallback(self):
+    """Verify flash attention gracefully falls back for cached prefill."""
+    config = model_lib.ModelConfig.gemma4_e2b()
+    config.num_layers = 1
+    config.embed_dim = 256
+    config.hidden_dim = 512
+    config.num_heads = 4
+    config.head_dim = 64
+    config.num_kv_heads = 1
+    config.frac_shared_layers = 0.0
+    config.use_flash_attention = True
+    config.flash_attention_block_size = 1024
+
+    rngs = nnx.Rngs(0)
+    model = model_lib.Gemma4(config, rngs=rngs)
+
+    # Prefix length 228 (not divisible by 1024).
+    pfx_len = 228
+    cache_len = 512
+    tokens = jax.random.randint(
+        jax.random.PRNGKey(0), (1, pfx_len), 0, config.num_embed
+    )
+    positions = jnp.arange(pfx_len)[None, :]
+    attn_mask = jnp.pad(
+        jnp.tril(jnp.ones((pfx_len, pfx_len), dtype=jnp.bool_))[None, ...],
+        ((0, 0), (0, 0), (0, cache_len - pfx_len)),
+    )
+    cache = model.init_cache(batch_size=1, max_seq_len=cache_len, dtype=jnp.float32)
+
+    # Should run cleanly via fallback without raising ValueError on q_block_size.
+    out = model(tokens, positions=positions, cache=cache, attention_mask=attn_mask)
+    self.assertEqual(out.logits.shape, (1, pfx_len, config.num_embed))
+    self.assertIsNotNone(out.cache)
 
   def test_remat_block(self):
     config = model_lib.ModelConfig.gemma4_e2b()

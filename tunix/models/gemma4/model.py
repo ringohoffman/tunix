@@ -1152,10 +1152,12 @@ class Attention(nnx.Module):
             ),
         }
 
-    b, _, qh, _ = query_proj.shape
-    _, _, kh, _ = key_proj.shape
-
-    if self.config.use_flash_attention and seq_len > 1:
+    if (
+        self.config.use_flash_attention
+        and seq_len > 1
+        and cache is None
+        and (seq_len % self.config.flash_attention_block_size == 0)
+    ):
       query_proj = query_proj.transpose(0, 2, 1, 3)
       key_proj = key_proj.transpose(0, 2, 1, 3)
       value_proj = value_proj.transpose(0, 2, 1, 3)
@@ -1345,13 +1347,19 @@ class Attention(nnx.Module):
         logits = jnp.einsum("BTNH,BSNH->BTNS", query_proj, key_proj)
 
       assert attn_mask is not None, "attn_mask required for non-flash path"
-      if (
-          attn_mask is not None
-          and (cache is None or seq_len > cache["v"].shape[1])
-      ):
-        # Only compute attention scores for the actual sequence length when not
-        # using a cache-backed representation.
-        attn_mask = attn_mask[..., :seq_len]
+      if attn_mask is not None:
+        if cache is None or seq_len > cache["v"].shape[1]:
+          # Only compute attention scores for the actual sequence length when not
+          # using a cache-backed representation.
+          attn_mask = attn_mask[..., :seq_len]
+        elif attn_mask.shape[-1] < key_proj.shape[1]:
+          padding = key_proj.shape[1] - attn_mask.shape[-1]
+          attn_mask = jnp.pad(
+              attn_mask,
+              (*((0, 0) for _ in range(attn_mask.ndim - 1)), (0, padding)),
+          )
+        elif attn_mask.shape[-1] > key_proj.shape[1]:
+          attn_mask = attn_mask[..., : key_proj.shape[1]]
 
       if self.attn_type == AttentionType.LOCAL_SLIDING:
         if (
