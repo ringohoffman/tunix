@@ -137,7 +137,6 @@ class ClassificationModelConfig(gemma4_model.ModelConfig):
   pool_strategy: PoolStrategy = PoolStrategy.LAST_TOKEN
 
   def __post_init__(self) -> None:
-    super().__post_init__()
     if self.head_type == HeadType.BINARY and self.num_classes != 1:
       raise ValueError(
           f"BINARY head requires num_classes=1, got {self.num_classes}"
