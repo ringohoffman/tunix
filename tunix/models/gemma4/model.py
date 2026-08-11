@@ -483,13 +483,6 @@ class ModelConfig:
   # scheduling and reduced memory fragmentation.
   use_scan_layers: bool = False
 
-  def __post_init__(self) -> None:
-    # TODO(tunix-dev): support flash attention with sliding window KV cache
-    if self.use_sliding_window_kv_cache and self.use_flash_attention:
-      raise ValueError(
-          "Flash attention and sliding window KV cache are mutually exclusive."
-      )
-
   @classmethod
   def gemma4_e2b(
       cls,
