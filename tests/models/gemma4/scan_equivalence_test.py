@@ -126,59 +126,15 @@ def _copy_weights_loop_to_scan(
     scan_model: model_lib.Gemma4,
 ) -> None:
   """Copy weights from for-loop model to scan model."""
-  loop_gd, loop_state = nnx.split(loop_model)
-  scan_gd, scan_state = nnx.split(scan_model)
-
-  num_layers = loop_model.config.num_layers
-  pattern_len = (
-      len(loop_model.config.attention_pattern)
-      if loop_model.config.attention_pattern is not None
-      else _PATTERN_LEN
+  from tunix.models.gemma4 import params as params_lib
+  loop_dict = nnx.to_pure_dict(nnx.state(loop_model))
+  stacked_dict = params_lib._stack_layers_for_scan(
+      loop_dict,
+      scan_model.config.num_layers,
+      scan_model.scan_pattern,
+      scan_model.config.frac_shared_layers,
   )
-  num_unshared_layers = int(
-      num_layers - loop_model.config.frac_shared_layers * num_layers
-  )
-  num_shared_layers = num_layers - num_unshared_layers
-
-  num_unshared_groups = num_unshared_layers // pattern_len
-  num_shared_groups = num_shared_layers // pattern_len
-
-  # Copy shared state (embedder, final_norm) from the loop model.
-  scan_state["embedder"] = loop_state["embedder"]
-  scan_state["final_norm"] = loop_state["final_norm"]
-
-  unshared_key = (
-      "unshared_scan_groups"
-      if loop_model.config.frac_shared_layers > 0
-      else "scan_groups"
-  )
-  for sub_idx in range(pattern_len):
-    loop_indices = [
-        g * pattern_len + sub_idx for g in range(num_unshared_groups)
-    ]
-    loop_layer_states = [loop_state["layers"][li] for li in loop_indices]
-
-    stacked = jax.tree.map(
-        lambda *xs: jnp.stack(xs, axis=0),
-        *loop_layer_states,
-    )
-    scan_state[unshared_key]["sub_layers"][sub_idx] = stacked
-
-  if num_shared_groups > 0:
-    for sub_idx in range(pattern_len):
-      loop_indices = [
-          num_unshared_layers + g * pattern_len + sub_idx
-          for g in range(num_shared_groups)
-      ]
-      loop_layer_states = [loop_state["layers"][li] for li in loop_indices]
-
-      stacked = jax.tree.map(
-          lambda *xs: jnp.stack(xs, axis=0),
-          *loop_layer_states,
-      )
-      scan_state["shared_scan_groups"]["sub_layers"][sub_idx] = stacked
-
-  nnx.update(scan_model, scan_state)
+  nnx.update(scan_model, stacked_dict)
 
 
 def _make_paired_models_from_config(
@@ -578,8 +534,12 @@ class ScanForwardEquivalenceTest(absltest.TestCase):
 
     # Compare gradients for layer params.
     num_groups = scan_model.num_scan_groups
+    subgroup_specs = scan_model.subgroup_specs
     for sub_idx in range(_PATTERN_LEN):
-      scan_sub_grads = scan_state["scan_groups"]["sub_layers"][sub_idx]
+      sg_idx, inner_idx = model_lib.sub_layer_idx_to_subgroup_coord(
+          sub_idx, subgroup_specs
+      )
+      scan_sub_grads = scan_state["scan_groups"]["sub_groups"][sg_idx]["layers"]
       scan_sub_leaves = jax.tree.leaves(scan_sub_grads)
 
       for group_idx in range(num_groups):
@@ -590,7 +550,7 @@ class ScanForwardEquivalenceTest(absltest.TestCase):
         for leaf_idx, (ll, sl) in enumerate(
             zip(loop_layer_leaves, scan_sub_leaves)
         ):
-          sl_group = sl[group_idx]
+          sl_group = sl[group_idx, inner_idx]
           max_diff = float(jnp.max(jnp.abs(ll - sl_group)))
           self.assertLess(
               max_diff,

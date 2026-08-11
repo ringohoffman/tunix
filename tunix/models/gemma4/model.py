@@ -1141,7 +1141,9 @@ class Attention(nnx.Module):
         value_proj = jnp.where(
             use_kv_override, kv_override["v"][:, :seq_len], value_proj
         )
-      else:  # decode or cache-enabled prefill: key_proj is full cache [B, cache_len, H, D]
+      else:
+        # decode or cache-enabled prefill: key_proj is full cache
+        # [B, cache_len, H, D]
         key_proj = jnp.where(use_kv_override, kv_override["k"], key_proj)
         value_proj = jnp.where(use_kv_override, kv_override["v"], value_proj)
       if cache is not None:
@@ -1806,13 +1808,71 @@ class DecoderLayer(nnx.Module):
     return self.attn.init_cache(batch_size, max_seq_len, dtype)
 
 
+def group_contiguous_attention_types(
+    pattern: tuple[AttentionType, ...],
+) -> tuple[tuple[AttentionType, int], ...]:
+  """Groups contiguous identical attention types into (attention_type, count) pairs.
+
+  Example: (LOCAL, LOCAL, LOCAL, LOCAL, GLOBAL) -> ((LOCAL, 4), (GLOBAL, 1)).
+  """
+  return tuple(
+      (attn_type, len(list(group)))
+      for attn_type, group in itertools.groupby(pattern)
+  )
+
+
+def sub_layer_idx_to_subgroup_coord(
+    sub_layer_idx: int,
+    subgroup_specs: tuple[tuple[AttentionType, int], ...],
+) -> tuple[int, int]:
+  """Maps a flat sub_layer index in [0..pattern_len-1] to (subgroup_idx, inner_idx)."""
+  curr = 0
+  for sg_idx, (_, count) in enumerate(subgroup_specs):
+    if sub_layer_idx < curr + count:
+      return sg_idx, sub_layer_idx - curr
+    curr += count
+  raise IndexError(
+      f"sub_layer_idx {sub_layer_idx} out of range for subgroup specs"
+      f" {subgroup_specs}"
+  )
+
+
+class ScanSubGroup(nnx.Module):
+  """Vectorized subscan group containing K contiguous identical layers of any AttentionType."""
+
+  def __init__(
+      self,
+      config: ModelConfig,
+      attn_type: AttentionType,
+      count: int,
+      *,
+      hidden_dim: int,
+      skip_kv_projection: bool = False,
+      rngs: nnx.Rngs,
+  ) -> None:
+    self.config = config
+    self.attn_type = attn_type
+    self.count = count
+    self.skip_kv_projection = skip_kv_projection
+
+    @nnx.split_rngs(splits=count)
+    @nnx.vmap(axis_size=count)
+    def create_layer(rngs: nnx.Rngs) -> DecoderLayer:
+      return DecoderLayer(
+          config=config,
+          attn_type=attn_type,
+          hidden_dim=hidden_dim,
+          rngs=rngs,
+      )
+
+    self.layers = create_layer(rngs)
+
+
 class ScanLayerGroup(nnx.Module):
   """A group of DecoderLayers matching one full attention pattern cycle.
 
-  For Gemma4 31B with pattern (L, L, L, L, L, G), each group contains
-  6 layers. When used with nnx.scan, XLA compiles the group body once
-  and executes it N times (where N = num_layers / pattern_length),
-  producing a tiled schedule with regular memory behavior.
+  Organized uniformly by grouping contiguous identical attention layers into
+  ScanSubGroups.
   """
 
   def __init__(
@@ -1827,17 +1887,35 @@ class ScanLayerGroup(nnx.Module):
     self.config = config
     self.pattern = pattern
     self.skip_kv_projection = skip_kv_projection
-    self.sub_layers = compat.ModuleList[DecoderLayer]()
+    self.subgroup_specs = group_contiguous_attention_types(pattern)
     hidden_dim = hidden_dim if hidden_dim is not None else config.hidden_dim
-    for attn_type in pattern:
-      self.sub_layers.append(
-          DecoderLayer(
-              config=config,
-              attn_type=attn_type,
+
+    self.sub_groups = compat.ModuleList[ScanSubGroup]()
+    for attn_type, count in self.subgroup_specs:
+      self.sub_groups.append(
+          ScanSubGroup(
+              config,
+              attn_type,
+              count,
               hidden_dim=hidden_dim,
+              skip_kv_projection=skip_kv_projection,
               rngs=rngs,
           )
       )
+
+  @property
+  def sub_layers(self) -> Sequence[DecoderLayer]:
+    """Helper providing unrolled compatibility view over all sub-layers in
+
+    pattern.
+    """
+    layers: list[DecoderLayer] = []
+    for sub_group in self.sub_groups:
+      graphdef, state = nnx.split(sub_group.layers)
+      for i in range(sub_group.count):
+        sub_state = jax.tree.map(lambda leaf: leaf[i], state)
+        layers.append(nnx.merge(graphdef, sub_state))
+    return layers
 
   def __call__(
       self,
@@ -1860,50 +1938,61 @@ class ScanLayerGroup(nnx.Module):
       origin_kv_local: LayerKV | LayerCache | None = None,
       segment_ids: jaxtyping.Array | splash.SegmentIds | None = None,
   ) -> jaxtyping.Array:
-    """Run one pattern-group of layers with full scan compatibility."""
-    for sub_idx, layer in enumerate(self.sub_layers):
-      layer_cache = (
-          cache[sub_idx] if cache is not None and sub_idx < len(cache) else None
-      )
+    """Run one pattern-group of layers across all contiguous attention
 
-      # Resolve KV override for scan-based cache sharing.
-      kv_override = None
-      use_kv_override = None
-      if origin_kv is not None and is_shared is not None:
-        assert origin_sub_indices is not None
-        origin_s = origin_sub_indices[sub_idx]
-        kv_override = origin_kv[origin_s]
-        use_kv_override = is_shared[sub_idx]
-      elif origin_kv_global is not None and origin_kv_local is not None:
-        attn_type = self.pattern[sub_idx]
-        if attn_type == AttentionType.GLOBAL:
-          kv_override = origin_kv_global
-        else:
-          kv_override = origin_kv_local
-        use_kv_override = jnp.array(True)
+    sub-groups.
+    """
+    sub_idx = 0
+    for sub_group in self.sub_groups:
+      graphdef, state = nnx.split(sub_group.layers)
+      for inner_idx in range(sub_group.count):
+        layer_cache = (
+            cache[sub_idx]
+            if cache is not None and sub_idx < len(cache)
+            else None
+        )
+        kv_override = None
+        use_kv_override = None
+        if origin_kv is not None and is_shared is not None:
+          assert origin_sub_indices is not None
+          origin_s = origin_sub_indices[sub_idx]
+          kv_override = origin_kv[origin_s]
+          use_kv_override = is_shared[sub_idx]
+        elif origin_kv_global is not None and origin_kv_local is not None:
+          attn_type = self.pattern[sub_idx]
+          if attn_type == AttentionType.GLOBAL:
+            kv_override = origin_kv_global
+          else:
+            kv_override = origin_kv_local
+          use_kv_override = jnp.array(True)
 
-      pli = (
-          per_layer_inputs[:, :, sub_idx, :]
-          if per_layer_inputs is not None
-          else None
-      )
+        per_layer_input = (
+            per_layer_inputs[:, :, sub_idx, :]
+            if per_layer_inputs is not None
+            else None
+        )
 
-      layer_cache, x, kv = layer(
-          x,
-          positions,
-          layer_cache,
-          attn_mask,
-          per_layer_input=pli,
-          kv_override=kv_override,
-          use_kv_override=use_kv_override,
-          skip_kv_projection=self.skip_kv_projection,
-          segment_ids=segment_ids,
-      )
-      if new_cache is not None and layer_cache is not None:
-        assert "end_index" in layer_cache
-        new_cache[sub_idx] = layer_cache
-      if new_group_kvs is not None and kv is not None:
-        new_group_kvs[sub_idx] = {"k": kv[0], "v": kv[1]}
+        sub_state = jax.tree.map(lambda leaf: leaf[inner_idx], state)
+        layer = nnx.merge(graphdef, sub_state)
+
+        layer_cache, x, kv = layer(
+            x,
+            positions,
+            layer_cache,
+            attn_mask,
+            per_layer_input=per_layer_input,
+            kv_override=kv_override,
+            use_kv_override=use_kv_override,
+            skip_kv_projection=self.skip_kv_projection,
+            segment_ids=segment_ids,
+        )
+        if new_cache is not None and layer_cache is not None:
+          assert "end_index" in layer_cache
+          new_cache[sub_idx] = layer_cache
+        if new_group_kvs is not None and kv is not None:
+          new_group_kvs[sub_idx] = {"k": kv[0], "v": kv[1]}
+
+        sub_idx += 1
 
     return x
 
@@ -2023,6 +2112,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
     self.num_shared_groups = num_shared_layers // pattern_len
     self.num_scan_groups = config.num_layers // pattern_len
     self.scan_pattern = pattern
+    self.subgroup_specs = group_contiguous_attention_types(pattern)
 
     # Unshared scan groups
     @nnx.split_rngs(splits=self.num_unshared_groups)
@@ -2041,7 +2131,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
         continue
       spec = var.get_metadata("out_sharding", None)
       if isinstance(spec, tuple):
-        var.set_metadata("out_sharding", (None,) + spec)
+        var.set_metadata("out_sharding", (None, None) + spec)
 
     # Shared scan groups (if frac_shared_layers > 0)
     if self.num_shared_groups > 0:
@@ -2069,7 +2159,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
           continue
         spec = var.get_metadata("out_sharding", None)
         if isinstance(spec, tuple):
-          var.set_metadata("out_sharding", (None,) + spec)
+          var.set_metadata("out_sharding", (None, None) + spec)
 
   def forward_backbone(
       self,
@@ -2215,29 +2305,26 @@ class Gemma4(BackendMappingMixin, nnx.Module):
       num_unshared_layers = int(
           num_layers - self.config.frac_shared_layers * num_layers
       )
-      unshared_splits = [
-          nnx.split(sub_layer)
-          for sub_layer in self.unshared_scan_groups.sub_layers
-      ]
-      shared_splits = (
-          [
-              nnx.split(sub_layer)
-              for sub_layer in self.shared_scan_groups.sub_layers
-          ]
-          if self.num_shared_groups > 0
-          else []
-      )
       for i in range(num_layers):
         if i < num_unshared_layers:
           group_idx = i // pattern_len
           sub_idx = i % pattern_len
-          graphdef, state = unshared_splits[sub_idx]
+          sg_idx, inner_idx = sub_layer_idx_to_subgroup_coord(
+              sub_idx, self.subgroup_specs
+          )
+          sub_group = self.unshared_scan_groups.sub_groups[sg_idx]
         else:
           rel_i = i - num_unshared_layers
           group_idx = rel_i // pattern_len
           sub_idx = rel_i % pattern_len
-          graphdef, state = shared_splits[sub_idx]
-        layer_state = jax.tree.map(lambda leaf: leaf[group_idx], state)
+          sg_idx, inner_idx = sub_layer_idx_to_subgroup_coord(
+              sub_idx, self.subgroup_specs
+          )
+          sub_group = self.shared_scan_groups.sub_groups[sg_idx]
+        graphdef, state = nnx.split(sub_group.layers)
+        layer_state = jax.tree.map(
+            lambda leaf: leaf[group_idx, inner_idx], state
+        )
         unrolled_layers.append(nnx.merge(graphdef, layer_state))
     else:
       unrolled_layers = self.layers

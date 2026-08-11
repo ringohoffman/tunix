@@ -22,6 +22,7 @@ from flax.traverse_util import flatten_dict
 import flax.typing
 import jax
 import numpy as np
+from tunix.models.gemma4 import model as gemma4_model
 from tunix.models.gemma4 import params
 
 
@@ -470,7 +471,7 @@ class CreateModelTest(absltest.TestCase):
     self.mock_prune.return_value = self.fake_params
     self.mock_state.return_value = nnx.State(self.fake_params)
     self.config = mock.create_autospec(
-        params.gemma4_model.ModelConfig, instance=True
+        gemma4_model.ModelConfig, instance=True
     )
     self.config.use_scan_layers = False
     self.checkpoint_path = '/fake/checkpoint'
@@ -568,7 +569,7 @@ class BuildShardedRestoreTargetTest(absltest.TestCase):
 
   def test_build_target_without_scan_layers(self):
     config = mock.create_autospec(
-        params.gemma4_model.ModelConfig, instance=True
+        gemma4_model.ModelConfig, instance=True
     )
     config.use_scan_layers = False
 
@@ -625,36 +626,38 @@ class BuildShardedRestoreTargetTest(absltest.TestCase):
 
   def test_build_target_with_scan_layers(self):
     config = mock.create_autospec(
-        params.gemma4_model.ModelConfig, instance=True
+        gemma4_model.ModelConfig, instance=True
     )
     config.use_scan_layers = True
-    config.attention_pattern = (params.gemma4_model.AttentionType.GLOBAL,)
+    config.attention_pattern = (gemma4_model.AttentionType.GLOBAL,)
     config.num_layers = 1
     config.frac_shared_layers = 0.0
 
-    # Downstream scan layout: scan_groups/sub_layers/0/...
+    # Downstream scan layout: scan_groups/sub_groups/0/layers/...
     model_state = nnx.state(
         nnx.Dict({
             'scan_groups': nnx.Dict({
-                'sub_layers': nnx.List([
+                'sub_groups': nnx.List([
                     nnx.Dict({
-                        'mlp': nnx.Dict({
-                            'gate_proj': nnx.Dict({
-                                'kernel': nnx.Param(
-                                    np.zeros((1, 4, 8)),
-                                    sharding=jax.sharding.PartitionSpec(
-                                        'fsdp', 'tp'
-                                    ),
-                                )
-                            }),
-                            'up_proj': nnx.Dict({
-                                'kernel': nnx.Param(
-                                    np.zeros((1, 4, 8)),
-                                    sharding=jax.sharding.PartitionSpec(
-                                        'fsdp', 'tp'
-                                    ),
-                                )
-                            }),
+                        'layers': nnx.Dict({
+                            'mlp': nnx.Dict({
+                                'gate_proj': nnx.Dict({
+                                    'kernel': nnx.Param(
+                                        np.zeros((1, 1, 4, 8)),
+                                        sharding=jax.sharding.PartitionSpec(
+                                            'fsdp', 'tp'
+                                        ),
+                                    )
+                                }),
+                                'up_proj': nnx.Dict({
+                                    'kernel': nnx.Param(
+                                        np.zeros((1, 1, 4, 8)),
+                                        sharding=jax.sharding.PartitionSpec(
+                                            'fsdp', 'tp'
+                                        ),
+                                    )
+                                }),
+                            })
                         })
                     })
                 ])
@@ -687,7 +690,7 @@ class BuildShardedRestoreTargetTest(absltest.TestCase):
     )
 
   def test_real_model_sharded_restore_target_with_scan_layers(self):
-    config = params.gemma4_model.ModelConfig(
+    config = gemma4_model.ModelConfig(
         num_layers=6,
         num_embed=256000,
         embed_dim=5376,
@@ -696,12 +699,12 @@ class BuildShardedRestoreTargetTest(absltest.TestCase):
         head_dim=256,
         num_kv_heads=16,
         attention_pattern=(
-            params.gemma4_model.AttentionType.LOCAL_SLIDING,
-            params.gemma4_model.AttentionType.LOCAL_SLIDING,
-            params.gemma4_model.AttentionType.LOCAL_SLIDING,
-            params.gemma4_model.AttentionType.LOCAL_SLIDING,
-            params.gemma4_model.AttentionType.LOCAL_SLIDING,
-            params.gemma4_model.AttentionType.GLOBAL,
+            gemma4_model.AttentionType.LOCAL_SLIDING,
+            gemma4_model.AttentionType.LOCAL_SLIDING,
+            gemma4_model.AttentionType.LOCAL_SLIDING,
+            gemma4_model.AttentionType.LOCAL_SLIDING,
+            gemma4_model.AttentionType.LOCAL_SLIDING,
+            gemma4_model.AttentionType.GLOBAL,
         ),
         use_scan_layers=True,
     )
@@ -713,7 +716,7 @@ class BuildShardedRestoreTargetTest(absltest.TestCase):
 
     with nnx.use_eager_sharding(True), jax.set_mesh(mesh):
       abs_model = nnx.eval_shape(
-          lambda: params.gemma4_model.Gemma4(config, rngs=nnx.Rngs(0))
+          lambda: gemma4_model.Gemma4(config, rngs=nnx.Rngs(0))
       )
     model_state = nnx.state(abs_model)
 
@@ -736,7 +739,7 @@ class BuildShardedRestoreTargetTest(absltest.TestCase):
     self.assertEqual(shard_shape, (2, 16, 168, 256))
 
   def test_create_model_from_checkpoint_with_scan_layers(self):
-    config = params.gemma4_model.ModelConfig(
+    config = gemma4_model.ModelConfig(
         num_layers=6,
         num_embed=256000,
         embed_dim=5376,
@@ -744,13 +747,15 @@ class BuildShardedRestoreTargetTest(absltest.TestCase):
         num_heads=32,
         head_dim=256,
         num_kv_heads=16,
+        global_key_size=256,
+        num_global_kv_heads=16,
         attention_pattern=(
-            params.gemma4_model.AttentionType.LOCAL_SLIDING,
-            params.gemma4_model.AttentionType.LOCAL_SLIDING,
-            params.gemma4_model.AttentionType.LOCAL_SLIDING,
-            params.gemma4_model.AttentionType.LOCAL_SLIDING,
-            params.gemma4_model.AttentionType.LOCAL_SLIDING,
-            params.gemma4_model.AttentionType.LOCAL_SLIDING,
+            gemma4_model.AttentionType.LOCAL_SLIDING,
+            gemma4_model.AttentionType.LOCAL_SLIDING,
+            gemma4_model.AttentionType.LOCAL_SLIDING,
+            gemma4_model.AttentionType.LOCAL_SLIDING,
+            gemma4_model.AttentionType.LOCAL_SLIDING,
+            gemma4_model.AttentionType.GLOBAL,
         ),
         use_scan_layers=True,
     )
@@ -792,14 +797,13 @@ class BuildShardedRestoreTargetTest(absltest.TestCase):
     model = params.create_model_from_checkpoint(
         '/fake/checkpoint', config, mesh=mesh
     )
-    self.assertIsInstance(model, params.gemma4_model.Gemma4)
+    self.assertIsInstance(model, gemma4_model.Gemma4)
 
-    # Verify that the stacked parameters have the correct 5D sharding spec
-    # (i.e. prepended with None for the scan group axis)
+    # Verify that the stacked parameters have the correct sharding spec
     state = nnx.state(model)
     self.assertEqual(
-        state.scan_groups.sub_layers[0].attn.kv_einsum.w.sharding.spec,
-        jax.sharding.PartitionSpec(None, None, 'tp', 'fsdp', None),
+        state.scan_groups.sub_groups[0].layers.attn.kv_einsum.w.sharding.spec,
+        jax.sharding.PartitionSpec(),
     )
 
   def test_map_from_upstream_checkpoint_fine_tuned_layout(self):
@@ -853,29 +857,23 @@ class BuildShardedRestoreTargetTest(absltest.TestCase):
     _GKV, _GHD = 1, 32  # global kv_heads, global head_dim
     _F = 128  # hidden_dim
 
-    config = params.gemma4_model.ModelConfig(
+    config = gemma4_model.ModelConfig(
         num_layers=12,
         num_embed=128,
         embed_dim=_E,
         hidden_dim=_F,
         num_heads=_H,
-        head_dim=_HD,
         num_kv_heads=_KV,
-        num_global_kv_heads=_GKV,
+        head_dim=_HD,
         global_key_size=_GHD,
+        num_global_kv_heads=_GKV,
         sliding_window_size=16,
+        attention_pattern=gemma4_model.GEMMA4_ATTENTION_PATTERN,
+        dtype=jax.numpy.bfloat16,
+        param_dtype=jax.numpy.bfloat16,
         k_eq_v_global=True,
-        frac_shared_layers=0.0,
-        per_layer_input_dim=0,
         use_scan_layers=True,
-        attention_pattern=(
-            params.gemma4_model.AttentionType.LOCAL_SLIDING,
-            params.gemma4_model.AttentionType.LOCAL_SLIDING,
-            params.gemma4_model.AttentionType.LOCAL_SLIDING,
-            params.gemma4_model.AttentionType.LOCAL_SLIDING,
-            params.gemma4_model.AttentionType.LOCAL_SLIDING,
-            params.gemma4_model.AttentionType.GLOBAL,
-        ),
+        use_flash_attention=False,
     )
 
     devices = np.array(jax.devices()[:1]).reshape(1, 1)
@@ -935,7 +933,7 @@ class BuildShardedRestoreTargetTest(absltest.TestCase):
     model = params.create_model_from_checkpoint(
         '/fake/checkpoint', config, mesh=mesh
     )
-    self.assertIsInstance(model, params.gemma4_model.Gemma4)
+    self.assertIsInstance(model, gemma4_model.Gemma4)
 
     # Verify scan group structure exists
     self.assertTrue(hasattr(model, 'scan_groups'))
@@ -945,17 +943,17 @@ class BuildShardedRestoreTargetTest(absltest.TestCase):
     state = nnx.state(model)
     flat_state = flatten_dict(nnx.to_pure_dict(state))
 
-    # LOCAL_SLIDING sub_layer (index 0): should have kv_einsum
-    kv_key = ('scan_groups', 'sub_layers', 0, 'attn', 'kv_einsum', 'w')
+    # LOCAL_SLIDING sub_group (index 0): in sub_groups[0].layers
+    kv_key = ('scan_groups', 'sub_groups', 0, 'layers', 'attn', 'kv_einsum', 'w')
     self.assertIn(kv_key, flat_state)
-    # Shape: (num_groups=2, 2, kv_heads, embed, head_dim)
-    self.assertEqual(flat_state[kv_key].shape, (2, 2, _KV, _E, _HD))
+    # Shape: (num_groups=2, count=5, 2, kv_heads, embed, head_dim)
+    self.assertEqual(flat_state[kv_key].shape, (2, 5, 2, _KV, _E, _HD))
 
-    # GLOBAL sub_layer (index 5): should have k_einsum (k_eq_v_global)
-    k_key = ('scan_groups', 'sub_layers', 5, 'attn', 'k_einsum', 'w')
+    # GLOBAL sub_group (index 1): in sub_groups[1].layers
+    k_key = ('scan_groups', 'sub_groups', 1, 'layers', 'attn', 'k_einsum', 'w')
     self.assertIn(k_key, flat_state)
-    # Shape: (num_groups=2, global_kv_heads, embed, global_head_dim)
-    self.assertEqual(flat_state[k_key].shape, (2, _GKV, _E, _GHD))
+    # Shape: (num_groups=2, count=1, global_kv_heads, embed, global_head_dim)
+    self.assertEqual(flat_state[k_key].shape, (2, 1, _GKV, _E, _GHD))
 
   def test_stack_layers_for_scan_int_layer_keys(self):
     """Tests _stack_layers_for_scan with integer layer keys.
@@ -970,14 +968,25 @@ class BuildShardedRestoreTargetTest(absltest.TestCase):
         }
     }
     stacked = params._stack_layers_for_scan(
-        dummy_params, num_layers=2, pattern_len=1, frac_shared_layers=0.0
+        dummy_params,
+        num_layers=2,
+        pattern=(
+            gemma4_model.AttentionType.LOCAL_SLIDING,
+            gemma4_model.AttentionType.GLOBAL,
+        ),
+        frac_shared_layers=0.0,
     )
     self.assertIn('scan_groups', stacked)
-    self.assertIn('sub_layers', stacked['scan_groups'])
-    # Stacked shape for sub_layer 0 should be (num_groups=2, 4, 4)
+    self.assertIn('sub_groups', stacked['scan_groups'])
+    # Stacked shape for sub_groups[0] (local) should be (num_groups=1, count=1, 4, 4)
     self.assertEqual(
-        stacked['scan_groups']['sub_layers'][0]['attn']['w'].shape,
-        (2, 4, 4),
+        stacked['scan_groups']['sub_groups'][0]['layers']['attn']['w'].shape,
+        (1, 1, 4, 4),
+    )
+    # Stacked shape for sub_groups[1] (global) should be (num_groups=1, count=1, 4, 4)
+    self.assertEqual(
+        stacked['scan_groups']['sub_groups'][1]['layers']['attn']['w'].shape,
+        (1, 1, 4, 4),
     )
 
 

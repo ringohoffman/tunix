@@ -165,25 +165,32 @@ LeafT = TypeVar('LeafT', jax.Array, _ShapeTracer)
 def _stack_layers_for_scan(
     params: flax.typing.PyTree[jax.Array],
     num_layers: int,
-    pattern_len: int,
+    pattern: tuple[gemma4_model.AttentionType, ...],
     frac_shared_layers: float,
 ) -> flax.typing.PyTree[jax.Array]:
-  """Restructure per-layer params into scan_groups/sub_layers with stacking.
+  """Restructure per-layer params into scan_groups.sub_groups with contiguous subgroup stacking.
 
-  When use_scan_layers is True, the model uses vmapped scan groups instead
-  of individual layer modules. This function takes the flat per-layer
-  checkpoint layout (layers/0..N) and reorganizes it into the scan layout
-  (scan_groups/sub_layers/0..pattern_len) with an extra leading axis.
+  When use_scan_layers is True, the model groups contiguous identical layers
+  into vectorized ScanSubGroups. Outer scan groups and inner subscan layers are
+  stacked along axes (0, 1).
+
+  Supports input from:
+  1. Flat non-scan checkpoints (layers/0..N).
+  2. Old scan checkpoints (sub_layers/0..pattern_len-1).
+  3. New subscan checkpoints (sub_groups/0..N/layers/...).
 
   Args:
     params: Nested parameter dict from map_from_upstream_checkpoint.
     num_layers: Total number of layers in the model.
-    pattern_len: Number of sub-layers per scan group.
+    pattern: Attention pattern tuple (tuple[AttentionType, ...]).
     frac_shared_layers: Fraction of shared layers in Gemma 4.
 
   Returns:
     Parameter dict with layers restructured into scan groups.
   """
+  pattern_len = len(pattern)
+  subgroup_specs = gemma4_model.group_contiguous_attention_types(pattern)
+
   num_unshared_layers = int(num_layers - frac_shared_layers * num_layers)
   num_shared_layers = num_layers - num_unshared_layers
   num_unshared_groups = num_unshared_layers // pattern_len
@@ -191,10 +198,11 @@ def _stack_layers_for_scan(
 
   flat = flax.traverse_util.flatten_dict(params)
   new_flat: flax.typing.FlatPyTree[jax.Array] = {}
-  collector_group_count: dict[flax.typing.PathParts, int] = {}
-  collector: dict[flax.typing.PathParts, dict[int, jax.Array]] = (
+  collector: dict[flax.typing.PathParts, dict[tuple[int, int], jax.Array]] = (
       collections.defaultdict(dict)
   )
+  group_counts: dict[flax.typing.PathParts, int] = {}
+  subgroup_indices: dict[flax.typing.PathParts, int] = {}
 
   for path, param in flat.items():
     root = path[0]
@@ -215,31 +223,52 @@ def _stack_layers_for_scan(
         group_name = (
             'unshared_scan_groups' if frac_shared_layers > 0 else 'scan_groups'
         )
-        target_path: flax.typing.PathParts = (
-            group_name,
-            'sub_layers',
-            sub_layer_idx,
-        ) + param_path
-        collector[target_path][group_idx] = param
-        collector_group_count[target_path] = num_unshared_groups
+        g_count = num_unshared_groups
       else:
         rel_idx = layer_idx - num_unshared_layers
         sub_layer_idx = rel_idx % pattern_len
         group_idx = rel_idx // pattern_len
-        target_path: flax.typing.PathParts = (
-            'shared_scan_groups',
-            'sub_layers',
-            sub_layer_idx,
-        ) + param_path
-        collector[target_path][group_idx] = param
-        collector_group_count[target_path] = num_shared_groups
+        group_name = 'shared_scan_groups'
+        g_count = num_shared_groups
+
+      sg_idx, inner_idx = gemma4_model.sub_layer_idx_to_subgroup_coord(
+          sub_layer_idx, subgroup_specs
+      )
+      target_path = (group_name, 'sub_groups', sg_idx, 'layers') + param_path
+      collector[target_path][(group_idx, inner_idx)] = param
+      group_counts[target_path] = g_count
+      subgroup_indices[target_path] = sg_idx
+
+    elif len(path) >= 3 and path[1] == 'sub_layers':
+      group_name = path[0]
+      sub_layer_idx = path[2]
+      assert isinstance(sub_layer_idx, int)
+      param_path = path[3:]
+      g_count = (
+          num_unshared_groups
+          if group_name in ('scan_groups', 'unshared_scan_groups')
+          else num_shared_groups
+      )
+
+      sg_idx, inner_idx = gemma4_model.sub_layer_idx_to_subgroup_coord(
+          sub_layer_idx, subgroup_specs
+      )
+      target_path = (group_name, 'sub_groups', sg_idx, 'layers') + param_path
+      for g in range(g_count):
+        collector[target_path][(g, inner_idx)] = param[g]
+      group_counts[target_path] = g_count
+      subgroup_indices[target_path] = sg_idx
+
     else:
       new_flat[path] = param
 
   for target_path, slices in collector.items():
-    g_count = collector_group_count[target_path]
-    sorted_slices = [slices[i] for i in range(g_count)]
-    new_flat[target_path] = jnp.stack(sorted_slices, axis=0)
+    g_count = group_counts[target_path]
+    sg_idx = subgroup_indices[target_path]
+    count = subgroup_specs[sg_idx][1]
+    grid = [[slices[(g, l)] for l in range(count)] for g in range(g_count)]
+    stacked = jnp.stack([jnp.stack(row, axis=0) for row in grid], axis=0)
+    new_flat[target_path] = stacked
 
   return flax.traverse_util.unflatten_dict(new_flat)
 
@@ -274,7 +303,7 @@ def _build_sharded_restore_target(
   meta = ckptr.metadata(checkpoint_path)
   assert meta.item_metadata is not None
   item_tree = meta.item_metadata.tree
-  assert flax.typing.is_pytree_of(item_tree, ocp.metadata.Metadata)
+  assert flax.typing.is_pytree_of(item_tree, ocp.metadata.ArrayMetadata)
   flat_upstream = flax.traverse_util.flatten_dict(item_tree)
 
   mock_upstream = flax.traverse_util.unflatten_dict(
@@ -343,7 +372,15 @@ def _build_sharded_restore_target(
         sub_layer_idx = rel_idx % pattern_len
         group_name = 'shared_scan_groups'
 
-      scan_key = (group_name, 'sub_layers', sub_layer_idx) + param_path
+      assert model_config.attention_pattern is not None
+      subgroup_specs = gemma4_model.group_contiguous_attention_types(
+          model_config.attention_pattern
+      )
+      sg_idx, _ = gemma4_model.sub_layer_idx_to_subgroup_coord(
+          sub_layer_idx, subgroup_specs
+      )
+      scan_key = (group_name, 'sub_groups', sg_idx, 'layers') + param_path
+
       if scan_key not in flat_shardings:
         if (group_name,) + scan_key in flat_shardings:
           scan_key = (group_name,) + scan_key
@@ -354,16 +391,16 @@ def _build_sharded_restore_target(
           )
           continue
       sharding = flat_shardings[scan_key]
-      # The stacked param's spec has a leading None for the scan/vmap axis
-      # (prepended by _init_scan_layers Phase 2). The checkpoint stores
-      # per-layer (un-stacked) tensors without that axis, so strip it before
-      # inverting to the upstream checkpoint spec.
       spec_axes = tuple(sharding.spec)
-      if spec_axes and spec_axes[0] is None:
-        sharding = jax.sharding.NamedSharding(
-            sharding.mesh,
-            jax.sharding.PartitionSpec(*spec_axes[1:]),
-        )
+      expected_rank = len(tracer.shape)
+      while (
+          spec_axes and spec_axes[0] is None and len(spec_axes) > expected_rank
+      ):
+        spec_axes = spec_axes[1:]
+      sharding = jax.sharding.NamedSharding(
+          sharding.mesh,
+          jax.sharding.PartitionSpec(*spec_axes),
+      )
     else:
       if downstream_key not in flat_shardings:
         logging.info(
@@ -523,7 +560,7 @@ def _try_restore_native_tunix(
     stacked = _stack_layers_for_scan(
         flat_params,
         model_config.num_layers,
-        len(model_config.attention_pattern),
+        model_config.attention_pattern,
         model_config.frac_shared_layers,
     )
     # Prune stacked params to match the target model's state keys and update.
@@ -614,15 +651,14 @@ def create_model_from_checkpoint(
       nnx.use_eager_sharding(True),
       _mesh_context(mesh),
   ):
-    model_cls = (
-        gemma4_classification.Gemma4ForClassification
+    abs_model = nnx.eval_shape(
+        lambda: gemma4_classification.Gemma4ForClassification(
+            model_config, rngs=nnx.Rngs(0)
+        )
         if isinstance(
             model_config, gemma4_classification.ClassificationModelConfig
         )
-        else gemma4_model.Gemma4
-    )
-    abs_model = nnx.eval_shape(
-        lambda: model_cls(model_config, rngs=nnx.Rngs(0))
+        else gemma4_model.Gemma4(model_config, rngs=nnx.Rngs(0))
     )
   model_state: nnx.State[
       flax.typing.PathParts, nnx.Variable[jax.ShapeDtypeStruct]
@@ -679,7 +715,7 @@ def create_model_from_checkpoint(
       mapped = _stack_layers_for_scan(
           mapped,
           model_config.num_layers,
-          len(model_config.attention_pattern),
+          model_config.attention_pattern,
           model_config.frac_shared_layers,
       )
 
