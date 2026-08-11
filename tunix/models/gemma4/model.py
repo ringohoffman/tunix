@@ -1860,6 +1860,122 @@ class ScanSubGroup(nnx.Module):
 
     self.layers = create_layer(rngs)
 
+  def __call__(
+      self,
+      x: jaxtyping.Array,
+      positions: jaxtyping.Array,
+      attn_mask: jaxtyping.Array | None,
+      *,
+      subgroup_cache: LayerCache | None = None,
+      per_layer_inputs: jaxtyping.Array | None = None,
+      kv_override: LayerCache | LayerKV | None = None,
+      use_kv_override: jaxtyping.Array | None = None,
+      segment_ids: jaxtyping.Array | splash.SegmentIds | None = None,
+  ) -> tuple[jaxtyping.Array, LayerCache | None, LayerKV | None]:
+    """Run this sub-group's layers via vectorized subscan."""
+    if subgroup_cache is not None:
+
+      @nnx.scan(
+          in_axes=(
+              nnx.Carry,
+              0,
+              {"k": 0, "v": 0, "end_index": 0},
+              None,
+              None,
+              0 if per_layer_inputs is not None else None,
+              0 if use_kv_override is not None else None,
+              None,
+          ),
+          out_axes=(
+              nnx.Carry,
+              {"k": 0, "v": 0, "end_index": 0},
+          ),
+      )
+      def subscan_cache_body(
+          x: jaxtyping.Array,
+          layer: DecoderLayer,
+          layer_cache: LayerCache,
+          positions: jaxtyping.Array,
+          attn_mask: jaxtyping.Array | None,
+          pli: jaxtyping.Array | None,
+          use_kvo: jaxtyping.Array | None,
+          segment_ids: jaxtyping.Array | splash.SegmentIds | None,
+      ) -> tuple[jaxtyping.Array, LayerCache]:
+        layer_cache, x, _ = layer(
+            x,
+            positions,
+            layer_cache,
+            attn_mask,
+            per_layer_input=pli,
+            kv_override=kv_override,
+            use_kv_override=use_kvo,
+            skip_kv_projection=self.skip_kv_projection,
+            segment_ids=segment_ids,
+        )
+        return x, layer_cache
+
+      x, out_cache = subscan_cache_body(
+          x,
+          self.layers,
+          subgroup_cache,
+          positions,
+          attn_mask,
+          per_layer_inputs,
+          use_kv_override,
+          segment_ids,
+      )
+      return x, out_cache, None
+
+    else:
+
+      @nnx.scan(
+          in_axes=(
+              nnx.Carry,
+              0,
+              None,
+              None,
+              0 if per_layer_inputs is not None else None,
+              0 if use_kv_override is not None else None,
+              None,
+          ),
+          out_axes=(
+              nnx.Carry,
+              (0, 0),
+          ),
+      )
+      def subscan_body(
+          x: jaxtyping.Array,
+          layer: DecoderLayer,
+          positions: jaxtyping.Array,
+          attn_mask: jaxtyping.Array | None,
+          pli: jaxtyping.Array | None,
+          use_kvo: jaxtyping.Array | None,
+          segment_ids: jaxtyping.Array | splash.SegmentIds | None,
+      ) -> tuple[jaxtyping.Array, tuple[jaxtyping.Array, jaxtyping.Array]]:
+        _, x, kv = layer(
+            x,
+            positions,
+            None,
+            attn_mask,
+            per_layer_input=pli,
+            kv_override=kv_override,
+            use_kv_override=use_kvo,
+            skip_kv_projection=self.skip_kv_projection,
+            segment_ids=segment_ids,
+        )
+        return x, kv
+
+      x, out_kv = subscan_body(
+          x,
+          self.layers,
+          positions,
+          attn_mask,
+          per_layer_inputs,
+          use_kv_override,
+          segment_ids,
+      )
+      return x, None, out_kv
+
 
 class ScanLayerGroup(nnx.Module):
   """A group of DecoderLayers matching one full attention pattern cycle.
@@ -1931,61 +2047,76 @@ class ScanLayerGroup(nnx.Module):
       origin_kv_local: LayerKV | LayerCache | None = None,
       segment_ids: jaxtyping.Array | splash.SegmentIds | None = None,
   ) -> jaxtyping.Array:
-    """Run one pattern-group of layers across all contiguous attention
-
-    sub-groups.
-    """
+    """Run one pattern-group of layers across all contiguous attention sub-groups."""
     sub_idx = 0
     for sub_group in self.sub_groups:
-      graphdef, state = nnx.split(sub_group.layers)
-      for inner_idx in range(sub_group.count):
-        layer_cache = (
-            cache[sub_idx]
-            if cache is not None and sub_idx < len(cache)
-            else None
-        )
-        kv_override = None
-        use_kv_override = None
-        if origin_kv is not None and is_shared is not None:
-          assert origin_sub_indices is not None
-          origin_s = origin_sub_indices[sub_idx]
-          kv_override = origin_kv[origin_s]
-          use_kv_override = is_shared[sub_idx]
-        elif origin_kv_global is not None and origin_kv_local is not None:
-          attn_type = self.pattern[sub_idx]
-          if attn_type == AttentionType.GLOBAL:
-            kv_override = origin_kv_global
-          else:
-            kv_override = origin_kv_local
-          use_kv_override = jnp.array(True)
+      count = sub_group.count
 
-        per_layer_input = (
-            per_layer_inputs[:, :, sub_idx, :]
-            if per_layer_inputs is not None
-            else None
-        )
+      subgroup_cache = None
+      if cache is not None:
+        sub_caches = [
+            cache[sub_idx + i]
+            for i in range(count)
+            if (sub_idx + i) < len(cache) and cache[sub_idx + i] is not None
+        ]
+        if len(sub_caches) == count:
+          subgroup_cache = {
+              "k": jnp.stack([c["k"] for c in sub_caches], axis=0),
+              "v": jnp.stack([c["v"] for c in sub_caches], axis=0),
+              "end_index": jnp.stack(
+                  [c["end_index"] for c in sub_caches], axis=0
+              ),
+          }
 
-        sub_state = jax.tree.map(lambda leaf: leaf[inner_idx], state)
-        layer = nnx.merge(graphdef, sub_state)
+      sub_per_layer_inputs = (
+          per_layer_inputs[:, :, sub_idx : sub_idx + count, :]
+          if per_layer_inputs is not None
+          else None
+      )
+      if sub_per_layer_inputs is not None:
+        sub_per_layer_inputs = jnp.transpose(sub_per_layer_inputs, (2, 0, 1, 3))
 
-        layer_cache, x, kv = layer(
-            x,
-            positions,
-            layer_cache,
-            attn_mask,
-            per_layer_input=per_layer_input,
-            kv_override=kv_override,
-            use_kv_override=use_kv_override,
-            skip_kv_projection=self.skip_kv_projection,
-            segment_ids=segment_ids,
-        )
-        if new_cache is not None and layer_cache is not None:
-          assert "end_index" in layer_cache
-          new_cache[sub_idx] = layer_cache
-        if new_group_kvs is not None and kv is not None:
-          new_group_kvs[sub_idx] = {"k": kv[0], "v": kv[1]}
+      kv_override = None
+      use_kv_override = None
+      if origin_kv is not None and is_shared is not None:
+        assert origin_sub_indices is not None
+        origin_s = origin_sub_indices[sub_idx]
+        kv_override = origin_kv[origin_s]
+        use_kv_override = is_shared[sub_idx : sub_idx + count]
+      elif origin_kv_global is not None and origin_kv_local is not None:
+        attn_type = self.pattern[sub_idx]
+        if attn_type == AttentionType.GLOBAL:
+          kv_override = origin_kv_global
+        else:
+          kv_override = origin_kv_local
+        use_kv_override = jnp.ones((count,), dtype=jnp.bool_)
 
-        sub_idx += 1
+      x, out_cache, out_kv = sub_group(
+          x,
+          positions,
+          attn_mask,
+          subgroup_cache=subgroup_cache,
+          per_layer_inputs=sub_per_layer_inputs,
+          kv_override=kv_override,
+          use_kv_override=use_kv_override,
+          segment_ids=segment_ids,
+      )
+
+      if new_cache is not None and out_cache is not None:
+        for i in range(count):
+          new_cache[sub_idx + i] = {
+              "k": out_cache["k"][i],
+              "v": out_cache["v"][i],
+              "end_index": out_cache["end_index"][i],
+          }
+      if new_group_kvs is not None and out_kv is not None:
+        for i in range(count):
+          new_group_kvs[sub_idx + i] = {
+              "k": out_kv[0][i],
+              "v": out_kv[1][i],
+          }
+
+      sub_idx += count
 
     return x
 
