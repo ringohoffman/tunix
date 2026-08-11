@@ -258,6 +258,127 @@ class ModelTest(absltest.TestCase):
         msg=f'_forward_loop vs _forward_scan diff too large: {max_diff}',
     )
 
+  def test_cached_autoregressive_vs_prefill_equivalence(self):
+    """Verifies that incremental cached single-token decode matches full un-cached sequence forward."""
+    for use_scan in (False, True):
+      with self.subTest(use_scan=use_scan):
+        config = model_lib.ModelConfig(
+            num_layers=10,
+            num_embed=128,
+            embed_dim=64,
+            hidden_dim=128,
+            num_heads=4,
+            head_dim=16,
+            num_kv_heads=2,
+            num_global_kv_heads=1,
+            global_key_size=16,
+            sliding_window_size=16,
+            frac_shared_layers=0.5,
+            use_scan_layers=use_scan,
+            use_flash_attention=False,
+            dtype=jnp.float32,
+            param_dtype=jnp.float32,
+            attention_pattern=(
+                model_lib.AttentionType.LOCAL_SLIDING,
+                model_lib.AttentionType.LOCAL_SLIDING,
+                model_lib.AttentionType.LOCAL_SLIDING,
+                model_lib.AttentionType.LOCAL_SLIDING,
+                model_lib.AttentionType.GLOBAL,
+            ),
+        )
+        model = model_lib.Gemma4(config, rngs=nnx.Rngs(42))
+        batch_size = 2
+        seq_len = 8
+        cache_size = 16
+
+        # 1. Full un-cached sequence forward pass
+        full_tokens = jax.random.randint(
+            jax.random.PRNGKey(0), (batch_size, seq_len), 0, config.num_embed
+        )
+        full_positions = jnp.tile(jnp.arange(seq_len)[None, :], (batch_size, 1))
+        full_mask = jnp.tril(jnp.ones((seq_len, seq_len), dtype=jnp.bool_))[None, ...]
+        full_out = model(full_tokens, positions=full_positions, attention_mask=full_mask)
+        expected_last_logits = full_out.logits[:, -1, :]
+
+        # 2. Prefill on seq_len - 1 tokens
+        pfill_tokens = full_tokens[:, :-1]
+        pfill_positions = full_positions[:, :-1]
+        pfill_len = seq_len - 1
+        pfill_mask = jnp.pad(
+            jnp.tril(jnp.ones((pfill_len, pfill_len), dtype=jnp.bool_))[None, ...],
+            ((0, 0), (0, 0), (0, cache_size - pfill_len)),
+        )
+        init_cache = model.init_cache(batch_size=batch_size, max_seq_len=cache_size, dtype=jnp.float32)
+        pfill_out = model(pfill_tokens, positions=pfill_positions, cache=init_cache, attention_mask=pfill_mask)
+
+        # 3. Incremental single-token decode for token at index seq_len - 1
+        last_tok = full_tokens[:, -1:]
+        last_pos = full_positions[:, -1:]
+        # Attention mask for single decode step: causal access to 0..pfill_len
+        dec_mask = jnp.zeros((batch_size, 1, cache_size), dtype=jnp.bool_)
+        dec_mask = dec_mask.at[:, :, :seq_len].set(True)
+
+        dec_out = model(last_tok, positions=last_pos, cache=pfill_out.cache, attention_mask=dec_mask)
+        actual_last_logits = dec_out.logits[:, 0, :]
+
+        max_diff = float(jnp.max(jnp.abs(expected_last_logits - actual_last_logits)))
+        self.assertLess(
+            max_diff,
+            1e-4,
+            msg=f'Cached decode vs full forward mismatch (use_scan={use_scan}): {max_diff}',
+        )
+
+  def test_cached_eager_multistep_decode_with_shared_layers(self):
+    """Verifies multi-step eager cached decode does not crash or diverge with shared layers."""
+    config = model_lib.ModelConfig(
+        num_layers=10,
+        num_embed=128,
+        embed_dim=64,
+        hidden_dim=128,
+        num_heads=4,
+        head_dim=16,
+        num_kv_heads=2,
+        num_global_kv_heads=1,
+        global_key_size=16,
+        sliding_window_size=16,
+        frac_shared_layers=0.5,
+        use_scan_layers=False,
+        use_flash_attention=False,
+        dtype=jnp.float32,
+        param_dtype=jnp.float32,
+        attention_pattern=(
+            model_lib.AttentionType.LOCAL_SLIDING,
+            model_lib.AttentionType.LOCAL_SLIDING,
+            model_lib.AttentionType.LOCAL_SLIDING,
+            model_lib.AttentionType.LOCAL_SLIDING,
+            model_lib.AttentionType.GLOBAL,
+        ) * 2,
+    )
+    model = model_lib.Gemma4(config, rngs=nnx.Rngs(123))
+    batch_size = 1
+    pfill_len = 4
+    cache_size = 16
+
+    init_cache = model.init_cache(batch_size=batch_size, max_seq_len=cache_size, dtype=jnp.float32)
+    pfill_tok = jnp.array([[10, 20, 30, 40]], dtype=jnp.int32)
+    pfill_pos = jnp.arange(pfill_len)[None, :]
+    pfill_mask = jnp.pad(
+        jnp.tril(jnp.ones((pfill_len, pfill_len), dtype=jnp.bool_))[None, ...],
+        ((0, 0), (0, 0), (0, cache_size - pfill_len)),
+    )
+    pfill_out = model(pfill_tok, positions=pfill_pos, cache=init_cache, attention_mask=pfill_mask)
+    cache = pfill_out.cache
+
+    for step in range(4):
+      curr_pos = pfill_len + step
+      tok = jnp.array([[50 + step]], dtype=jnp.int32)
+      pos = jnp.array([[curr_pos]], dtype=jnp.int32)
+      mask = jnp.zeros((batch_size, 1, cache_size), dtype=jnp.bool_).at[:, :, :curr_pos + 1].set(True)
+      out = model(tok, positions=pos, cache=cache, attention_mask=mask)
+      cache = out.cache
+      self.assertEqual(out.logits.shape, (batch_size, 1, config.num_embed))
+      self.assertFalse(jnp.isnan(out.logits).any())
+
 
 def _make_shared_scan_config() -> model_lib.ModelConfig:
   """Minimal config with shared layers + scan for skip_kv_projection tests.

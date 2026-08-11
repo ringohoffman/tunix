@@ -1356,9 +1356,10 @@ class Attention(nnx.Module):
       else:
         logits = jnp.einsum("BTNH,BSNH->BTNS", query_proj, key_proj)
 
+      active_cache = cache if cache is not None else kv_shared_cache
       assert attn_mask is not None, "attn_mask required for non-flash path"
       if attn_mask is not None:
-        if cache is None or seq_len > cache["v"].shape[1]:
+        if active_cache is None or seq_len > active_cache["v"].shape[1]:
           # Only compute attention scores for the actual sequence length when not
           # using a cache-backed representation.
           attn_mask = attn_mask[..., :seq_len]
