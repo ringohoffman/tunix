@@ -1436,6 +1436,7 @@ class Attention(nnx.Module):
           and prefix_k.shape[1] > 0
       )
 
+      pfx_logits: jaxtyping.Array | None = None
       if self.use_gqa:
         b, t, kg, h = query_proj.shape
         n_groups = kg // self.num_kv_heads
@@ -1450,18 +1451,13 @@ class Attention(nnx.Module):
           pfx_logits = jnp.einsum("BTKGH,BSKH->BTKGS", query_reshaped, prefix_k)
           pfx_s = pfx_logits.shape[-1]
           pfx_logits = pfx_logits.reshape((b, t, kg, pfx_s))
-          logits = jnp.concatenate([pfx_logits, gen_logits], axis=-1)
-        else:
-          logits = gen_logits
       else:
         gen_logits = jnp.einsum("BTNH,BSNH->BTNS", query_proj, key_proj)
         gen_s = gen_logits.shape[-1]
         if has_prefix:
           assert prefix_k is not None
           pfx_logits = jnp.einsum("BTNH,BSNH->BTNS", query_proj, prefix_k)
-          logits = jnp.concatenate([pfx_logits, gen_logits], axis=-1)
-        else:
-          logits = gen_logits
+          pfx_s = pfx_logits.shape[-1]
 
       assert attn_mask is not None, "attn_mask required for non-flash path"
       if attn_mask is not None:
@@ -1554,33 +1550,36 @@ class Attention(nnx.Module):
           ) * jnp.tril(all_ones, self.config.sliding_window_size - 1)
           attn_mask = sliding_mask * attn_mask
 
-      # --- Build combined mask: prefix (all-True) + gen mask ---
       if has_prefix:
-        assert prefix_k is not None and prefix_v is not None
-        prefix_len = prefix_k.shape[1]
-        pfx_mask = jnp.ones(
-            (*attn_mask.shape[:-1], prefix_len), dtype=jnp.bool_
+        assert (
+            prefix_k is not None
+            and prefix_v is not None
+            and pfx_logits is not None
         )
-        full_mask = jnp.concatenate([pfx_mask, attn_mask], axis=-1)
-      else:
-        full_mask = attn_mask
-
-      if full_mask.ndim == 3:
-        full_mask = jnp.expand_dims(full_mask, -2)
-      attn = jnp.where(full_mask, logits, K_MASK)
-      attn = jax.nn.softmax(attn.astype(jnp.float32), axis=-1).astype(
-          key_proj.dtype
-      )
-
-      # --- Split attention weights and compute value-weighted sums ---
-      if has_prefix:
-        assert prefix_k is not None and prefix_v is not None
         pfx_s = prefix_k.shape[1]
-        pfx_attn = attn[..., :pfx_s]
-        gen_attn = attn[..., pfx_s:]
+        expanded_gen_mask = (
+            jnp.expand_dims(attn_mask, -2) if attn_mask.ndim == 3 else attn_mask
+        )
+        gen_masked_logits = jnp.where(expanded_gen_mask, gen_logits, K_MASK)
+
+        # Numerically exact 2-chunk online softmax without monolithic concatenation
+        m_gen = jnp.max(
+            gen_masked_logits.astype(jnp.float32), axis=-1, keepdims=True
+        )
+        m_pfx = jnp.max(pfx_logits.astype(jnp.float32), axis=-1, keepdims=True)
+        m = jnp.maximum(m_gen, m_pfx)
+
+        e_pfx = jnp.exp(pfx_logits.astype(jnp.float32) - m)
+        e_gen = jnp.exp(gen_masked_logits.astype(jnp.float32) - m)
+
+        l_total = jnp.sum(e_pfx, axis=-1, keepdims=True) + jnp.sum(
+            e_gen, axis=-1, keepdims=True
+        )
+        pfx_attn = (e_pfx / l_total).astype(key_proj.dtype)
+        gen_attn = (e_gen / l_total).astype(key_proj.dtype)
 
         if self.use_gqa:
-          b, t, kg, _ = pfx_attn.shape
+          b, t, kg, _ = pfx_logits.shape
           n_groups = kg // self.num_kv_heads
           pfx_attn_r = pfx_attn.reshape(
               (b, t, self.num_kv_heads, n_groups, pfx_s)
@@ -1598,6 +1597,13 @@ class Attention(nnx.Module):
               "BTNS,BSNH->BTNH", pfx_attn, prefix_v
           ) + jnp.einsum("BTNS,BSNH->BTNH", gen_attn, value_proj)
       else:
+        full_mask = (
+            jnp.expand_dims(attn_mask, -2) if attn_mask.ndim == 3 else attn_mask
+        )
+        attn = jnp.where(full_mask, gen_logits, K_MASK)
+        attn = jax.nn.softmax(attn.astype(jnp.float32), axis=-1).astype(
+            key_proj.dtype
+        )
         if self.use_gqa:
           b, t, kg, s = attn.shape
           n_groups = kg // self.num_kv_heads

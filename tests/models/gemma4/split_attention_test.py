@@ -66,42 +66,59 @@ def split_attention(
     pfx_s = pfx_logits.shape[-1]
     gen_s = gen_logits.shape[-1]
 
-  # Concatenate logits for joint softmax
-  logits = jnp.concatenate([pfx_logits, gen_logits], axis=-1)
-
-  # Build combined mask: prefix is always attended (True), gen uses gen_mask
   prefix_len = prefix_k.shape[1]
   if prefix_len > 0:
-    pfx_mask = jnp.ones((*gen_mask.shape[:-1], prefix_len), dtype=jnp.bool_)
-    full_mask = jnp.concatenate([pfx_mask, gen_mask], axis=-1)
-  else:
-    full_mask = gen_mask
-
-  # Apply mask + softmax
-  attn = jnp.where(jnp.expand_dims(full_mask, -2), logits, k_mask)
-  attn = jax.nn.softmax(attn.astype(jnp.float32), axis=-1).astype(query.dtype)
-
-  # Split attention weights and compute weighted sums
-  pfx_attn = attn[..., :pfx_s]
-  gen_attn = attn[..., pfx_s:]
-
-  if use_gqa:
-    assert num_kv_heads is not None
-    b, t, n, _ = pfx_attn.shape
-    n_groups = n // num_kv_heads
-
-    pfx_attn_r = pfx_attn.reshape((b, t, num_kv_heads, n_groups, pfx_s))
-    gen_attn_r = gen_attn.reshape((b, t, num_kv_heads, n_groups, gen_s))
-
-    encoded = jnp.einsum(
-        "BTKGS,BSKH->BTKGH", pfx_attn_r, prefix_v
-    ) + jnp.einsum("BTKGS,BSKH->BTKGH", gen_attn_r, gen_v)
-    b, t, k, g, h = encoded.shape
-    encoded = encoded.reshape((b, t, k * g, h))
-  else:
-    encoded = jnp.einsum("BTNS,BSNH->BTNH", pfx_attn, prefix_v) + jnp.einsum(
-        "BTNS,BSNH->BTNH", gen_attn, gen_v
+    expanded_gen_mask = (
+        jnp.expand_dims(gen_mask, -2) if gen_mask.ndim == 3 else gen_mask
     )
+    gen_masked_logits = jnp.where(expanded_gen_mask, gen_logits, k_mask)
+
+    m_gen = jnp.max(
+        gen_masked_logits.astype(jnp.float32), axis=-1, keepdims=True
+    )
+    m_pfx = jnp.max(pfx_logits.astype(jnp.float32), axis=-1, keepdims=True)
+    m = jnp.maximum(m_gen, m_pfx)
+
+    e_pfx = jnp.exp(pfx_logits.astype(jnp.float32) - m)
+    e_gen = jnp.exp(gen_masked_logits.astype(jnp.float32) - m)
+
+    l_total = jnp.sum(e_pfx, axis=-1, keepdims=True) + jnp.sum(
+        e_gen, axis=-1, keepdims=True
+    )
+    pfx_attn = (e_pfx / l_total).astype(query.dtype)
+    gen_attn = (e_gen / l_total).astype(query.dtype)
+
+    if use_gqa:
+      assert num_kv_heads is not None
+      b, t, n, _ = pfx_logits.shape
+      n_groups = n // num_kv_heads
+      pfx_attn_r = pfx_attn.reshape((b, t, num_kv_heads, n_groups, pfx_s))
+      gen_attn_r = gen_attn.reshape((b, t, num_kv_heads, n_groups, gen_s))
+      encoded = jnp.einsum(
+          "BTKGS,BSKH->BTKGH", pfx_attn_r, prefix_v
+      ) + jnp.einsum("BTKGS,BSKH->BTKGH", gen_attn_r, gen_v)
+      b, t, k, g, h = encoded.shape
+      encoded = encoded.reshape((b, t, k * g, h))
+    else:
+      encoded = jnp.einsum("BTNS,BSNH->BTNH", pfx_attn, prefix_v) + jnp.einsum(
+          "BTNS,BSNH->BTNH", gen_attn, gen_v
+      )
+  else:
+    expanded_gen_mask = (
+        jnp.expand_dims(gen_mask, -2) if gen_mask.ndim == 3 else gen_mask
+    )
+    attn = jnp.where(expanded_gen_mask, gen_logits, k_mask)
+    attn = jax.nn.softmax(attn.astype(jnp.float32), axis=-1).astype(query.dtype)
+    if use_gqa:
+      assert num_kv_heads is not None
+      b, t, n, s = attn.shape
+      n_groups = n // num_kv_heads
+      probs_reshaped = attn.reshape((b, t, num_kv_heads, n_groups, s))
+      encoded = jnp.einsum("BTKGS,BSKH->BTKGH", probs_reshaped, gen_v)
+      b, t, k, g, h = encoded.shape
+      encoded = encoded.reshape((b, t, k * g, h))
+    else:
+      encoded = jnp.einsum("BTNS,BSNH->BTNH", attn, gen_v)
 
   return encoded
 
