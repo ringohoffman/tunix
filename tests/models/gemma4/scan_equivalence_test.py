@@ -523,7 +523,7 @@ class ScanForwardEquivalenceTest(absltest.TestCase):
       scan_groups = scan_state["scan_groups"]
       assert isinstance(scan_groups, dict)
       sub_groups = scan_groups["sub_groups"]
-      assert isinstance(sub_groups, (list, tuple))
+      assert isinstance(sub_groups, (dict, list, tuple))
       sg = sub_groups[sg_idx]
       assert isinstance(sg, dict)
       scan_sub_grads = sg["layers"]
@@ -532,7 +532,7 @@ class ScanForwardEquivalenceTest(absltest.TestCase):
       for group_idx in range(num_groups):
         loop_layer_idx = group_idx * _PATTERN_LEN + sub_idx
         layers = loop_state["layers"]
-        assert isinstance(layers, (list, tuple))
+        assert isinstance(layers, (dict, list, tuple))
         loop_layer_grads = layers[loop_layer_idx]
         loop_layer_leaves = jax.tree.leaves(loop_layer_grads)
 
