@@ -127,6 +127,7 @@ def _copy_weights_loop_to_scan(
 ) -> None:
   """Copy weights from for-loop model to scan model."""
   from tunix.models.gemma4 import params as params_lib
+
   loop_dict = nnx.to_pure_dict(nnx.state(loop_model))
   stacked_dict = params_lib._stack_layers_for_scan(
       loop_dict,
@@ -193,11 +194,6 @@ def _assert_close(
   )
 
 
-# ---------------------------------------------------------------------------
-# Smoke tests
-# ---------------------------------------------------------------------------
-
-
 class ScanSmokeTest(absltest.TestCase):
   """Basic tests that the scan model compiles and runs."""
 
@@ -206,8 +202,8 @@ class ScanSmokeTest(absltest.TestCase):
     model = model_lib.Gemma4(config, rngs=nnx.Rngs(0))
     tokens, positions, attn_mask = _make_inputs(config)
 
-    logits, _ = model(tokens, positions=positions, attention_mask=attn_mask)
-    self.assertEqual(logits.shape, (2, 16, config.num_embed))
+    out = model(tokens, positions=positions, attention_mask=attn_mask)
+    self.assertEqual(out.logits.shape, (2, 16, config.num_embed))
 
   def test_gradient_flow(self):
     config = _make_config(use_scan_layers=True)
@@ -215,8 +211,8 @@ class ScanSmokeTest(absltest.TestCase):
     tokens, positions, attn_mask = _make_inputs(config)
 
     def loss_fn(model):
-      logits, _ = model(tokens, positions=positions, attention_mask=attn_mask)
-      return jnp.sum(logits)
+      out = model(tokens, positions=positions, attention_mask=attn_mask)
+      return jnp.sum(out.logits)
 
     loss, grads = nnx.value_and_grad(loss_fn)(model)
     self.assertTrue(jnp.isfinite(loss))
@@ -233,11 +229,6 @@ class ScanSmokeTest(absltest.TestCase):
       model_lib.Gemma4(config, rngs=nnx.Rngs(0))
 
 
-# ---------------------------------------------------------------------------
-# Forward (training) equivalence — exercises the nnx.scan path (cache=None)
-# ---------------------------------------------------------------------------
-
-
 class ScanForwardEquivalenceTest(absltest.TestCase):
   """Numerical equivalence tests between for-loop and scan (cache=None).
 
@@ -249,15 +240,14 @@ class ScanForwardEquivalenceTest(absltest.TestCase):
     loop_model, scan_model, config = _make_paired_models(num_layers=12)
     tokens, positions, attn_mask = _make_inputs(config)
 
-    loop_logits, _ = loop_model(
-        tokens, positions=positions, attention_mask=attn_mask
-    )
-    scan_logits, _ = scan_model(
-        tokens, positions=positions, attention_mask=attn_mask
-    )
+    loop_out = loop_model(tokens, positions=positions, attention_mask=attn_mask)
+    scan_out = scan_model(tokens, positions=positions, attention_mask=attn_mask)
 
     _assert_close(
-        self, loop_logits, scan_logits, msg="Forward pass (2 groups) diverged."
+        self,
+        loop_out.logits,
+        scan_out.logits,
+        msg="Forward pass (2 groups) diverged.",
     )
 
   def test_forward_equivalence_single_group(self):
@@ -265,15 +255,14 @@ class ScanForwardEquivalenceTest(absltest.TestCase):
     loop_model, scan_model, config = _make_paired_models(num_layers=6)
     tokens, positions, attn_mask = _make_inputs(config)
 
-    loop_logits, _ = loop_model(
-        tokens, positions=positions, attention_mask=attn_mask
-    )
-    scan_logits, _ = scan_model(
-        tokens, positions=positions, attention_mask=attn_mask
-    )
+    loop_out = loop_model(tokens, positions=positions, attention_mask=attn_mask)
+    scan_out = scan_model(tokens, positions=positions, attention_mask=attn_mask)
 
     _assert_close(
-        self, loop_logits, scan_logits, msg="Forward pass (1 group) diverged."
+        self,
+        loop_out.logits,
+        scan_out.logits,
+        msg="Forward pass (1 group) diverged.",
     )
 
   def test_forward_equivalence_three_groups(self):
@@ -281,15 +270,14 @@ class ScanForwardEquivalenceTest(absltest.TestCase):
     loop_model, scan_model, config = _make_paired_models(num_layers=18)
     tokens, positions, attn_mask = _make_inputs(config)
 
-    loop_logits, _ = loop_model(
-        tokens, positions=positions, attention_mask=attn_mask
-    )
-    scan_logits, _ = scan_model(
-        tokens, positions=positions, attention_mask=attn_mask
-    )
+    loop_out = loop_model(tokens, positions=positions, attention_mask=attn_mask)
+    scan_out = scan_model(tokens, positions=positions, attention_mask=attn_mask)
 
     _assert_close(
-        self, loop_logits, scan_logits, msg="Forward pass (3 groups) diverged."
+        self,
+        loop_out.logits,
+        scan_out.logits,
+        msg="Forward pass (3 groups) diverged.",
     )
 
   def test_forward_equivalence_batch_size_1(self):
@@ -297,15 +285,14 @@ class ScanForwardEquivalenceTest(absltest.TestCase):
     loop_model, scan_model, config = _make_paired_models(num_layers=12)
     tokens, positions, attn_mask = _make_inputs(config, batch_size=1)
 
-    loop_logits, _ = loop_model(
-        tokens, positions=positions, attention_mask=attn_mask
-    )
-    scan_logits, _ = scan_model(
-        tokens, positions=positions, attention_mask=attn_mask
-    )
+    loop_out = loop_model(tokens, positions=positions, attention_mask=attn_mask)
+    scan_out = scan_model(tokens, positions=positions, attention_mask=attn_mask)
 
     _assert_close(
-        self, loop_logits, scan_logits, msg="Forward pass (batch=1) diverged."
+        self,
+        loop_out.logits,
+        scan_out.logits,
+        msg="Forward pass (batch=1) diverged.",
     )
 
   def test_forward_equivalence_with_segment_ids(self):
@@ -317,13 +304,13 @@ class ScanForwardEquivalenceTest(absltest.TestCase):
         dtype=jnp.int32,
     )
 
-    loop_logits, _ = loop_model(
+    loop_out = loop_model(
         tokens,
         positions=positions,
         attention_mask=attn_mask,
         segment_ids=segment_ids,
     )
-    scan_logits, _ = scan_model(
+    scan_out = scan_model(
         tokens,
         positions=positions,
         attention_mask=attn_mask,
@@ -332,8 +319,8 @@ class ScanForwardEquivalenceTest(absltest.TestCase):
 
     _assert_close(
         self,
-        loop_logits,
-        scan_logits,
+        loop_out.logits,
+        scan_out.logits,
         msg="Forward pass with segment_ids diverged.",
     )
 
@@ -357,6 +344,8 @@ class ScanForwardEquivalenceTest(absltest.TestCase):
 
     self.assertIsNotNone(loop_out.hidden_states)
     self.assertIsNotNone(scan_out.hidden_states)
+    assert loop_out.hidden_states is not None
+    assert scan_out.hidden_states is not None
     _assert_close(
         self,
         loop_out.hidden_states,
@@ -432,17 +421,13 @@ class ScanForwardEquivalenceTest(absltest.TestCase):
     )
     tokens, positions, attn_mask = _make_inputs(config)
 
-    loop_logits, _ = loop_model(
-        tokens, positions=positions, attention_mask=attn_mask
-    )
-    scan_logits, _ = scan_model(
-        tokens, positions=positions, attention_mask=attn_mask
-    )
+    loop_out = loop_model(tokens, positions=positions, attention_mask=attn_mask)
+    scan_out = scan_model(tokens, positions=positions, attention_mask=attn_mask)
 
     _assert_close(
         self,
-        loop_logits,
-        scan_logits,
+        loop_out.logits,
+        scan_out.logits,
         msg="Forward pass with per_layer_inputs diverged.",
     )
 
@@ -453,17 +438,13 @@ class ScanForwardEquivalenceTest(absltest.TestCase):
     )
     tokens, positions, attn_mask = _make_inputs(config)
 
-    loop_logits, _ = loop_model(
-        tokens, positions=positions, attention_mask=attn_mask
-    )
-    scan_logits, _ = scan_model(
-        tokens, positions=positions, attention_mask=attn_mask
-    )
+    loop_out = loop_model(tokens, positions=positions, attention_mask=attn_mask)
+    scan_out = scan_model(tokens, positions=positions, attention_mask=attn_mask)
 
     _assert_close(
         self,
-        loop_logits,
-        scan_logits,
+        loop_out.logits,
+        scan_out.logits,
         msg="Shared KV training forward pass diverged.",
     )
 
@@ -483,17 +464,13 @@ class ScanForwardEquivalenceTest(absltest.TestCase):
         config, batch_size=2, seq_len=16
     )
 
-    loop_logits, _ = loop_model(
-        tokens, positions=positions, attention_mask=attn_mask
-    )
-    scan_logits, _ = scan_model(
-        tokens, positions=positions, attention_mask=attn_mask
-    )
+    loop_out = loop_model(tokens, positions=positions, attention_mask=attn_mask)
+    scan_out = scan_model(tokens, positions=positions, attention_mask=attn_mask)
 
     _assert_close(
         self,
-        loop_logits,
-        scan_logits,
+        loop_out.logits,
+        scan_out.logits,
         msg="Gemma4 E2B training forward pass diverged.",
     )
 
@@ -503,8 +480,8 @@ class ScanForwardEquivalenceTest(absltest.TestCase):
     tokens, positions, attn_mask = _make_inputs(config)
 
     def loss_fn(model):
-      logits, _ = model(tokens, positions=positions, attention_mask=attn_mask)
-      return jnp.sum(logits)
+      out = model(tokens, positions=positions, attention_mask=attn_mask)
+      return jnp.sum(out.logits)
 
     loop_loss, loop_grads = nnx.value_and_grad(loss_fn)(loop_model)
     scan_loss, scan_grads = nnx.value_and_grad(loss_fn)(scan_model)
@@ -518,12 +495,16 @@ class ScanForwardEquivalenceTest(absltest.TestCase):
     )
 
     # Compare gradients for shared params (embedder, final_norm).
-    loop_state = nnx.state(loop_grads)
-    scan_state = nnx.state(scan_grads)
+    loop_state = nnx.to_pure_dict(nnx.state(loop_grads))
+    scan_state = nnx.to_pure_dict(nnx.state(scan_grads))
+    assert isinstance(loop_state, dict)
+    assert isinstance(scan_state, dict)
 
     for key in ("embedder", "final_norm"):
-      loop_leaves = jax.tree.leaves(loop_state[key])
-      scan_leaves = jax.tree.leaves(scan_state[key])
+      loop_val = loop_state[key]
+      scan_val = scan_state[key]
+      loop_leaves = jax.tree.leaves(loop_val)
+      scan_leaves = jax.tree.leaves(scan_val)
       for i, (ll, sl) in enumerate(zip(loop_leaves, scan_leaves)):
         max_diff = float(jnp.max(jnp.abs(ll - sl)))
         self.assertLess(
@@ -539,12 +520,20 @@ class ScanForwardEquivalenceTest(absltest.TestCase):
       sg_idx, inner_idx = model_lib.sub_layer_idx_to_subgroup_coord(
           sub_idx, subgroup_specs
       )
-      scan_sub_grads = scan_state["scan_groups"]["sub_groups"][sg_idx]["layers"]
+      scan_groups = scan_state["scan_groups"]
+      assert isinstance(scan_groups, dict)
+      sub_groups = scan_groups["sub_groups"]
+      assert isinstance(sub_groups, (list, tuple))
+      sg = sub_groups[sg_idx]
+      assert isinstance(sg, dict)
+      scan_sub_grads = sg["layers"]
       scan_sub_leaves = jax.tree.leaves(scan_sub_grads)
 
       for group_idx in range(num_groups):
         loop_layer_idx = group_idx * _PATTERN_LEN + sub_idx
-        loop_layer_grads = loop_state["layers"][loop_layer_idx]
+        layers = loop_state["layers"]
+        assert isinstance(layers, (list, tuple))
+        loop_layer_grads = layers[loop_layer_idx]
         loop_layer_leaves = jax.tree.leaves(loop_layer_grads)
 
         for leaf_idx, (ll, sl) in enumerate(
@@ -575,8 +564,8 @@ class ScanForwardEquivalenceTest(absltest.TestCase):
     model = model_lib.Gemma4(config=config, rngs=nnx.Rngs(0))
 
     def loss_carry(m, tok, pos, mask):
-      out, _ = m(tok, positions=pos, attention_mask=mask)
-      return jnp.sum(out)
+      out = m(tok, positions=pos, attention_mask=mask)
+      return jnp.sum(out.logits)
 
     # Compile backward pass for current Carry implementation
     grad_carry = nnx.jit(nnx.grad(loss_carry, argnums=0))
@@ -585,6 +574,7 @@ class ScanForwardEquivalenceTest(absltest.TestCase):
     ).compile()
     mem_carry = compiled_carry.memory_analysis()
     hlo_carry = compiled_carry.as_text()
+    assert hlo_carry is not None
 
     # Define HEAD-style forward scan that returns origin KV via out_axes instead of Carry
     pattern_len = len(model.scan_pattern)
@@ -685,6 +675,7 @@ class ScanForwardEquivalenceTest(absltest.TestCase):
     ).compile()
     mem_head = compiled_head.memory_analysis()
     hlo_head = compiled_head.as_text()
+    assert hlo_head is not None
 
     # 1. Verify Carry generates fewer dynamic-update-slice and dynamic-slice instructions
     head_dus_count = hlo_head.count("dynamic-update-slice")
@@ -718,11 +709,6 @@ class ScanForwardEquivalenceTest(absltest.TestCase):
             f"than HEAD ({len(hlo_head)} chars)"
         ),
     )
-
-
-# ---------------------------------------------------------------------------
-# Generation (inference) equivalence — exercises the unrolled cache path
-# ---------------------------------------------------------------------------
 
 
 class ScanGenerationEquivalenceTest(absltest.TestCase):
@@ -1095,11 +1081,6 @@ class ScanGenerationEquivalenceTest(absltest.TestCase):
     )
 
 
-# ---------------------------------------------------------------------------
-# Sharding spec tests
-# ---------------------------------------------------------------------------
-
-
 class ScanShardingSpecTest(absltest.TestCase):
   """Tests that scan-axis sharding specs are correct.
 
@@ -1238,14 +1219,29 @@ class ScanShardingSpecTest(absltest.TestCase):
       shutil.rmtree(temp_dir)
 
     # Verify specs match checkpoint rank (scan axis stripped).
-    q_w_sharding = target["layer_0"]["attn"]["q_einsum"]["w"].sharding
+    assert isinstance(target, dict)
+    layer_0 = target["layer_0"]
+    assert isinstance(layer_0, dict)
+    attn = layer_0["attn"]
+    assert isinstance(attn, dict)
+    q_einsum = attn["q_einsum"]
+    assert isinstance(q_einsum, dict)
+    q_w = q_einsum["w"]
+    assert isinstance(q_w, jax.ShapeDtypeStruct)
+    q_w_sharding = q_w.sharding
+    assert isinstance(q_w_sharding, jax.sharding.NamedSharding)
     self.assertEqual(len(q_w_sharding.spec), 3)
     self.assertEqual(
         q_w_sharding.spec,
         jax.sharding.PartitionSpec("tp", "fsdp", None),
     )
 
-    kv_w_sharding = target["layer_0"]["attn"]["kv_einsum"]["w"].sharding
+    kv_einsum = attn["kv_einsum"]
+    assert isinstance(kv_einsum, dict)
+    kv_w = kv_einsum["w"]
+    assert isinstance(kv_w, jax.ShapeDtypeStruct)
+    kv_w_sharding = kv_w.sharding
+    assert isinstance(kv_w_sharding, jax.sharding.NamedSharding)
     self.assertEqual(len(kv_w_sharding.spec), 4)
     self.assertEqual(
         kv_w_sharding.spec,
@@ -1303,6 +1299,7 @@ class ScanShardingSpecTest(absltest.TestCase):
           batch_size=32, max_seq_len=64, dtype=jnp.float32
       )
       self.assertIsInstance(stacked_cache, tuple)
+      assert isinstance(stacked_cache, tuple)
       for sub_cache in stacked_cache:
         if sub_cache is None:
           continue
@@ -1374,10 +1371,7 @@ def _stack_cache(
       k_dtype = proto_cache["k"].dtype
       v_dtype = proto_cache["v"].dtype
       end_idx_dtype = proto_cache["end_index"].dtype
-    else:
-      proto_cache = None
 
-    if proto_cache is not None:
       ks = []
       vs = []
       end_indices = []
@@ -1413,27 +1407,35 @@ class CacheConversionTest(absltest.TestCase):
     dict_cache = model.init_cache(
         batch_size=2, max_seq_len=16, dtype=jnp.float32
     )
+    assert isinstance(dict_cache, dict)
 
     stacked = _stack_cache(
         dict_cache, config.num_layers, pattern_len=len(_PATTERN)
     )
     self.assertIsInstance(stacked, tuple)
+    assert isinstance(stacked, tuple)
     self.assertEqual(len(stacked), len(_PATTERN))
 
     unstacked = _unstack_cache(
         stacked, config.num_layers, pattern_len=len(_PATTERN)
     )
+    assert isinstance(unstacked, dict)
     self.assertEqual(set(dict_cache.keys()), set(unstacked.keys()))
 
     for key in dict_cache:
+      assert isinstance(unstacked[key], dict)
       for k in ("k", "v", "end_index"):
         np.testing.assert_allclose(dict_cache[key][k], unstacked[key][k])
 
   def test_gemma_output_pytree_node(self):
     """Test that GemmaOutput is a valid JAX PyTree node (flatten/unflatten/map)."""
     logits = jnp.ones((2, 3))
-    cache = {
-        "layer_0": {"k": jnp.zeros((2, 4, 16)), "v": jnp.zeros((2, 4, 16))}
+    cache: model_lib.Cache = {
+        "layer_0": {
+            "k": jnp.zeros((2, 4, 16)),
+            "v": jnp.zeros((2, 4, 16)),
+            "end_index": jnp.zeros((2,), dtype=jnp.int32),
+        }
     }
     out = model_lib.GemmaOutput(logits=logits, cache=cache)
 

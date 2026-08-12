@@ -451,8 +451,53 @@ def generate(
   if key is None:
     key = jax.random.key(0)
 
+  gen_cache_size = cache_size
   cache: KVCache = None
-  if raw_cache is not None:
+  if (
+      raw_cache is not None
+      and prefix_length > 0
+      and hasattr(model, "init_cache")
+  ):
+    # Decoupled prefix cache: init generation-only cache at B=batch and
+    # inject B=1 prefix KV as read-only prefix_k/prefix_v fields.
+    gen_cache_size = cache_size - prefix_length
+    model_dtype = (
+        model.config.dtype
+        if hasattr(model, "config") and hasattr(model.config, "dtype")
+        else jnp.bfloat16
+    )
+    cache = model.init_cache(batch_size, gen_cache_size, dtype=model_dtype)
+
+    def _inject_prefix(
+        gen_layer: LayerCache, pfx_layer: LayerCache
+    ) -> LayerCache:
+      gen_layer["prefix_k"] = pfx_layer["k"][:, :prefix_length, :, :]
+      gen_layer["prefix_v"] = pfx_layer["v"][:, :prefix_length, :, :]
+      return gen_layer
+
+    if isinstance(cache, (tuple, list)) and isinstance(
+        raw_cache, (tuple, list)
+    ):
+      # StackedCache: tuple of LayerCache dicts, shape [G, B, S, H, D]
+      def _inject_prefix_stacked(
+          gen_lc: LayerCache, pfx_lc: LayerCache
+      ) -> LayerCache:
+        gen_lc["prefix_k"] = pfx_lc["k"][:, :, :prefix_length, :, :]
+        gen_lc["prefix_v"] = pfx_lc["v"][:, :, :prefix_length, :, :]
+        return gen_lc
+
+      cache = tuple(
+          _inject_prefix_stacked(gen_lc, pfx_lc)
+          if gen_lc is not None and pfx_lc is not None
+          else gen_lc
+          for gen_lc, pfx_lc in zip(cache, raw_cache)
+      )
+    elif isinstance(cache, dict) and isinstance(raw_cache, dict):
+      # Dict cache: {"layer_0": LayerCache, ...}
+      for layer_name in cache:
+        if layer_name in raw_cache:
+          _inject_prefix(cache[layer_name], raw_cache[layer_name])
+  elif raw_cache is not None:
 
     is_stacked_cache = isinstance(raw_cache, (tuple, list))
 
@@ -527,16 +572,24 @@ def generate(
     suffix_positions = positions[:, prefix_length:prompt_len]
     suffix_mask = suffix_tokens != pad_id
 
-    attention_mask = jnp.zeros(
-        (batch_size, suffix_len, cache_size), dtype=jnp.bool_
-    )
-    attention_mask = attention_mask.at[:, :, :prefix_length].set(True)
     causal_suffix = jnp.tril(
         jnp.ones((suffix_len, suffix_len), dtype=jnp.bool_)
     )[None, ...]
-    attention_mask = attention_mask.at[:, :, prefix_length:prompt_len].set(
-        causal_suffix & suffix_mask[:, None, :]
+    attention_mask = jnp.zeros(
+        (batch_size, suffix_len, gen_cache_size), dtype=jnp.bool_
     )
+    if gen_cache_size == cache_size:
+      # Monolithic cache: prefix positions are in the cache
+      attention_mask = attention_mask.at[:, :, :prefix_length].set(True)
+      attention_mask = attention_mask.at[:, :, prefix_length:prompt_len].set(
+          causal_suffix & suffix_mask[:, None, :]
+      )
+    else:
+      # Decoupled cache: prefix handled by split attention, gen cache
+      # starts at position 0 for suffix tokens
+      attention_mask = attention_mask.at[:, :, :suffix_len].set(
+          causal_suffix & suffix_mask[:, None, :]
+      )
 
     out = model(
         suffix_tokens,
@@ -711,9 +764,20 @@ def generate(
     last_token = state.token_buffer[:, current_idx][:, None]
     step_position = state.positions[:, current_idx][:, None]
 
-    attn_mask = utils.compute_attention_masks(
-        current_idx, cache_size, state.token_buffer == pad_id
-    )
+    if gen_cache_size < cache_size:
+      # Decoupled prefix: mask covers gen cache only. Offset the pad
+      # mask by prefix_length so compute_attention_masks reads the
+      # gen-portion of the token buffer.
+      prefix_offset = cache_size - gen_cache_size
+      cache_relative_idx = current_idx - prefix_offset
+      gen_token_mask = state.token_buffer[:, prefix_offset:] == pad_id
+      attn_mask = utils.compute_attention_masks(
+          cache_relative_idx, gen_cache_size, gen_token_mask
+      )
+    else:
+      attn_mask = utils.compute_attention_masks(
+          current_idx, cache_size, state.token_buffer == pad_id
+      )
 
     loop_out = loop_model(
         last_token,

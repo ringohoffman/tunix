@@ -49,9 +49,9 @@ class ModelTest(absltest.TestCase):
         jnp.ones((tokens.shape[1], tokens.shape[1]), dtype=jnp.bool_)
     )[None, ...]
 
-    logits, _ = model(tokens, positions=positions, attention_mask=attn_mask)
-    self.assertEqual(logits.shape, (2, 32, config.num_embed))
-    print(f'{logits.shape=}')
+    out = model(tokens, positions=positions, attention_mask=attn_mask)
+    self.assertEqual(out.logits.shape, (2, 32, config.num_embed))
+    print(f'{out.logits.shape=}')
 
   def test_forward_pass_moe(self):
     config = model_lib.ModelConfig.gemma4_26b_a4b()
@@ -106,10 +106,14 @@ class ModelTest(absltest.TestCase):
         jnp.tril(jnp.ones((pfx_len, pfx_len), dtype=jnp.bool_))[None, ...],
         ((0, 0), (0, 0), (0, cache_len - pfx_len)),
     )
-    cache = model.init_cache(batch_size=1, max_seq_len=cache_len, dtype=jnp.float32)
+    cache = model.init_cache(
+        batch_size=1, max_seq_len=cache_len, dtype=jnp.float32
+    )
 
     # Should run cleanly via fallback without raising ValueError on q_block_size.
-    out = model(tokens, positions=positions, cache=cache, attention_mask=attn_mask)
+    out = model(
+        tokens, positions=positions, cache=cache, attention_mask=attn_mask
+    )
     self.assertEqual(out.logits.shape, (1, pfx_len, config.num_embed))
     self.assertIsNotNone(out.cache)
 
@@ -212,10 +216,8 @@ class ModelTest(absltest.TestCase):
     def decode_fn(params):
       def body_fn(step, _):
         transformer = nnx.merge(graphdef, params)
-        logits, _ = transformer(
-            tokens, positions=positions, attention_mask=attn_mask
-        )
-        return step + 1, logits
+        out = transformer(tokens, positions=positions, attention_mask=attn_mask)
+        return step + 1, out.logits
 
       return jax.lax.while_loop(
           lambda state: state[0] < 1,
@@ -225,6 +227,7 @@ class ModelTest(absltest.TestCase):
 
     compiled_decode = jax.jit(decode_fn)
     _, logits = compiled_decode(state)
+    assert isinstance(logits, jax.Array)
     self.assertEqual(logits.shape, (2, 32, config.num_embed))
 
   def test_forward_loop_shared_scan(self):
@@ -296,8 +299,12 @@ class ModelTest(absltest.TestCase):
             jax.random.PRNGKey(0), (batch_size, seq_len), 0, config.num_embed
         )
         full_positions = jnp.tile(jnp.arange(seq_len)[None, :], (batch_size, 1))
-        full_mask = jnp.tril(jnp.ones((seq_len, seq_len), dtype=jnp.bool_))[None, ...]
-        full_out = model(full_tokens, positions=full_positions, attention_mask=full_mask)
+        full_mask = jnp.tril(jnp.ones((seq_len, seq_len), dtype=jnp.bool_))[
+            None, ...
+        ]
+        full_out = model(
+            full_tokens, positions=full_positions, attention_mask=full_mask
+        )
         expected_last_logits = full_out.logits[:, -1, :]
 
         # 2. Prefill on seq_len - 1 tokens
@@ -305,11 +312,20 @@ class ModelTest(absltest.TestCase):
         pfill_positions = full_positions[:, :-1]
         pfill_len = seq_len - 1
         pfill_mask = jnp.pad(
-            jnp.tril(jnp.ones((pfill_len, pfill_len), dtype=jnp.bool_))[None, ...],
+            jnp.tril(jnp.ones((pfill_len, pfill_len), dtype=jnp.bool_))[
+                None, ...
+            ],
             ((0, 0), (0, 0), (0, cache_size - pfill_len)),
         )
-        init_cache = model.init_cache(batch_size=batch_size, max_seq_len=cache_size, dtype=jnp.float32)
-        pfill_out = model(pfill_tokens, positions=pfill_positions, cache=init_cache, attention_mask=pfill_mask)
+        init_cache = model.init_cache(
+            batch_size=batch_size, max_seq_len=cache_size, dtype=jnp.float32
+        )
+        pfill_out = model(
+            pfill_tokens,
+            positions=pfill_positions,
+            cache=init_cache,
+            attention_mask=pfill_mask,
+        )
 
         # 3. Incremental single-token decode for token at index seq_len - 1
         last_tok = full_tokens[:, -1:]
@@ -318,14 +334,24 @@ class ModelTest(absltest.TestCase):
         dec_mask = jnp.zeros((batch_size, 1, cache_size), dtype=jnp.bool_)
         dec_mask = dec_mask.at[:, :, :seq_len].set(True)
 
-        dec_out = model(last_tok, positions=last_pos, cache=pfill_out.cache, attention_mask=dec_mask)
+        dec_out = model(
+            last_tok,
+            positions=last_pos,
+            cache=pfill_out.cache,
+            attention_mask=dec_mask,
+        )
         actual_last_logits = dec_out.logits[:, 0, :]
 
-        max_diff = float(jnp.max(jnp.abs(expected_last_logits - actual_last_logits)))
+        max_diff = float(
+            jnp.max(jnp.abs(expected_last_logits - actual_last_logits))
+        )
         self.assertLess(
             max_diff,
             1e-4,
-            msg=f'Cached decode vs full forward mismatch (use_scan={use_scan}): {max_diff}',
+            msg=(
+                f'Cached decode vs full forward mismatch (use_scan={use_scan}):'
+                f' {max_diff}'
+            ),
         )
 
   def test_cached_eager_multistep_decode_with_shared_layers(self):
@@ -352,28 +378,40 @@ class ModelTest(absltest.TestCase):
             model_lib.AttentionType.LOCAL_SLIDING,
             model_lib.AttentionType.LOCAL_SLIDING,
             model_lib.AttentionType.GLOBAL,
-        ) * 2,
+        )
+        * 2,
     )
     model = model_lib.Gemma4(config, rngs=nnx.Rngs(123))
     batch_size = 1
     pfill_len = 4
     cache_size = 16
 
-    init_cache = model.init_cache(batch_size=batch_size, max_seq_len=cache_size, dtype=jnp.float32)
+    init_cache = model.init_cache(
+        batch_size=batch_size, max_seq_len=cache_size, dtype=jnp.float32
+    )
     pfill_tok = jnp.array([[10, 20, 30, 40]], dtype=jnp.int32)
     pfill_pos = jnp.arange(pfill_len)[None, :]
     pfill_mask = jnp.pad(
         jnp.tril(jnp.ones((pfill_len, pfill_len), dtype=jnp.bool_))[None, ...],
         ((0, 0), (0, 0), (0, cache_size - pfill_len)),
     )
-    pfill_out = model(pfill_tok, positions=pfill_pos, cache=init_cache, attention_mask=pfill_mask)
+    pfill_out = model(
+        pfill_tok,
+        positions=pfill_pos,
+        cache=init_cache,
+        attention_mask=pfill_mask,
+    )
     cache = pfill_out.cache
 
     for step in range(4):
       curr_pos = pfill_len + step
       tok = jnp.array([[50 + step]], dtype=jnp.int32)
       pos = jnp.array([[curr_pos]], dtype=jnp.int32)
-      mask = jnp.zeros((batch_size, 1, cache_size), dtype=jnp.bool_).at[:, :, :curr_pos + 1].set(True)
+      mask = (
+          jnp.zeros((batch_size, 1, cache_size), dtype=jnp.bool_)
+          .at[:, :, : curr_pos + 1]
+          .set(True)
+      )
       out = model(tok, positions=pos, cache=cache, attention_mask=mask)
       cache = out.cache
       self.assertEqual(out.logits.shape, (batch_size, 1, config.num_embed))
@@ -467,6 +505,7 @@ class SkipKVProjectionTest(absltest.TestCase):
 
     # Non-shared layer caches must also be identical.
     if isinstance(out_b.cache, dict):
+      assert isinstance(out_o.cache, dict)
       for key in out_b.cache:
         for field in ('k', 'v'):
           cache_diff = float(

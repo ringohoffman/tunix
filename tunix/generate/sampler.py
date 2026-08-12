@@ -19,6 +19,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping, Sequence
 import dataclasses
 import inspect
+import typing
 from typing import Any, TypeGuard, TypeVar
 import warnings
 
@@ -140,6 +141,12 @@ class _SamplingState:
 
   prefill_start_idx: int = flax.struct.field(pytree_node=False, default=0)
   """Starting token index for the prefill step (0 for full prefill, P for prefix-cached prefill)."""
+
+  gen_cache_size: int = flax.struct.field(pytree_node=False, default=0)
+  """Generation-only cache size (cache_size - prefix_length). 0 means use full cache_size."""
+
+  prefix_offset: int = flax.struct.field(pytree_node=False, default=0)
+  """Prefix length offset for computing cache-relative indices. 0 means no prefix."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -502,6 +509,65 @@ class Sampler(base_sampler.BaseSampler):
 
     return jax.tree.map(_broadcast_leaf, prefix_cache.cache)
 
+  def _decoupled_prefix_cache(
+      self,
+      prefix_cache: functional.PrefixCache,
+      batch_size: int,
+      prefix_length: int,
+  ) -> functional.KVCache:
+    """Creates a gen-only cache with injected B=1 prefix KV for split attention.
+
+    Instead of broadcasting the full B=1 cache to B=batch_size, this creates
+    a smaller generation-only cache (cache_size - prefix_length) and stores
+    the B=1 prefix KV separately as prefix_k/prefix_v fields. Split attention
+    handles the broadcast implicitly via einsum.
+
+    Args:
+      prefix_cache: B=1 prefilled prefix cache.
+      batch_size: Target batch size for generation.
+      prefix_length: Number of prefix tokens (unpadded).
+
+    Returns:
+      Generation-only cache with prefix KV injected.
+    """
+    gen_cache_size = self.cache_config.cache_size - prefix_length
+    init_cache_fn = getattr(self.transformer, 'init_cache', None)
+    if init_cache_fn is None:
+      raise AttributeError('Transformer does not have init_cache method.')
+    cache = init_cache_fn(batch_size, gen_cache_size, self.dtype)
+    raw_cache = prefix_cache.cache
+
+    def _inject_prefix(
+        gen_layer: LayerCache, pfx_layer: LayerCache
+    ) -> LayerCache:
+      gen_layer['prefix_k'] = pfx_layer['k'][:, :prefix_length, :, :]
+      gen_layer['prefix_v'] = pfx_layer['v'][:, :prefix_length, :, :]
+      return gen_layer
+
+    def _inject_prefix_stacked(
+        gen_layer: LayerCache, pfx_layer: LayerCache
+    ) -> LayerCache:
+      # Stacked cache shape: [num_groups, B, cache_size, H, D]
+      gen_layer['prefix_k'] = pfx_layer['k'][:, :, :prefix_length, :, :]
+      gen_layer['prefix_v'] = pfx_layer['v'][:, :, :prefix_length, :, :]
+      return gen_layer
+
+    if isinstance(cache, (tuple, list)) and isinstance(
+        raw_cache, (tuple, list)
+    ):
+      cache = tuple(
+          _inject_prefix_stacked(gen_lc, pfx_lc)
+          if gen_lc is not None and pfx_lc is not None
+          else gen_lc
+          for gen_lc, pfx_lc in zip(cache, raw_cache)
+      )
+    elif isinstance(cache, dict) and isinstance(raw_cache, dict):
+      for layer_name in cache:
+        if layer_name in raw_cache:
+          _inject_prefix(cache[layer_name], raw_cache[layer_name])
+
+    return typing.cast(functional.KVCache, cache)
+
   def compile_constraint(
       self,
       constraint: constrained.Constraint,
@@ -696,10 +762,19 @@ class Sampler(base_sampler.BaseSampler):
           token_buffer = token_buffer.at[:, :P].set(pfx)
         token_buffer = token_buffer.at[:, P:num_input_tokens].set(all_input_ids)
       prefill_start_idx = P
-      cache = self._broadcast_prefix_cache(prefix_cache, batch_size)
+      if hasattr(self.transformer, 'init_cache'):
+        cache = self._decoupled_prefix_cache(prefix_cache, batch_size, P)
+        gen_cache_size = self.cache_config.cache_size - P
+        prefix_offset = P
+      else:
+        cache = self._broadcast_prefix_cache(prefix_cache, batch_size)
+        gen_cache_size = 0
+        prefix_offset = 0
     else:
       num_input_tokens = all_input_ids.shape[1]
       prefill_start_idx = 0
+      gen_cache_size = self.cache_config.cache_size
+      prefix_offset = 0
       token_buffer = jnp.full(
           (batch_size, total_sampling_steps),
           self.tokenizer.pad_id(),
@@ -829,6 +904,8 @@ class Sampler(base_sampler.BaseSampler):
         token_bounds_state=token_bounds_state,
         logit_gather_ids=logit_gather_ids,
         prefill_start_idx=prefill_start_idx,
+        gen_cache_size=gen_cache_size,
+        prefix_offset=prefix_offset,
     )
 
   def tokenize(self, input_string: str) -> np.ndarray | list[int]:
@@ -973,6 +1050,9 @@ class Sampler(base_sampler.BaseSampler):
         unique_state=unique_state,
         token_bounds_state=token_bounds_state,
         logit_gather_ids=sampler_state.logit_gather_ids,
+        prefill_start_idx=sampler_state.prefill_start_idx,
+        gen_cache_size=sampler_state.gen_cache_size,
+        prefix_offset=sampler_state.prefix_offset,
     )
 
   def _prefill_fn(
@@ -999,13 +1079,24 @@ class Sampler(base_sampler.BaseSampler):
           (batch_size, S),
       )
       input_mask = tokens != self.tokenizer.pad_id()
-      attention_mask = jnp.zeros(
-          (batch_size, S, self.cache_config.cache_size), dtype=jnp.bool_
-      )
-      attention_mask = attention_mask.at[:, :, :P].set(True)
-      causal_suffix = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))[None, ...]
-      valid_causal = causal_suffix & input_mask[:, None, :]
-      attention_mask = attention_mask.at[:, :, P : P + S].set(valid_causal)
+      if (
+          sampler_state.gen_cache_size > 0
+          and sampler_state.gen_cache_size < self.cache_config.cache_size
+      ):
+        attention_mask = jnp.zeros(
+            (batch_size, S, sampler_state.gen_cache_size), dtype=jnp.bool_
+        )
+        causal_suffix = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))[None, ...]
+        valid_causal = causal_suffix & input_mask[:, None, :]
+        attention_mask = attention_mask.at[:, :, :S].set(valid_causal)
+      else:
+        attention_mask = jnp.zeros(
+            (batch_size, S, self.cache_config.cache_size), dtype=jnp.bool_
+        )
+        attention_mask = attention_mask.at[:, :, :P].set(True)
+        causal_suffix = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))[None, ...]
+        valid_causal = causal_suffix & input_mask[:, None, :]
+        attention_mask = attention_mask.at[:, :, P : P + S].set(valid_causal)
     else:
       tokens = jax.lax.dynamic_slice(
           sampler_state.token_buffer,
@@ -1118,6 +1209,8 @@ class Sampler(base_sampler.BaseSampler):
         token_bounds_state=sampler_state.token_bounds_state,
         logit_gather_ids=sampler_state.logit_gather_ids,
         prefill_start_idx=sampler_state.prefill_start_idx,
+        gen_cache_size=sampler_state.gen_cache_size,
+        prefix_offset=sampler_state.prefix_offset,
     )
     updated_sampler_state = self._sample(
         logits=logits,
@@ -1187,9 +1280,23 @@ class Sampler(base_sampler.BaseSampler):
     )
 
     input_mask = sampler_state.token_buffer == self.tokenizer.pad_id()
-    attention_mask = utils.compute_attention_masks(
-        decoding_step, self.cache_config.cache_size, input_mask
-    )
+    if (
+        sampler_state.gen_cache_size > 0
+        and sampler_state.gen_cache_size < self.cache_config.cache_size
+    ):
+      prefix_offset = sampler_state.prefix_offset
+      cache_relative_step = decoding_step - prefix_offset
+      gen_token_mask = (
+          sampler_state.token_buffer[:, prefix_offset:]
+          == self.tokenizer.pad_id()
+      )
+      attention_mask = utils.compute_attention_masks(
+          cache_relative_step, sampler_state.gen_cache_size, gen_token_mask
+      )
+    else:
+      attention_mask = utils.compute_attention_masks(
+          decoding_step, self.cache_config.cache_size, input_mask
+      )
 
     logits, cache = transformer(
         last_token,

@@ -83,6 +83,10 @@ class LayerKV(TypedDict):
   """Key projection tensor of shape (batch_size, seq_len, num_kv_heads, head_dim)."""
   v: jaxtyping.Array
   """Value projection tensor of shape (batch_size, seq_len, num_kv_heads, head_dim)."""
+  prefix_k: NotRequired[jaxtyping.Array]
+  """Optional read-only prefix key cache."""
+  prefix_v: NotRequired[jaxtyping.Array]
+  """Optional read-only prefix value cache."""
 
 
 class LayerCache(TypedDict):
@@ -94,6 +98,10 @@ class LayerCache(TypedDict):
   """Pre-allocated value cache array of shape (batch_size, max_seq_len, num_kv_heads, head_dim)."""
   end_index: jaxtyping.Array
   """Current sequence length or insertion index array of shape (batch_size,)."""
+  prefix_k: NotRequired[jaxtyping.Array]
+  """Read-only prefix key cache, shape (1, prefix_len, num_kv_heads, head_dim) or (B, 0, ...)."""
+  prefix_v: NotRequired[jaxtyping.Array]
+  """Read-only prefix value cache, shape (1, prefix_len, num_kv_heads, head_dim) or (B, 0, ...)."""
 
 
 class OriginKV(TypedDict):
@@ -108,9 +116,12 @@ class OriginKV(TypedDict):
   """LayerKV projections from the local origin layer (shape (batch_size, seq_len, num_kv_heads, head_dim))."""
 
 
+LayerKVPair = tuple[jaxtyping.Array, jaxtyping.Array]
+"""Key and value tensor pair of shape (batch_size, seq_len, num_kv_heads, head_dim)."""
+
 Cache = dict[str, LayerCache]
 StackedCache = tuple[LayerCache | None, ...]
-TransientKVs = dict[str, tuple[jaxtyping.Array, jaxtyping.Array]]
+TransientKVs = dict[str, LayerKVPair]
 
 
 class GemmaInput(TypedDict):
@@ -979,6 +990,66 @@ class Attention(nnx.Module):
         param_dtype=config.param_dtype,
     )
 
+  @overload
+  def block(
+      self,
+      x: jaxtyping.Array,
+      segment_pos: jaxtyping.Array,
+      cache: LayerCache,
+      attn_mask: jaxtyping.Array | None,
+      kv_shared_cache: LayerKV | LayerCache | None = None,
+      kv_override: LayerKV | LayerCache | None = None,
+      use_kv_override: jaxtyping.Array | bool | None = None,
+      skip_kv_projection: bool = False,
+      segment_ids: jaxtyping.Array | splash.SegmentIds | None = None,
+  ) -> tuple[LayerCache, jaxtyping.Array, LayerKVPair]:
+    ...
+
+  @overload
+  def block(
+      self,
+      x: jaxtyping.Array,
+      segment_pos: jaxtyping.Array,
+      cache: LayerKV,
+      attn_mask: jaxtyping.Array | None,
+      kv_shared_cache: LayerKV | LayerCache | None = None,
+      kv_override: LayerKV | LayerCache | None = None,
+      use_kv_override: jaxtyping.Array | bool | None = None,
+      skip_kv_projection: bool = False,
+      segment_ids: jaxtyping.Array | splash.SegmentIds | None = None,
+  ) -> tuple[LayerKV, jaxtyping.Array, LayerKVPair]:
+    ...
+
+  @overload
+  def block(
+      self,
+      x: jaxtyping.Array,
+      segment_pos: jaxtyping.Array,
+      cache: None,
+      attn_mask: jaxtyping.Array | None,
+      kv_shared_cache: LayerKV | LayerCache | None = None,
+      kv_override: LayerKV | LayerCache | None = None,
+      use_kv_override: jaxtyping.Array | bool | None = None,
+      skip_kv_projection: bool = False,
+      segment_ids: jaxtyping.Array | splash.SegmentIds | None = None,
+  ) -> tuple[None, jaxtyping.Array, LayerKVPair]:
+    ...
+
+  @overload
+  def block(
+      self,
+      x: jaxtyping.Array,
+      segment_pos: jaxtyping.Array,
+      cache: LayerKV | LayerCache | None,
+      attn_mask: jaxtyping.Array | None,
+      kv_shared_cache: LayerKV | LayerCache | None = None,
+      kv_override: LayerKV | LayerCache | None = None,
+      use_kv_override: jaxtyping.Array | bool | None = None,
+      skip_kv_projection: bool = False,
+      segment_ids: jaxtyping.Array | splash.SegmentIds | None = None,
+  ) -> tuple[LayerKV | LayerCache | None, jaxtyping.Array, LayerKVPair]:
+    ...
+
   def block(
       self,
       x: jaxtyping.Array,
@@ -993,7 +1064,7 @@ class Attention(nnx.Module):
   ) -> tuple[
       LayerKV | LayerCache | None,
       jaxtyping.Array,
-      tuple[jaxtyping.Array, jaxtyping.Array],
+      LayerKVPair,
   ]:
     x = checkpoint_name(x, "residual_attn")
     x = x.astype(self.config.dtype)
@@ -1120,6 +1191,11 @@ class Attention(nnx.Module):
           "k": key_proj,
       }
 
+    # Propagate read-only prefix cache fields unchanged.
+    if cache is not None and "prefix_k" in cache and "prefix_v" in cache:
+      new_cache["prefix_k"] = cache["prefix_k"]
+      new_cache["prefix_v"] = cache["prefix_v"]
+
     # KV override for scan-based cache sharing.  When use_kv_override is
     # True (shared layer), swap K/V with the origin's cache for attention
     # and suppress the cache write so the shared layer's output cache
@@ -1155,6 +1231,9 @@ class Attention(nnx.Module):
                 new_cache["end_index"],
             ),
         }
+        if "prefix_k" in cache and "prefix_v" in cache:
+          new_cache["prefix_k"] = cache["prefix_k"]
+          new_cache["prefix_v"] = cache["prefix_v"]
 
     if (
         self.config.use_flash_attention
@@ -1339,19 +1418,51 @@ class Attention(nnx.Module):
       value_proj = value_proj.transpose(0, 2, 1, 3)
 
     else:
+      # --- Prefix KV extraction (read-only, B=1 or empty) ---
+      active_cache = (
+          cache
+          if cache is not None
+          else (kv_override if kv_override is not None else kv_shared_cache)
+      )
+      prefix_k = (
+          active_cache.get("prefix_k") if active_cache is not None else None
+      )
+      prefix_v = (
+          active_cache.get("prefix_v") if active_cache is not None else None
+      )
+      has_prefix = (
+          prefix_k is not None
+          and prefix_v is not None
+          and prefix_k.shape[1] > 0
+      )
+
       if self.use_gqa:
         b, t, kg, h = query_proj.shape
         n_groups = kg // self.num_kv_heads
         query_reshaped = query_proj.reshape(
             (b, t, self.num_kv_heads, n_groups, h)
         )
-        logits = jnp.einsum("BTKGH,BSKH->BTKGS", query_reshaped, key_proj)
-        b, t, k, g, s = logits.shape
-        logits = logits.reshape((b, t, k * g, s))
+        gen_logits = jnp.einsum("BTKGH,BSKH->BTKGS", query_reshaped, key_proj)
+        gen_s = gen_logits.shape[-1]
+        gen_logits = gen_logits.reshape((b, t, kg, gen_s))
+        if has_prefix:
+          assert prefix_k is not None
+          pfx_logits = jnp.einsum("BTKGH,BSKH->BTKGS", query_reshaped, prefix_k)
+          pfx_s = pfx_logits.shape[-1]
+          pfx_logits = pfx_logits.reshape((b, t, kg, pfx_s))
+          logits = jnp.concatenate([pfx_logits, gen_logits], axis=-1)
+        else:
+          logits = gen_logits
       else:
-        logits = jnp.einsum("BTNH,BSNH->BTNS", query_proj, key_proj)
+        gen_logits = jnp.einsum("BTNH,BSNH->BTNS", query_proj, key_proj)
+        gen_s = gen_logits.shape[-1]
+        if has_prefix:
+          assert prefix_k is not None
+          pfx_logits = jnp.einsum("BTNH,BSNH->BTNS", query_proj, prefix_k)
+          logits = jnp.concatenate([pfx_logits, gen_logits], axis=-1)
+        else:
+          logits = gen_logits
 
-      active_cache = cache if cache is not None else kv_shared_cache
       assert attn_mask is not None, "attn_mask required for non-flash path"
       if attn_mask is not None:
         if active_cache is None or seq_len > active_cache["v"].shape[1]:
@@ -1407,7 +1518,35 @@ class Attention(nnx.Module):
               sliding_window_size=self.config.sliding_window_size,
           )
           attn_mask = sliding_mask * attn_mask
-        else:  # for prefill
+        elif self.config.use_sliding_window_kv_cache and (
+            (new_cache is not None and "end_index" in new_cache)
+            or (kv_shared_cache is not None and "end_index" in kv_shared_cache)
+        ):
+          # for suffix prefill with warm sliding window cache
+          end_idx_arr = (
+              new_cache["end_index"]
+              if (new_cache is not None and "end_index" in new_cache)
+              else (
+                  kv_shared_cache["end_index"]
+                  if kv_shared_cache is not None
+                  and "end_index" in kv_shared_cache
+                  else None
+              )
+          )
+          assert end_idx_arr is not None
+          cache_len = key_proj.shape[1]
+          # start_idx is before this prefill step (since end_index was already
+          # incremented by seq_len)
+          start_idx = end_idx_arr[0] - seq_len
+          end_idx = (start_idx + jnp.arange(1, seq_len + 1))[None, :, None]
+          p = jnp.arange(cache_len)[None, None, :]
+          logical_indices = end_idx - ((end_idx - p) % cache_len)
+          valid_physical = logical_indices >= 0
+          logical_indices = jnp.maximum(0, logical_indices)
+          attn_mask = jnp.take_along_axis(attn_mask, logical_indices, axis=-1)
+          attn_mask = attn_mask * valid_physical
+        else:
+          # for cold prefill
           assert self.config.sliding_window_size is not None
           all_ones = jnp.ones_like(attn_mask)
           sliding_mask = jnp.triu(
@@ -1415,20 +1554,59 @@ class Attention(nnx.Module):
           ) * jnp.tril(all_ones, self.config.sliding_window_size - 1)
           attn_mask = sliding_mask * attn_mask
 
-      attn = jnp.where((jnp.expand_dims(attn_mask, -2)), logits, K_MASK)
+      # --- Build combined mask: prefix (all-True) + gen mask ---
+      if has_prefix:
+        assert prefix_k is not None and prefix_v is not None
+        prefix_len = prefix_k.shape[1]
+        pfx_mask = jnp.ones(
+            (*attn_mask.shape[:-1], prefix_len), dtype=jnp.bool_
+        )
+        full_mask = jnp.concatenate([pfx_mask, attn_mask], axis=-1)
+      else:
+        full_mask = attn_mask
+
+      if full_mask.ndim == 3:
+        full_mask = jnp.expand_dims(full_mask, -2)
+      attn = jnp.where(full_mask, logits, K_MASK)
       attn = jax.nn.softmax(attn.astype(jnp.float32), axis=-1).astype(
           key_proj.dtype
       )
 
-      if self.use_gqa:
-        b, t, kg, s = attn.shape
-        n_groups = kg // self.num_kv_heads
-        probs_reshaped = attn.reshape((b, t, self.num_kv_heads, n_groups, s))
-        encoded = jnp.einsum("BTKGS,BSKH->BTKGH", probs_reshaped, value_proj)
-        b, t, k, g, h = encoded.shape
-        encoded = encoded.reshape((b, t, k * g, h))
+      # --- Split attention weights and compute value-weighted sums ---
+      if has_prefix:
+        assert prefix_k is not None and prefix_v is not None
+        pfx_s = prefix_k.shape[1]
+        pfx_attn = attn[..., :pfx_s]
+        gen_attn = attn[..., pfx_s:]
+
+        if self.use_gqa:
+          b, t, kg, _ = pfx_attn.shape
+          n_groups = kg // self.num_kv_heads
+          pfx_attn_r = pfx_attn.reshape(
+              (b, t, self.num_kv_heads, n_groups, pfx_s)
+          )
+          gen_attn_r = gen_attn.reshape(
+              (b, t, self.num_kv_heads, n_groups, gen_s)
+          )
+          encoded = jnp.einsum(
+              "BTKGS,BSKH->BTKGH", pfx_attn_r, prefix_v
+          ) + jnp.einsum("BTKGS,BSKH->BTKGH", gen_attn_r, value_proj)
+          b, t, k, g, h = encoded.shape
+          encoded = encoded.reshape((b, t, k * g, h))
+        else:
+          encoded = jnp.einsum(
+              "BTNS,BSNH->BTNH", pfx_attn, prefix_v
+          ) + jnp.einsum("BTNS,BSNH->BTNH", gen_attn, value_proj)
       else:
-        encoded = jnp.einsum("BTNS,BSNH->BTNH", attn, value_proj)
+        if self.use_gqa:
+          b, t, kg, s = attn.shape
+          n_groups = kg // self.num_kv_heads
+          probs_reshaped = attn.reshape((b, t, self.num_kv_heads, n_groups, s))
+          encoded = jnp.einsum("BTKGS,BSKH->BTKGH", probs_reshaped, value_proj)
+          b, t, k, g, h = encoded.shape
+          encoded = encoded.reshape((b, t, k * g, h))
+        else:
+          encoded = jnp.einsum("BTNS,BSNH->BTNH", attn, value_proj)
 
     attn_output = self.attn_vec_einsum(encoded)
     attn_output = sharding_utils.shard(
@@ -1439,6 +1617,66 @@ class Attention(nnx.Module):
   @property
   def use_gqa(self) -> bool:
     return self.num_kv_heads != self.config.num_heads and self.num_kv_heads > 1
+
+  @overload
+  def __call__(
+      self,
+      x: jaxtyping.Array,
+      segment_pos: jaxtyping.Array,
+      cache: LayerCache,
+      attn_mask: jaxtyping.Array | None,
+      kv_shared_cache: LayerKV | LayerCache | None = None,
+      kv_override: LayerKV | LayerCache | None = None,
+      use_kv_override: jaxtyping.Array | bool | None = None,
+      skip_kv_projection: bool = False,
+      segment_ids: jaxtyping.Array | splash.SegmentIds | None = None,
+  ) -> tuple[LayerCache, jaxtyping.Array, LayerKVPair]:
+    ...
+
+  @overload
+  def __call__(
+      self,
+      x: jaxtyping.Array,
+      segment_pos: jaxtyping.Array,
+      cache: LayerKV,
+      attn_mask: jaxtyping.Array | None,
+      kv_shared_cache: LayerKV | LayerCache | None = None,
+      kv_override: LayerKV | LayerCache | None = None,
+      use_kv_override: jaxtyping.Array | bool | None = None,
+      skip_kv_projection: bool = False,
+      segment_ids: jaxtyping.Array | splash.SegmentIds | None = None,
+  ) -> tuple[LayerKV, jaxtyping.Array, LayerKVPair]:
+    ...
+
+  @overload
+  def __call__(
+      self,
+      x: jaxtyping.Array,
+      segment_pos: jaxtyping.Array,
+      cache: None,
+      attn_mask: jaxtyping.Array | None,
+      kv_shared_cache: LayerKV | LayerCache | None = None,
+      kv_override: LayerKV | LayerCache | None = None,
+      use_kv_override: jaxtyping.Array | bool | None = None,
+      skip_kv_projection: bool = False,
+      segment_ids: jaxtyping.Array | splash.SegmentIds | None = None,
+  ) -> tuple[None, jaxtyping.Array, LayerKVPair]:
+    ...
+
+  @overload
+  def __call__(
+      self,
+      x: jaxtyping.Array,
+      segment_pos: jaxtyping.Array,
+      cache: LayerKV | LayerCache | None,
+      attn_mask: jaxtyping.Array | None,
+      kv_shared_cache: LayerKV | LayerCache | None = None,
+      kv_override: LayerKV | LayerCache | None = None,
+      use_kv_override: jaxtyping.Array | bool | None = None,
+      skip_kv_projection: bool = False,
+      segment_ids: jaxtyping.Array | splash.SegmentIds | None = None,
+  ) -> tuple[LayerKV | LayerCache | None, jaxtyping.Array, LayerKVPair]:
+    ...
 
   def __call__(
       self,
@@ -1454,7 +1692,7 @@ class Attention(nnx.Module):
   ) -> tuple[
       LayerKV | LayerCache | None,
       jaxtyping.Array,
-      tuple[jaxtyping.Array, jaxtyping.Array],
+      LayerKVPair,
   ]:
     remat_config = self.config.remat_config
     if (
@@ -1516,7 +1754,17 @@ class Attention(nnx.Module):
         jnp.zeros((batch_size,), jnp.int32),
         self.config.shd_config.act_btnh[:1],
     )
-    return {"k": k, "v": v, "end_index": end_index}
+    return {
+        "k": k,
+        "v": v,
+        "end_index": end_index,
+        "prefix_k": jnp.zeros(
+            (batch_size, 0, self.num_kv_heads, self.head_dim), dtype
+        ),
+        "prefix_v": jnp.zeros(
+            (batch_size, 0, self.num_kv_heads, self.head_dim), dtype
+        ),
+    }
 
 
 class FeedForward(nnx.Module):
@@ -1687,6 +1935,70 @@ class DecoderLayer(nnx.Module):
 
     self.skip_scale = nnx.Param(jnp.ones((1,), dtype=config.param_dtype))
 
+  @overload
+  def block(
+      self,
+      x: jaxtyping.Array,
+      segment_pos: jaxtyping.Array,
+      cache: LayerCache,
+      attn_mask: jaxtyping.Array | None,
+      per_layer_input: jaxtyping.Array | None = None,
+      kv_shared_cache: LayerKV | LayerCache | None = None,
+      kv_override: LayerKV | LayerCache | None = None,
+      use_kv_override: jaxtyping.Array | bool | None = None,
+      skip_kv_projection: bool = False,
+      segment_ids: jaxtyping.Array | splash.SegmentIds | None = None,
+  ) -> tuple[LayerCache, jaxtyping.Array, LayerKVPair]:
+    ...
+
+  @overload
+  def block(
+      self,
+      x: jaxtyping.Array,
+      segment_pos: jaxtyping.Array,
+      cache: LayerKV,
+      attn_mask: jaxtyping.Array | None,
+      per_layer_input: jaxtyping.Array | None = None,
+      kv_shared_cache: LayerKV | LayerCache | None = None,
+      kv_override: LayerKV | LayerCache | None = None,
+      use_kv_override: jaxtyping.Array | bool | None = None,
+      skip_kv_projection: bool = False,
+      segment_ids: jaxtyping.Array | splash.SegmentIds | None = None,
+  ) -> tuple[LayerKV, jaxtyping.Array, LayerKVPair]:
+    ...
+
+  @overload
+  def block(
+      self,
+      x: jaxtyping.Array,
+      segment_pos: jaxtyping.Array,
+      cache: None,
+      attn_mask: jaxtyping.Array | None,
+      per_layer_input: jaxtyping.Array | None = None,
+      kv_shared_cache: LayerKV | LayerCache | None = None,
+      kv_override: LayerKV | LayerCache | None = None,
+      use_kv_override: jaxtyping.Array | bool | None = None,
+      skip_kv_projection: bool = False,
+      segment_ids: jaxtyping.Array | splash.SegmentIds | None = None,
+  ) -> tuple[None, jaxtyping.Array, LayerKVPair]:
+    ...
+
+  @overload
+  def block(
+      self,
+      x: jaxtyping.Array,
+      segment_pos: jaxtyping.Array,
+      cache: LayerKV | LayerCache | None,
+      attn_mask: jaxtyping.Array | None,
+      per_layer_input: jaxtyping.Array | None = None,
+      kv_shared_cache: LayerKV | LayerCache | None = None,
+      kv_override: LayerKV | LayerCache | None = None,
+      use_kv_override: jaxtyping.Array | bool | None = None,
+      skip_kv_projection: bool = False,
+      segment_ids: jaxtyping.Array | splash.SegmentIds | None = None,
+  ) -> tuple[LayerKV | LayerCache | None, jaxtyping.Array, LayerKVPair]:
+    ...
+
   def block(
       self,
       x: jaxtyping.Array,
@@ -1702,7 +2014,7 @@ class DecoderLayer(nnx.Module):
   ) -> tuple[
       LayerKV | LayerCache | None,
       jaxtyping.Array,
-      tuple[jaxtyping.Array, jaxtyping.Array],
+      LayerKVPair,
   ]:
     x = checkpoint_name(x, "decoder_input")
     norm = self.pre_attention_norm(x)
@@ -1743,6 +2055,70 @@ class DecoderLayer(nnx.Module):
     ffw = ffw * self.skip_scale[...]
     return cache, ffw, kv
 
+  @overload
+  def __call__(
+      self,
+      x: jaxtyping.Array,
+      segment_pos: jaxtyping.Array,
+      cache: LayerCache,
+      attn_mask: jaxtyping.Array | None,
+      per_layer_input: jaxtyping.Array | None = None,
+      kv_shared_cache: LayerKV | LayerCache | None = None,
+      kv_override: LayerKV | LayerCache | None = None,
+      use_kv_override: jaxtyping.Array | bool | None = None,
+      skip_kv_projection: bool = False,
+      segment_ids: jaxtyping.Array | splash.SegmentIds | None = None,
+  ) -> tuple[LayerCache, jaxtyping.Array, LayerKVPair]:
+    ...
+
+  @overload
+  def __call__(
+      self,
+      x: jaxtyping.Array,
+      segment_pos: jaxtyping.Array,
+      cache: LayerKV,
+      attn_mask: jaxtyping.Array | None,
+      per_layer_input: jaxtyping.Array | None = None,
+      kv_shared_cache: LayerKV | LayerCache | None = None,
+      kv_override: LayerKV | LayerCache | None = None,
+      use_kv_override: jaxtyping.Array | bool | None = None,
+      skip_kv_projection: bool = False,
+      segment_ids: jaxtyping.Array | splash.SegmentIds | None = None,
+  ) -> tuple[LayerKV, jaxtyping.Array, LayerKVPair]:
+    ...
+
+  @overload
+  def __call__(
+      self,
+      x: jaxtyping.Array,
+      segment_pos: jaxtyping.Array,
+      cache: None,
+      attn_mask: jaxtyping.Array | None,
+      per_layer_input: jaxtyping.Array | None = None,
+      kv_shared_cache: LayerKV | LayerCache | None = None,
+      kv_override: LayerKV | LayerCache | None = None,
+      use_kv_override: jaxtyping.Array | bool | None = None,
+      skip_kv_projection: bool = False,
+      segment_ids: jaxtyping.Array | splash.SegmentIds | None = None,
+  ) -> tuple[None, jaxtyping.Array, LayerKVPair]:
+    ...
+
+  @overload
+  def __call__(
+      self,
+      x: jaxtyping.Array,
+      segment_pos: jaxtyping.Array,
+      cache: LayerKV | LayerCache | None,
+      attn_mask: jaxtyping.Array | None,
+      per_layer_input: jaxtyping.Array | None = None,
+      kv_shared_cache: LayerKV | LayerCache | None = None,
+      kv_override: LayerKV | LayerCache | None = None,
+      use_kv_override: jaxtyping.Array | bool | None = None,
+      skip_kv_projection: bool = False,
+      segment_ids: jaxtyping.Array | splash.SegmentIds | None = None,
+  ) -> tuple[LayerKV | LayerCache | None, jaxtyping.Array, LayerKVPair]:
+    ...
+
   def __call__(
       self,
       x: jaxtyping.Array,
@@ -1758,7 +2134,7 @@ class DecoderLayer(nnx.Module):
   ) -> tuple[
       LayerKV | LayerCache | None,
       jaxtyping.Array,
-      tuple[jaxtyping.Array, jaxtyping.Array],
+      LayerKVPair,
   ]:
     remat_config = self.config.remat_config
     if (
@@ -1871,15 +2247,21 @@ class ScanSubGroup(nnx.Module):
       kv_override: LayerCache | LayerKV | None = None,
       use_kv_override: jaxtyping.Array | None = None,
       segment_ids: jaxtyping.Array | splash.SegmentIds | None = None,
-  ) -> tuple[jaxtyping.Array, LayerCache | None, LayerKV | None]:
+  ) -> tuple[jaxtyping.Array, LayerCache | None, LayerKVPair | None]:
     """Run this sub-group's layers via vectorized subscan."""
     if subgroup_cache is not None:
+      has_pfx = "prefix_k" in subgroup_cache
+      cache_in_axes = (
+          {"k": 0, "v": 0, "end_index": 0, "prefix_k": 0, "prefix_v": 0}
+          if has_pfx
+          else {"k": 0, "v": 0, "end_index": 0}
+      )
 
       @nnx.scan(
           in_axes=(
               nnx.Carry,
               0,
-              {"k": 0, "v": 0, "end_index": 0},
+              cache_in_axes,
               None,
               None,
               0 if per_layer_inputs is not None else None,
@@ -1888,7 +2270,7 @@ class ScanSubGroup(nnx.Module):
           ),
           out_axes=(
               nnx.Carry,
-              {"k": 0, "v": 0, "end_index": 0},
+              cache_in_axes,
           ),
       )
       def subscan_cache_body(
@@ -1901,7 +2283,7 @@ class ScanSubGroup(nnx.Module):
           use_kvo: jaxtyping.Array | None,
           segment_ids: jaxtyping.Array | splash.SegmentIds | None,
       ) -> tuple[jaxtyping.Array, LayerCache]:
-        layer_cache, x, _ = layer(
+        out_c, x, _ = layer(
             x,
             positions,
             layer_cache,
@@ -1912,7 +2294,7 @@ class ScanSubGroup(nnx.Module):
             skip_kv_projection=self.skip_kv_projection,
             segment_ids=segment_ids,
         )
-        return x, layer_cache
+        return x, out_c
 
       x, out_cache = subscan_cache_body(
           x,
@@ -1951,7 +2333,7 @@ class ScanSubGroup(nnx.Module):
           pli: jaxtyping.Array | None,
           use_kvo: jaxtyping.Array | None,
           segment_ids: jaxtyping.Array | splash.SegmentIds | None,
-      ) -> tuple[jaxtyping.Array, tuple[jaxtyping.Array, jaxtyping.Array]]:
+      ) -> tuple[jaxtyping.Array, LayerKVPair]:
         _, x, kv = layer(
             x,
             positions,
@@ -2052,12 +2434,13 @@ class ScanLayerGroup(nnx.Module):
     for sub_group in self.sub_groups:
       count = sub_group.count
 
-      subgroup_cache = None
+      subgroup_cache: LayerCache | None = None
       if cache is not None:
-        sub_caches = [
-            cache[sub_idx + i]
+        sub_caches: list[LayerCache] = [
+            c
             for i in range(count)
-            if (sub_idx + i) < len(cache) and cache[sub_idx + i] is not None
+            if (sub_idx + i) < len(cache)
+            and (c := cache[sub_idx + i]) is not None
         ]
         if len(sub_caches) == count:
           subgroup_cache = {
@@ -2067,6 +2450,13 @@ class ScanLayerGroup(nnx.Module):
                   [c["end_index"] for c in sub_caches], axis=0
               ),
           }
+          if "prefix_k" in sub_caches[0] and "prefix_v" in sub_caches[0]:
+            subgroup_cache["prefix_k"] = jnp.stack(
+                [c["prefix_k"] for c in sub_caches if "prefix_k" in c], axis=0
+            )
+            subgroup_cache["prefix_v"] = jnp.stack(
+                [c["prefix_v"] for c in sub_caches if "prefix_v" in c], axis=0
+            )
 
       sub_per_layer_inputs = (
           per_layer_inputs[:, :, sub_idx : sub_idx + count, :]
@@ -2104,11 +2494,15 @@ class ScanLayerGroup(nnx.Module):
 
       if new_cache is not None and out_cache is not None:
         for i in range(count):
-          new_cache[sub_idx + i] = {
+          lc: LayerCache = {
               "k": out_cache["k"][i],
               "v": out_cache["v"][i],
               "end_index": out_cache["end_index"][i],
           }
+          if "prefix_k" in out_cache and "prefix_v" in out_cache:
+            lc["prefix_k"] = out_cache["prefix_k"][i]
+            lc["prefix_v"] = out_cache["prefix_v"][i]
+          new_cache[sub_idx + i] = lc
       if new_group_kvs is not None and out_kv is not None:
         for i in range(count):
           new_group_kvs[sub_idx + i] = {
@@ -2465,6 +2859,15 @@ class Gemma4(BackendMappingMixin, nnx.Module):
         if is_prefill:
           shared_k, shared_v = transient_kvs[shared_layer_name]
           kv_shared_cache = {"k": shared_k, "v": shared_v}
+          if (
+              isinstance(cache, dict)
+              and shared_layer_name in cache
+              and (slc := cache[shared_layer_name]) is not None
+              and "prefix_k" in slc
+              and "prefix_v" in slc
+          ):
+            kv_shared_cache["prefix_k"] = slc["prefix_k"]
+            kv_shared_cache["prefix_v"] = slc["prefix_v"]
         else:
           kv_shared_cache = new_cache.get(shared_layer_name)
       else:
@@ -2582,13 +2985,28 @@ class Gemma4(BackendMappingMixin, nnx.Module):
 
             scan_shd_btnh = (None, *self.config.shd_config.act_btnh)
             scan_shd_b = (None, *self.config.shd_config.act_btnh[:1])
-            scan_cache_list.append({
+            stacked: LayerCache = {
                 "k": sharding_utils.shard(jnp.stack(ks, axis=0), scan_shd_btnh),
                 "v": sharding_utils.shard(jnp.stack(vs, axis=0), scan_shd_btnh),
                 "end_index": sharding_utils.shard(
                     jnp.stack(end_indices, axis=0), scan_shd_b
                 ),
-            })
+            }
+            if (
+                proto_cache is not None
+                and "prefix_k" in proto_cache
+                and "prefix_v" in proto_cache
+            ):
+              # Prefix is identical for all groups: replicate across axis 0.
+              pfx_k = proto_cache["prefix_k"]
+              pfx_v = proto_cache["prefix_v"]
+              stacked["prefix_k"] = jnp.broadcast_to(
+                  pfx_k[None], (num_scan_groups, *pfx_k.shape)
+              )
+              stacked["prefix_v"] = jnp.broadcast_to(
+                  pfx_v[None], (num_scan_groups, *pfx_v.shape)
+              )
+            scan_cache_list.append(stacked)
           else:
             scan_cache_list.append(None)
 
@@ -2650,19 +3068,27 @@ class Gemma4(BackendMappingMixin, nnx.Module):
           c_s = scan_cache[s]
           if c_s is not None:
             g_idx = origin_group_for_sub[s]
-            origin_kv_init_list.append({
+            entry: LayerCache = {
                 "k": c_s["k"][g_idx],
                 "v": c_s["v"][g_idx],
                 "end_index": c_s["end_index"][g_idx],
-            })
+            }
+            if "prefix_k" in c_s and "prefix_v" in c_s:
+              entry["prefix_k"] = c_s["prefix_k"][g_idx]
+              entry["prefix_v"] = c_s["prefix_v"][g_idx]
+            origin_kv_init_list.append(entry)
           else:
             assert scan_cache[0] is not None
             c_zero = scan_cache[0]
-            origin_kv_init_list.append({
+            entry = {
                 "k": jnp.zeros_like(c_zero["k"][0]),
                 "v": jnp.zeros_like(c_zero["v"][0]),
                 "end_index": jnp.zeros_like(c_zero["end_index"][0]),
-            })
+            }
+            if "prefix_k" in c_zero and "prefix_v" in c_zero:
+              entry["prefix_k"] = jnp.zeros_like(c_zero["prefix_k"][0])
+              entry["prefix_v"] = jnp.zeros_like(c_zero["prefix_v"][0])
+            origin_kv_init_list.append(entry)
         origin_kv_init = tuple(origin_kv_init_list)
         sharing_metadata = (is_shared_jax, is_origin_jax)
         sharing_in_axis = (0, 0)
@@ -2686,7 +3112,20 @@ class Gemma4(BackendMappingMixin, nnx.Module):
           out_axes=(
               nnx.Carry,
               tuple(
-                  {"k": 0, "v": 0, "end_index": 0} for _ in range(pattern_len)
+                  (
+                      {
+                          "k": 0,
+                          "v": 0,
+                          "end_index": 0,
+                          "prefix_k": 0,
+                          "prefix_v": 0,
+                      }
+                      if (
+                          (sc := scan_cache[s]) is not None and "prefix_k" in sc
+                      )
+                      else {"k": 0, "v": 0, "end_index": 0}
+                  )
+                  for s in range(pattern_len)
               ),
           ),
       )
@@ -2738,26 +3177,31 @@ class Gemma4(BackendMappingMixin, nnx.Module):
           assert origin_kv is not None
           # Update origin_kv carry: for sub-positions that are origins in
           # this group, write their updated caches into the carry.
-          updated_origin_kv: tuple[LayerCache, ...] = tuple(
-              {
-                  "k": jnp.where(
-                      is_origin_slice[s],
-                      new_group_cache[s]["k"],
-                      origin_kv[s]["k"],
-                  ),
-                  "v": jnp.where(
-                      is_origin_slice[s],
-                      new_group_cache[s]["v"],
-                      origin_kv[s]["v"],
-                  ),
-                  "end_index": jnp.where(
-                      is_origin_slice[s],
-                      new_group_cache[s]["end_index"],
-                      origin_kv[s]["end_index"],
-                  ),
-              }
-              for s in range(pattern_len)
-          )
+          updated_origin_kv_list: list[LayerCache] = []
+          for s in range(pattern_len):
+            entry: LayerCache = {
+                "k": jnp.where(
+                    is_origin_slice[s],
+                    new_group_cache[s]["k"],
+                    origin_kv[s]["k"],
+                ),
+                "v": jnp.where(
+                    is_origin_slice[s],
+                    new_group_cache[s]["v"],
+                    origin_kv[s]["v"],
+                ),
+                "end_index": jnp.where(
+                    is_origin_slice[s],
+                    new_group_cache[s]["end_index"],
+                    origin_kv[s]["end_index"],
+                ),
+            }
+            orig_s = origin_kv[s]
+            if "prefix_k" in orig_s and "prefix_v" in orig_s:
+              entry["prefix_k"] = orig_s["prefix_k"]
+              entry["prefix_v"] = orig_s["prefix_v"]
+            updated_origin_kv_list.append(entry)
+          updated_origin_kv = tuple(updated_origin_kv_list)
           return (x, updated_origin_kv), out_cache
         else:
           return x, out_cache
@@ -2785,24 +3229,28 @@ class Gemma4(BackendMappingMixin, nnx.Module):
           x = result[0]
           updated_scan_cache = result[1]
       else:
+
+        def _slice_scan_cache(
+            c_s: LayerCache | None, start: int, end: int
+        ) -> LayerCache | None:
+          if c_s is None:
+            return None
+          sliced: LayerCache = {
+              "k": c_s["k"][start:end],
+              "v": c_s["v"][start:end],
+              "end_index": c_s["end_index"][start:end],
+          }
+          if "prefix_k" in c_s and "prefix_v" in c_s:
+            sliced["prefix_k"] = c_s["prefix_k"][start:end]
+            sliced["prefix_v"] = c_s["prefix_v"][start:end]
+          return sliced
+
         unshared_scan_cache: tuple[LayerCache | None, ...] = tuple(
-            LayerCache(
-                k=c_s["k"][: self.num_unshared_groups],
-                v=c_s["v"][: self.num_unshared_groups],
-                end_index=c_s["end_index"][: self.num_unshared_groups],
-            )
-            if c_s is not None
-            else None
+            _slice_scan_cache(c_s, 0, self.num_unshared_groups)
             for c_s in scan_cache
         )
         shared_scan_cache: tuple[LayerCache | None, ...] = tuple(
-            LayerCache(
-                k=c_s["k"][self.num_unshared_groups :],
-                v=c_s["v"][self.num_unshared_groups :],
-                end_index=c_s["end_index"][self.num_unshared_groups :],
-            )
-            if c_s is not None
-            else None
+            _slice_scan_cache(c_s, self.num_unshared_groups, num_scan_groups)
             for c_s in scan_cache
         )
         if has_sharing:
@@ -2864,24 +3312,33 @@ class Gemma4(BackendMappingMixin, nnx.Module):
         else:
           assert isinstance(carry_final, jaxtyping.Array)
           x = carry_final
-        updated_scan_cache: StackedCache = tuple(
-            LayerCache(
-                k=jnp.concatenate(
-                    [unshared_out_cache[s]["k"], shared_out_cache[s]["k"]],
-                    axis=0,
-                ),
-                v=jnp.concatenate(
-                    [unshared_out_cache[s]["v"], shared_out_cache[s]["v"]],
-                    axis=0,
-                ),
-                end_index=jnp.concatenate(
-                    [
-                        unshared_out_cache[s]["end_index"],
-                        shared_out_cache[s]["end_index"],
-                    ],
-                    axis=0,
-                ),
+
+        def _concat_scan_caches(
+            unshared: LayerCache, shared: LayerCache
+        ) -> LayerCache:
+          merged: LayerCache = {
+              "k": jnp.concatenate([unshared["k"], shared["k"]], axis=0),
+              "v": jnp.concatenate([unshared["v"], shared["v"]], axis=0),
+              "end_index": jnp.concatenate(
+                  [unshared["end_index"], shared["end_index"]], axis=0
+              ),
+          }
+          if (
+              "prefix_k" in unshared
+              and "prefix_v" in unshared
+              and "prefix_k" in shared
+              and "prefix_v" in shared
+          ):
+            merged["prefix_k"] = jnp.concatenate(
+                [unshared["prefix_k"], shared["prefix_k"]], axis=0
             )
+            merged["prefix_v"] = jnp.concatenate(
+                [unshared["prefix_v"], shared["prefix_v"]], axis=0
+            )
+          return merged
+
+        updated_scan_cache: StackedCache = tuple(
+            _concat_scan_caches(unshared_out_cache[s], shared_out_cache[s])
             for s in range(pattern_len)
         )
 
@@ -2896,11 +3353,15 @@ class Gemma4(BackendMappingMixin, nnx.Module):
           group_idx = i // pattern_len
           sub_idx = i % pattern_len
           c = updated_scan_cache[sub_idx]
-          new_cache[f"layer_{i}"] = {
+          layer_c: LayerCache = {
               "k": c["k"][group_idx],
               "v": c["v"][group_idx],
               "end_index": c["end_index"][group_idx],
           }
+          if "prefix_k" in c and "prefix_v" in c:
+            layer_c["prefix_k"] = c["prefix_k"][group_idx]
+            layer_c["prefix_v"] = c["prefix_v"][group_idx]
+          new_cache[f"layer_{i}"] = layer_c
         out_cache = new_cache
       return x, out_cache
 
@@ -3131,7 +3592,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
           proto_cache = sub_layer.init_cache(batch_size, max_seq_len, dtype)
           shd_btnh = (None, *self.config.shd_config.act_btnh)
           shd_b = (None, *self.config.shd_config.act_btnh[:1])
-          scan_cache_list.append({
+          stacked_cache: LayerCache = {
               "k": sharding_utils.shard(
                   jnp.zeros(
                       (num_scan_groups, *proto_cache["k"].shape),
@@ -3153,7 +3614,21 @@ class Gemma4(BackendMappingMixin, nnx.Module):
                   ),
                   shd_b,
               ),
-          })
+          }
+          if (
+              proto_cache is not None
+              and "prefix_k" in proto_cache
+              and "prefix_v" in proto_cache
+          ):
+            pfx_k = proto_cache["prefix_k"]
+            pfx_v = proto_cache["prefix_v"]
+            stacked_cache["prefix_k"] = jnp.broadcast_to(
+                pfx_k[None], (num_scan_groups, *pfx_k.shape)
+            )
+            stacked_cache["prefix_v"] = jnp.broadcast_to(
+                pfx_v[None], (num_scan_groups, *pfx_v.shape)
+            )
+          scan_cache_list.append(stacked_cache)
         else:
           scan_cache_list.append(None)
       return tuple(scan_cache_list)
