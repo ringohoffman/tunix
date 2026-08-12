@@ -2278,6 +2278,7 @@ class ScanSubGroup(nnx.Module):
               nnx.Carry,
               cache_in_axes,
           ),
+          _split_transpose=True,
       )
       def subscan_cache_body(
           x: jaxtyping.Array,
@@ -2330,6 +2331,7 @@ class ScanSubGroup(nnx.Module):
               nnx.Carry,
               (0, 0),
           ),
+          _split_transpose=True,
       )
       def subscan_body(
           x: jaxtyping.Array,
@@ -3134,6 +3136,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
                   for s in range(pattern_len)
               ),
           ),
+          _split_transpose=True,
       )
       def scan_cache_body(
           carry: (
@@ -3400,6 +3403,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
               None,
           ),
           out_axes=nnx.Carry,
+          _split_transpose=True,
       )
       def scan_body(
           x: jaxtyping.Array,
@@ -3495,6 +3499,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
               None,
           ),
           out_axes=nnx.Carry,
+          _split_transpose=True,
       )
       def scan_body_unshared(
           carry: tuple[jaxtyping.Array, OriginKV],
@@ -3539,6 +3544,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
               None,
           ),
           out_axes=nnx.Carry,
+          _split_transpose=True,
       )
       def scan_body_shared(
           x: jaxtyping.Array,
