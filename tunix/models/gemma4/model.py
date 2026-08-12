@@ -626,7 +626,7 @@ class Embedder(nnx.Module):
         nnx.initializers.normal(dtype=self.param_dtype)(
             rngs.params(), (self.vocab_size, self.embed_dim)
         ),
-        sharding=config.shd_config.emb_vd,
+        out_sharding=config.shd_config.emb_vd,
     )
 
     if config.per_layer_input_dim > 0:
@@ -652,7 +652,7 @@ class Embedder(nnx.Module):
               rngs.params(),
               (self.vocab_size, config.num_layers, config.per_layer_input_dim),
           ),
-          sharding=config.shd_config.per_layer_input_embedding,
+          out_sharding=config.shd_config.per_layer_input_embedding,
       )
 
   def encode(self, x: jaxtyping.ArrayLike) -> jaxtyping.Array:
@@ -702,7 +702,7 @@ class Einsum(nnx.Module):
     self.expected_in_ndim = len(einsum_str.split(",")[0].strip())
     self.w = nnx.Param(
         nnx.initializers.normal(dtype=param_dtype)(rngs.params(), shape),
-        sharding=sharding,
+        out_sharding=sharding,
     )
 
   def __call__(self, x: jaxtyping.ArrayLike) -> jaxtyping.Array:
@@ -778,7 +778,7 @@ class RMSNorm(nnx.Module):
   ) -> None:
     self.scale = nnx.Param(
         nnx.initializers.ones_init()(rngs.params(), (dim,)).astype(param_dtype),
-        sharding=sharding.rms_norm_weight,
+        out_sharding=sharding.rms_norm_weight,
     )
     self.dtype = dtype
 

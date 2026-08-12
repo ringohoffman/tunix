@@ -101,13 +101,13 @@ class MoERagged(nnx.Module):
         nnx.initializers.normal(dtype=config.param_dtype)(
             rngs.params(), (self.num_experts, 2, self.hidden_dim, self.features)
         ),
-        sharding=config.shd_config.exp_weight_edf,
+        out_sharding=config.shd_config.exp_weight_edf,
     )
     self.linear = nnx.Param(
         nnx.initializers.normal(dtype=config.param_dtype)(
             rngs.params(), (self.num_experts, self.hidden_dim, self.features)
         ),
-        sharding=config.shd_config.exp_weight_efd,
+        out_sharding=config.shd_config.exp_weight_efd,
     )
     self.per_expert_scale = nnx.Param(
         jnp.ones((self.num_experts,), dtype=config.param_dtype)
@@ -187,8 +187,12 @@ class MoERagged(nnx.Module):
   def block(self, x, router_input=None):
     if router_input is None:
       router_input = x
-    var = jnp.mean(jnp.square(router_input.astype(jnp.float32)), axis=-1, keepdims=True)
-    router_input = router_input * jax.lax.rsqrt(var + 1e-06).astype(router_input.dtype)
+    var = jnp.mean(
+        jnp.square(router_input.astype(jnp.float32)), axis=-1, keepdims=True
+    )
+    router_input = router_input * jax.lax.rsqrt(var + 1e-06).astype(
+        router_input.dtype
+    )
 
     root_size = jax.lax.rsqrt(
         jnp.array(self.features, dtype=router_input.dtype)
