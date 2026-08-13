@@ -209,9 +209,8 @@ def _stack_layers_for_scan(
     assert isinstance(root, str)
     if len(path) >= 1 and (root == 'layers' or root.startswith('layer_')):
       if root == 'layers':
-        layer_idx, *param_path = path[1:]
-        assert isinstance(layer_idx, int)
-        param_path = tuple(param_path)
+        layer_idx = int(path[1])
+        param_path = tuple(path[2:])
       else:
         _, layer_idx_str = root.split('_')
         layer_idx = int(layer_idx_str)
@@ -241,8 +240,7 @@ def _stack_layers_for_scan(
 
     elif len(path) >= 3 and path[1] == 'sub_layers':
       group_name = path[0]
-      sub_layer_idx = path[2]
-      assert isinstance(sub_layer_idx, int)
+      sub_layer_idx = int(path[2])
       param_path = path[3:]
       g_count = (
           num_unshared_groups
@@ -496,16 +494,100 @@ def _try_restore_native_tunix(
   step_num = int(step_name)
   model_config = abs_model.config
 
+  model_wants_scan = (
+      model_config.attention_pattern is not None
+      and model_config.use_scan_layers
+  )
+
   # Determine whether the checkpoint is flat (layers.N) or scanned
   # (scan_groups), and whether the model expects the same format.
   ckpt_has_layers = 'layers' in top_keys
   ckpt_has_scan = (
       'scan_groups' in top_keys or 'unshared_scan_groups' in top_keys
   )
-  model_wants_scan = (
-      model_config.attention_pattern is not None
-      and model_config.use_scan_layers
-  )
+  ckpt_has_legacy_sub_layers = False
+  if ckptr_meta and ckptr_meta.item_metadata:
+    flat_meta = flax.traverse_util.flatten_dict(ckptr_meta.item_metadata.tree)
+    ckpt_has_legacy_sub_layers = any(
+        len(k) >= 2 and k[1] == 'sub_layers' for k in flat_meta.keys()
+    )
+
+  if ckpt_has_legacy_sub_layers and model_config.attention_pattern is not None:
+    replicated_sharding = jax.sharding.NamedSharding(
+        mesh, jax.sharding.PartitionSpec()
+    )
+    target_tree = {
+        k: jax.ShapeDtypeStruct(v.shape, v.dtype, sharding=replicated_sharding)
+        for k, v in flat_meta.items()
+    }
+    unflattened_target = flax.traverse_util.unflatten_dict(target_tree)
+    restore_args = ocp.checkpoint_utils.construct_restore_args(
+        unflattened_target
+    )
+    with _mesh_context(mesh):
+      raw_params = ocp.PyTreeCheckpointer().restore(
+          model_params_dir,
+          args=ocp.args.PyTreeRestore(
+              item=unflattened_target, restore_args=restore_args
+          ),
+      )
+    flat_raw = flax.traverse_util.flatten_dict(raw_params)
+    flat_unwrapped = {
+        (k[:-1] if k and k[-1] == 'value' else k): v
+        for k, v in flat_raw.items()
+    }
+    raw_params = flax.traverse_util.unflatten_dict(flat_unwrapped)
+    if model_wants_scan:
+      converted_params = _stack_layers_for_scan(
+          raw_params,
+          model_config.num_layers,
+          model_config.attention_pattern,
+          model_config.frac_shared_layers,
+      )
+    else:
+      converted_flat: dict[tuple[Any, ...], Any] = {}
+      pattern_len = len(model_config.attention_pattern)
+      num_unshared_layers = int(
+          model_config.num_layers
+          - model_config.frac_shared_layers * model_config.num_layers
+      )
+      flat_raw = flax.traverse_util.flatten_dict(raw_params)
+      for path, param in flat_raw.items():
+        if len(path) >= 3 and path[1] == 'sub_layers':
+          group_name = path[0]
+          sub_layer_idx = int(path[2])
+          param_path = path[3:]
+          is_unshared = group_name in ('scan_groups', 'unshared_scan_groups')
+          base_idx = 0 if is_unshared else num_unshared_layers
+          num_groups = param.shape[0]
+          for g in range(num_groups):
+            layer_idx = base_idx + g * pattern_len + sub_layer_idx
+            converted_flat[('layers', layer_idx) + param_path] = param[g]
+        else:
+          converted_flat[path] = param
+      converted_params = flax.traverse_util.unflatten_dict(converted_flat)
+
+    model_state = nnx.state(abs_model)
+    pruned = _prune_to_model_keys(converted_params, model_state)
+    _validate_param_shapes(pruned, model_state)
+    with _mesh_context(mesh):
+      shardings = nnx.to_pure_dict(nnx.get_named_sharding(model_state, mesh))
+      typed = jax.tree_util.tree_map_with_path(
+          lambda p, x, s: jnp.asarray(
+              x, device=s, dtype=model_config.param_dtype
+          ),
+          pruned,
+          shardings,
+      )
+    nnx.update(abs_model, typed)
+    logging.info(
+        'Restored native Tunix model from step %d (migrated legacy sub_layers'
+        ' -> %s) in %.2fs',
+        step_num,
+        'sub_groups' if model_wants_scan else 'layers.N',
+        time.monotonic() - t0,
+    )
+    return True
 
   # If the checkpoint format matches the model, restore directly.
   # Otherwise, build a temporary flat model and re-stack after restore.
