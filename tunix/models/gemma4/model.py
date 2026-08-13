@@ -58,9 +58,6 @@ _REMAT_SUPPORTS_GRAPH_UPDATES = (
 
 
 _F = TypeVar("_F", bound=Callable[..., object])
-_CacheT = TypeVar(
-    "_CacheT", LayerKV, LayerCache, None, LayerKV | LayerCache | None
-)
 
 
 def _compat_remat(
@@ -105,6 +102,11 @@ class LayerCache(TypedDict):
   """Read-only prefix key cache, shape (1, prefix_len, num_kv_heads, head_dim) or (B, 0, ...)."""
   prefix_v: NotRequired[jaxtyping.Array]
   """Read-only prefix value cache, shape (1, prefix_len, num_kv_heads, head_dim) or (B, 0, ...)."""
+
+
+_CacheT = TypeVar(
+    "_CacheT", LayerKV, LayerCache, None, LayerKV | LayerCache | None
+)
 
 
 class OriginKV(TypedDict):
@@ -2758,50 +2760,29 @@ class Gemma4(BackendMappingMixin, nnx.Module):
           )
 
           if proto_cache is not None:
-            k_shape = proto_cache["k"].shape
-            v_shape = proto_cache["v"].shape
-            end_idx_shape = proto_cache["end_index"].shape
-            k_dtype = proto_cache["k"].dtype
-            v_dtype = proto_cache["v"].dtype
-            end_idx_dtype = proto_cache["end_index"].dtype
-            ks: list[jaxtyping.Array] = []
-            vs: list[jaxtyping.Array] = []
-            end_indices: list[jaxtyping.Array] = []
-            for i in group_layer_indices:
-              if (
-                  self.kv_cache_sharing_patterns[i] == i
-                  and f"layer_{i}" in cache
-              ):
-                c = cache[f"layer_{i}"]
-                ks.append(c["k"])
-                vs.append(c["v"])
-                end_indices.append(c["end_index"])
-              else:
-                # Shared-layer slots in the stacked cache are zero-initialized
-                # placeholders. The scan body writes to them, but the values
-                # are never read because the kv_override path swaps in the
-                # origin layer's real cache. Consumers must check
-                # kv_cache_sharing_patterns before reading scan cache slots.
-                ks.append(jnp.zeros(k_shape, dtype=k_dtype))
-                vs.append(jnp.zeros(v_shape, dtype=v_dtype))
-                end_indices.append(
-                    jnp.zeros(end_idx_shape, dtype=end_idx_dtype)
+            # Layer caches across groups (using zeros_like for shared layers)
+            group_caches = [
+                cache[f"layer_{i}"]
+                if (
+                    self.kv_cache_sharing_patterns[i] == i
+                    and f"layer_{i}" in cache
                 )
-
+                else jax.tree.map(jnp.zeros_like, proto_cache)
+                for i in group_layer_indices
+            ]
             scan_shd_btnh = (None, *self.config.shd_config.act_btnh)
             scan_shd_b = (None, *self.config.shd_config.act_btnh[:1])
+            stacked_raw = jax.tree.map(
+                lambda *leaves: jnp.stack(leaves, axis=0), *group_caches
+            )
             stacked: LayerCache = {
-                "k": sharding_utils.shard(jnp.stack(ks, axis=0), scan_shd_btnh),
-                "v": sharding_utils.shard(jnp.stack(vs, axis=0), scan_shd_btnh),
+                "k": sharding_utils.shard(stacked_raw["k"], scan_shd_btnh),
+                "v": sharding_utils.shard(stacked_raw["v"], scan_shd_btnh),
                 "end_index": sharding_utils.shard(
-                    jnp.stack(end_indices, axis=0), scan_shd_b
+                    stacked_raw["end_index"], scan_shd_b
                 ),
             }
-            if (
-                proto_cache is not None
-                and "prefix_k" in proto_cache
-                and "prefix_v" in proto_cache
-            ):
+            if "prefix_k" in proto_cache and "prefix_v" in proto_cache:
               # Prefix is identical for all groups: replicate across axis 0.
               pfx_k = proto_cache["prefix_k"]
               pfx_v = proto_cache["prefix_v"]
@@ -2873,27 +2854,13 @@ class Gemma4(BackendMappingMixin, nnx.Module):
           c_s = scan_cache[s]
           if c_s is not None:
             g_idx = origin_group_for_sub[s]
-            entry: LayerCache = {
-                "k": c_s["k"][g_idx],
-                "v": c_s["v"][g_idx],
-                "end_index": c_s["end_index"][g_idx],
-            }
-            if "prefix_k" in c_s and "prefix_v" in c_s:
-              entry["prefix_k"] = c_s["prefix_k"][g_idx]
-              entry["prefix_v"] = c_s["prefix_v"][g_idx]
-            origin_kv_init_list.append(entry)
+            origin_kv_init_list.append(jax.tree.map(lambda v: v[g_idx], c_s))
           else:
             assert scan_cache[0] is not None
             c_zero = scan_cache[0]
-            entry = {
-                "k": jnp.zeros_like(c_zero["k"][0]),
-                "v": jnp.zeros_like(c_zero["v"][0]),
-                "end_index": jnp.zeros_like(c_zero["end_index"][0]),
-            }
-            if "prefix_k" in c_zero and "prefix_v" in c_zero:
-              entry["prefix_k"] = jnp.zeros_like(c_zero["prefix_k"][0])
-              entry["prefix_v"] = jnp.zeros_like(c_zero["prefix_v"][0])
-            origin_kv_init_list.append(entry)
+            origin_kv_init_list.append(
+                jax.tree.map(lambda v: jnp.zeros_like(v[0]), c_zero)
+            )
         origin_kv_init = tuple(origin_kv_init_list)
         sharing_metadata = (is_shared_jax, is_origin_jax)
         sharing_in_axis = (0, 0)
