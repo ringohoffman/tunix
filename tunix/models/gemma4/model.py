@@ -887,6 +887,39 @@ def create_kv_cache_sharing_patterns(
   return kv_cache_sharing_patterns
 
 
+def _pad_or_truncate(
+    x: jaxtyping.Array,
+    target_len: int,
+    truncation_side: str = "left",
+) -> jaxtyping.Array:
+  """Pad or truncate ``x`` along axis 1 to ``target_len``.
+
+  Args:
+    x: Tensor of shape ``[B, S, ...]``.
+    target_len: Desired length along axis 1.
+    truncation_side: Which side to truncate when ``x.shape[1] > target_len``.  *
+      ``"left"`` (default): discard leading (oldest) positions. * ``"right"``:
+      discard trailing (newest) positions.  When padding (``x.shape[1] <
+      target_len``), zeros are prepended on the left regardless of
+      ``truncation_side``.
+
+  Returns:
+    ``x`` with ``shape[1] == target_len``.
+  """
+  src_len = x.shape[1]
+  if src_len == target_len:
+    return x
+  if src_len > target_len:
+    if truncation_side == "right":
+      return x[:, :target_len]
+    return x[:, -target_len:]
+  # src_len < target_len → zero-pad on the left.
+  pad_len = target_len - src_len
+  pad_width = [(0, 0)] * x.ndim
+  pad_width[1] = (pad_len, 0)
+  return jnp.pad(x, pad_width)
+
+
 class Attention(nnx.Module):
   """Attention module."""
 
@@ -1204,17 +1237,23 @@ class Attention(nnx.Module):
       if key_proj.shape[1] == seq_len:
         # key_proj is raw [B, seq_len, H, D] (cacheless, or flash-attention
         # prefill where expansion was intentionally skipped).
-        key_proj = jnp.where(
-            use_kv_override, kv_override["k"][:, :seq_len], key_proj
+        kvo_k = _pad_or_truncate(
+            kv_override["k"], seq_len, truncation_side="right"
         )
-        value_proj = jnp.where(
-            use_kv_override, kv_override["v"][:, :seq_len], value_proj
+        kvo_v = _pad_or_truncate(
+            kv_override["v"], seq_len, truncation_side="right"
         )
+        key_proj = jnp.where(use_kv_override, kvo_k, key_proj)
+        value_proj = jnp.where(use_kv_override, kvo_v, value_proj)
       else:
         # decode or cache-enabled prefill: key_proj is full cache
-        # [B, cache_len, H, D]
-        key_proj = jnp.where(use_kv_override, kv_override["k"], key_proj)
-        value_proj = jnp.where(use_kv_override, kv_override["v"], value_proj)
+        # [B, cache_len, H, D].  When the origin is a global layer with a
+        # larger cache than this layer's sliding window cache, slice the
+        # trailing tokens to match key_proj's cache length.
+        kvo_k = _pad_or_truncate(kv_override["k"], key_proj.shape[1])
+        kvo_v = _pad_or_truncate(kv_override["v"], key_proj.shape[1])
+        key_proj = jnp.where(use_kv_override, kvo_k, key_proj)
+        value_proj = jnp.where(use_kv_override, kvo_v, value_proj)
       if cache is not None:
         assert "end_index" in new_cache
         kv_override_end_index = (
@@ -1222,9 +1261,18 @@ class Attention(nnx.Module):
             if kv_override is not None and "end_index" in kv_override
             else new_cache["end_index"]
         )
+        target_cache_len = new_cache["k"].shape[1]
         new_cache = {
-            "k": jnp.where(use_kv_override, kv_override["k"], new_cache["k"]),
-            "v": jnp.where(use_kv_override, kv_override["v"], new_cache["v"]),
+            "k": jnp.where(
+                use_kv_override,
+                _pad_or_truncate(kv_override["k"], target_cache_len),
+                new_cache["k"],
+            ),
+            "v": jnp.where(
+                use_kv_override,
+                _pad_or_truncate(kv_override["v"], target_cache_len),
+                new_cache["v"],
+            ),
             "end_index": jnp.where(
                 use_kv_override,
                 kv_override_end_index,

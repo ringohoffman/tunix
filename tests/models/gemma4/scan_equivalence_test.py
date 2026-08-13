@@ -1449,6 +1449,32 @@ class CacheConversionTest(absltest.TestCase):
     doubled = jax.tree.map(lambda x: x * 2 if hasattr(x, "shape") else x, out)
     np.testing.assert_allclose(doubled.logits, logits * 2)
 
+  def test_sliding_window_scan_shared_cache_size_mismatch(self):
+    """Test that scan layer sharing works when global cache_size > sliding_window_size."""
+    config = _make_config(
+        num_layers=12,
+        use_scan_layers=True,
+        frac_shared_layers=6.0 / 12,
+    )
+    config.use_sliding_window_kv_cache = True
+    config.sliding_window_size = 8
+    model = model_lib.Gemma4(config, rngs=nnx.Rngs(0))
+    batch_size = 2
+    cache_size = 32  # cache_size (32) > sliding_window_size (8)
+    cache = model.init_cache(batch_size, cache_size, jnp.float32)
+
+    # Prefill with seq_len not matching sliding_window_size
+    tokens = jax.random.randint(
+        jax.random.PRNGKey(0), (batch_size, 10), 0, config.num_embed
+    )
+    positions = jnp.tile(jnp.arange(10)[None, :], (batch_size, 1))
+    attn_mask = jnp.tril(jnp.ones((10, 10), dtype=jnp.bool_))[None, ...]
+    out = model(
+        tokens, positions=positions, cache=cache, attention_mask=attn_mask
+    )
+    self.assertEqual(out.logits.shape, (batch_size, 10, config.num_embed))
+
 
 if __name__ == "__main__":
   absltest.main()
+
