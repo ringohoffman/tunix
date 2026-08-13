@@ -199,6 +199,86 @@ class FunctionalGenerateTest(parameterized.TestCase):
         out_sampler.tokens,
     )
 
+  def test_logit_gather_ids_matches_full_logits(self):
+    prompt = jnp.array([[3, 4, 5]], dtype=jnp.int32)
+    gather_ids = jnp.array([2, 5, 8], dtype=jnp.int32)
+    max_new_tokens = 5
+
+    out_full = functional.generate(
+        self.model,
+        prompt,
+        max_new_tokens=max_new_tokens,
+        pad_id=self.pad_id,
+        eos_id=self.eos_id,
+        cache_size=32,
+        temperature=0.0,
+        return_logits=True,
+    )
+    out_gather = functional.generate(
+        self.model,
+        prompt,
+        max_new_tokens=max_new_tokens,
+        pad_id=self.pad_id,
+        eos_id=self.eos_id,
+        cache_size=32,
+        temperature=0.0,
+        return_logits=True,
+        logit_gather_ids=gather_ids,
+    )
+    self.assertIsNotNone(out_gather.logits)
+    self.assertEqual(out_gather.logits.shape, (1, max_new_tokens, 3))
+    np.testing.assert_array_equal(out_full.tokens, out_gather.tokens)
+    np.testing.assert_allclose(
+        out_gather.logits,
+        out_full.logits[:, :, gather_ids],
+        atol=1e-5,
+        rtol=1e-5,
+    )
+
+  def test_logit_gather_ids_matches_sampler(self):
+    prompt_ids = np.array([[3, 4, 5]], dtype=np.int32)
+    gather_ids = jnp.array([2, 5, 8], dtype=jnp.int32)
+    max_new_tokens = 4
+
+    out_func = functional.generate(
+        self.model,
+        jnp.array(prompt_ids),
+        max_new_tokens=max_new_tokens,
+        pad_id=self.pad_id,
+        eos_id=self.eos_id,
+        cache_size=32,
+        temperature=0.0,
+        return_logits=True,
+        logit_gather_ids=gather_ids,
+    )
+
+    sampler = sampler_lib.Sampler(
+        transformer=self.model,
+        tokenizer=self.vocab,
+        cache_config=sampler_lib.CacheConfig(
+            cache_size=32,
+            num_layers=4,
+            num_kv_heads=4,
+            head_dim=16,
+        ),
+    )
+    out_sampler = sampler.generate_from_tokens(
+        prompt_ids,
+        max_generation_steps=max_new_tokens,
+        temperature=0.0,
+        pad_output=True,
+        return_logits=True,
+        logit_gather_ids=gather_ids,
+    )
+
+    np.testing.assert_array_equal(out_func.tokens, out_sampler.tokens)
+    np.testing.assert_allclose(
+        out_func.logits,
+        out_sampler.logits,
+        atol=1e-5,
+        rtol=1e-5,
+    )
+
   def test_forbidden_tokens(self):
     prompt = jnp.array([[3, 4, 5]], dtype=jnp.int32)
     forbidden = jnp.array([7], dtype=jnp.int32)

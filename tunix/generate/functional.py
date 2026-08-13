@@ -364,6 +364,7 @@ def generate(
     return_logprobs: bool = False,
     return_cache: bool = False,
     prefix_cache: PrefixCache | KVCache = None,
+    logit_gather_ids: jax.Array | None = None,
 ) -> GenerateOutput:
   """Autoregressive generation as a pure JAX function.
 
@@ -394,6 +395,11 @@ def generate(
       host) rather than having it implicitly freed.
     prefix_cache: Optional ``PrefixCache`` containing precomputed KV cache for a
       shared prefix. When provided, prefill only executes for suffix tokens.
+    logit_gather_ids: Optional 1-D array of token IDs to gather logits for. When
+      provided with ``return_logits=True``, only logits for these IDs are
+      stored, returning shape ``[B, max_new_tokens, len(logit_gather_ids)]``
+      instead of ``[B, max_new_tokens, vocab_size]`` to dramatically reduce
+      memory overhead.
 
   Returns:
     A ``GenerateOutput`` containing generated tokens and optional
@@ -625,17 +631,23 @@ def generate(
 
   # Initialise logits/logprobs buffers now that we know the vocab size.
   actual_vocab_size = logits.shape[-1]
+  num_output_logits = (
+      logit_gather_ids.shape[0]
+      if logit_gather_ids is not None
+      else actual_vocab_size
+  )
   logits_buffer: jax.Array | None = None
   logprobs_buffer: jax.Array | None = None
   if return_logits:
     logits_buffer = jnp.zeros(
-        (batch_size, total_len, actual_vocab_size),
+        (batch_size, total_len, num_output_logits),
         dtype=jnp.float32,
     )
+    prefill_logits = logits[:, -1].astype(jnp.float32)
+    if logit_gather_ids is not None:
+      prefill_logits = prefill_logits[:, logit_gather_ids]
     # Store prefill logits (last position only, matching Sampler behaviour).
-    logits_buffer = logits_buffer.at[:, prompt_len - 1, :].set(
-        logits[:, -1].astype(jnp.float32)
-    )
+    logits_buffer = logits_buffer.at[:, prompt_len - 1, :].set(prefill_logits)
 
   if return_logprobs:
     logprobs_buffer = jnp.zeros(
@@ -714,9 +726,10 @@ def generate(
 
   # Store logits for the first generated position.
   if logits_buffer is not None:
-    logits_buffer = logits_buffer.at[:, prompt_len, :].set(
-        jnp.squeeze(last_logits, 1).astype(jnp.float32)
-    )
+    first_step_logits = jnp.squeeze(last_logits, 1).astype(jnp.float32)
+    if logit_gather_ids is not None:
+      first_step_logits = first_step_logits[:, logit_gather_ids]
+    logits_buffer = logits_buffer.at[:, prompt_len, :].set(first_step_logits)
 
   constraint_state, unique_state, token_bounds_state = (
       _advance_constraint_state(
@@ -802,8 +815,11 @@ def generate(
     new_logits_buffer = state.logits_buffer
     if new_logits_buffer is not None:
       write_logits_idx = prompt_len + state.step
+      step_logits = jnp.squeeze(loop_logits, 1).astype(jnp.float32)
+      if logit_gather_ids is not None:
+        step_logits = step_logits[:, logit_gather_ids]
       new_logits_buffer = new_logits_buffer.at[:, write_logits_idx, :].set(
-          jnp.squeeze(loop_logits, 1).astype(jnp.float32)
+          step_logits
       )
 
     new_logprobs_buffer = state.logprobs_buffer
