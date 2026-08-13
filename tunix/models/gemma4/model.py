@@ -2499,20 +2499,9 @@ class ScanLayerGroup(nnx.Module):
             and (c := cache[sub_idx + i]) is not None
         ]
         if len(sub_caches) == count:
-          subgroup_cache = {
-              "k": jnp.stack([c["k"] for c in sub_caches], axis=0),
-              "v": jnp.stack([c["v"] for c in sub_caches], axis=0),
-              "end_index": jnp.stack(
-                  [c["end_index"] for c in sub_caches], axis=0
-              ),
-          }
-          if "prefix_k" in sub_caches[0] and "prefix_v" in sub_caches[0]:
-            subgroup_cache["prefix_k"] = jnp.stack(
-                [c["prefix_k"] for c in sub_caches if "prefix_k" in c], axis=0
-            )
-            subgroup_cache["prefix_v"] = jnp.stack(
-                [c["prefix_v"] for c in sub_caches if "prefix_v" in c], axis=0
-            )
+          subgroup_cache = jax.tree.map(
+              lambda *leaves: jnp.stack(leaves, axis=0), *sub_caches
+          )
 
       sub_per_layer_inputs = (
           per_layer_inputs[:, :, sub_idx : sub_idx + count, :]
@@ -2550,15 +2539,7 @@ class ScanLayerGroup(nnx.Module):
 
       if new_cache is not None and out_cache is not None:
         for i in range(count):
-          lc: LayerCache = {
-              "k": out_cache["k"][i],
-              "v": out_cache["v"][i],
-              "end_index": out_cache["end_index"][i],
-          }
-          if "prefix_k" in out_cache and "prefix_v" in out_cache:
-            lc["prefix_k"] = out_cache["prefix_k"][i]
-            lc["prefix_v"] = out_cache["prefix_v"][i]
-          new_cache[sub_idx + i] = lc
+          new_cache[sub_idx + i] = jax.tree.map(lambda x: x[i], out_cache)
       if new_group_kvs is not None and out_kv is not None:
         for i in range(count):
           new_group_kvs[sub_idx + i] = {
@@ -3232,33 +3213,17 @@ class Gemma4(BackendMappingMixin, nnx.Module):
         if has_sharing:
           assert is_origin_slice is not None
           assert origin_kv is not None
+          origin_slice = is_origin_slice
           # Update origin_kv carry: for sub-positions that are origins in
           # this group, write their updated caches into the carry.
-          updated_origin_kv_list: list[LayerCache] = []
-          for s in range(pattern_len):
-            entry: LayerCache = {
-                "k": jnp.where(
-                    is_origin_slice[s],
-                    new_group_cache[s]["k"],
-                    origin_kv[s]["k"],
-                ),
-                "v": jnp.where(
-                    is_origin_slice[s],
-                    new_group_cache[s]["v"],
-                    origin_kv[s]["v"],
-                ),
-                "end_index": jnp.where(
-                    is_origin_slice[s],
-                    new_group_cache[s]["end_index"],
-                    origin_kv[s]["end_index"],
-                ),
-            }
-            orig_s = origin_kv[s]
-            if "prefix_k" in orig_s and "prefix_v" in orig_s:
-              entry["prefix_k"] = orig_s["prefix_k"]
-              entry["prefix_v"] = orig_s["prefix_v"]
-            updated_origin_kv_list.append(entry)
-          updated_origin_kv = tuple(updated_origin_kv_list)
+          updated_origin_kv = tuple(
+              jax.tree.map(
+                  lambda n, o: jnp.where(origin_slice[s], n, o),
+                  new_group_cache[s],
+                  origin_kv[s],
+              )
+              for s in range(pattern_len)
+          )
           return (x, updated_origin_kv), out_cache
         else:
           return x, out_cache
@@ -3292,15 +3257,7 @@ class Gemma4(BackendMappingMixin, nnx.Module):
         ) -> LayerCache | None:
           if c_s is None:
             return None
-          sliced: LayerCache = {
-              "k": c_s["k"][start:end],
-              "v": c_s["v"][start:end],
-              "end_index": c_s["end_index"][start:end],
-          }
-          if "prefix_k" in c_s and "prefix_v" in c_s:
-            sliced["prefix_k"] = c_s["prefix_k"][start:end]
-            sliced["prefix_v"] = c_s["prefix_v"][start:end]
-          return sliced
+          return jax.tree.map(lambda v: v[start:end], c_s)
 
         unshared_scan_cache: tuple[LayerCache | None, ...] = tuple(
             _slice_scan_cache(c_s, 0, self.num_unshared_groups)
@@ -3373,26 +3330,9 @@ class Gemma4(BackendMappingMixin, nnx.Module):
         def _concat_scan_caches(
             unshared: LayerCache, shared: LayerCache
         ) -> LayerCache:
-          merged: LayerCache = {
-              "k": jnp.concatenate([unshared["k"], shared["k"]], axis=0),
-              "v": jnp.concatenate([unshared["v"], shared["v"]], axis=0),
-              "end_index": jnp.concatenate(
-                  [unshared["end_index"], shared["end_index"]], axis=0
-              ),
-          }
-          if (
-              "prefix_k" in unshared
-              and "prefix_v" in unshared
-              and "prefix_k" in shared
-              and "prefix_v" in shared
-          ):
-            merged["prefix_k"] = jnp.concatenate(
-                [unshared["prefix_k"], shared["prefix_k"]], axis=0
-            )
-            merged["prefix_v"] = jnp.concatenate(
-                [unshared["prefix_v"], shared["prefix_v"]], axis=0
-            )
-          return merged
+          return jax.tree.map(
+              lambda u, s: jnp.concatenate([u, s], axis=0), unshared, shared
+          )
 
         updated_scan_cache: StackedCache = tuple(
             _concat_scan_caches(unshared_out_cache[s], shared_out_cache[s])
@@ -3410,15 +3350,8 @@ class Gemma4(BackendMappingMixin, nnx.Module):
           group_idx = i // pattern_len
           sub_idx = i % pattern_len
           c = updated_scan_cache[sub_idx]
-          layer_c: LayerCache = {
-              "k": c["k"][group_idx],
-              "v": c["v"][group_idx],
-              "end_index": c["end_index"][group_idx],
-          }
-          if "prefix_k" in c and "prefix_v" in c:
-            layer_c["prefix_k"] = c["prefix_k"][group_idx]
-            layer_c["prefix_v"] = c["prefix_v"][group_idx]
-          new_cache[f"layer_{i}"] = layer_c
+          if c is not None:
+            new_cache[f"layer_{i}"] = jax.tree.map(lambda x: x[group_idx], c)
         out_cache = new_cache
       return x, out_cache
 
