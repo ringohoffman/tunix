@@ -896,32 +896,49 @@ def _pad_or_truncate(
     x: jaxtyping.Array,
     target_len: int,
     truncation_side: str = "left",
+    padding_side: str = "left",
+    axis: int = 1,
 ) -> jaxtyping.Array:
-  """Pad or truncate ``x`` along axis 1 to ``target_len``.
+  """Pad or truncate ``x`` along ``axis`` to ``target_len``.
 
   Args:
-    x: Tensor of shape ``[B, S, ...]``.
-    target_len: Desired length along axis 1.
-    truncation_side: Which side to truncate when ``x.shape[1] > target_len``.  *
-      ``"left"`` (default): discard leading (oldest) positions. * ``"right"``:
-      discard trailing (newest) positions.  When padding (``x.shape[1] <
-      target_len``), zeros are prepended on the left regardless of
-      ``truncation_side``.
+    x: Input tensor.
+    target_len: Desired length along ``axis``.
+    truncation_side: Which side to truncate when ``x.shape[axis] > target_len``.
+      * ``"left"`` (default): discard leading (oldest) positions. * ``"right"``:
+      discard trailing (newest) positions.
+    padding_side: Which side to pad when ``x.shape[axis] < target_len``. *
+      ``"left"`` (default): prepend zeros before index 0. * ``"right"``: append
+      zeros after the last index.
+    axis: Axis along which to pad or truncate (default 1).
 
   Returns:
-    ``x`` with ``shape[1] == target_len``.
+    ``x`` with ``shape[axis] == target_len``.
   """
-  src_len = x.shape[1]
+  src_len = x.shape[axis]
   if src_len == target_len:
     return x
   if src_len > target_len:
-    if truncation_side == "right":
-      return x[:, :target_len]
-    return x[:, -target_len:]
-  # src_len < target_len → zero-pad on the left.
+    if axis == 1:
+      if truncation_side == "right":
+        return x[:, :target_len]
+      return x[:, -target_len:]
+    elif axis == 2:
+      if truncation_side == "right":
+        return x[:, :, :target_len]
+      return x[:, :, -target_len:]
+    else:
+      slc = (
+          slice(None, target_len)
+          if truncation_side == "right"
+          else slice(-target_len, None)
+      )
+      return jax.lax.slice_in_dim(
+          x, slc.start or 0, slc.stop or src_len, axis=axis
+      )
   pad_len = target_len - src_len
   pad_width = [(0, 0)] * x.ndim
-  pad_width[1] = (pad_len, 0)
+  pad_width[axis] = (0, pad_len) if padding_side == "right" else (pad_len, 0)
   return jnp.pad(x, pad_width)
 
 
@@ -1401,8 +1418,16 @@ class Attention(nnx.Module):
         key_proj_t = jnp.concatenate([pfx_k_t, key_proj_t], axis=2)
         value_proj_t = jnp.concatenate([pfx_v_t, value_proj_t], axis=2)
         pfx_offset = pfx_len_for_flash
-
       kv_len = key_proj_t.shape[2]
+      target_kv_len = int(np.ceil(kv_len / _block_sz)) * _block_sz
+      if target_kv_len != kv_len:
+        key_proj_t = _pad_or_truncate(
+            key_proj_t, target_kv_len, padding_side="right", axis=2
+        )
+        value_proj_t = _pad_or_truncate(
+            value_proj_t, target_kv_len, padding_side="right", axis=2
+        )
+        kv_len = target_kv_len
 
       mesh = shd.get_abstract_mesh()
       if self.attn_type == AttentionType.LOCAL_SLIDING:

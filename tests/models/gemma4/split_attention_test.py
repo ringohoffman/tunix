@@ -13,6 +13,8 @@ from absl.testing import absltest
 from absl.testing import parameterized
 from flax import nnx
 import jax
+from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask as mask_lib
+from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask_info
 import jax.numpy as jnp
 import numpy as np
 from tunix.generate import functional
@@ -808,6 +810,52 @@ class BridgeFlashAttentionTest(absltest.TestCase):
           prefix_cache=pfx,
       )
     self.assertEqual(out.tokens.shape, (2, 1))
+
+  def test_bridge_flash_tpu_mask_divisibility(self):
+    """Verify bridge+flash Flash Attention mask satisfies TPU Pallas block divisibility."""
+    # Production dimensions: prefix 1024, suffix 2212, block_size 1024
+    block_sz = 1024
+    pfx_len = 1024
+    sfx_len = 2212
+    bridge_len = sfx_len % block_sz  # 164
+    flash_q_len = sfx_len - bridge_len  # 2048
+    pfx_offset = pfx_len + bridge_len  # 1188
+
+    # 1. Unpadded KV length is pfx_len + sfx_len = 3236
+    unpadded_kv_len = pfx_len + sfx_len
+    unpadded_mask = mask_lib.MultiHeadMask([
+        mask_lib.CausalMask((flash_q_len, unpadded_kv_len), offset=pfx_offset)
+        for _ in range(4)
+    ])
+    # TPU Pallas _process_mask MUST reject unpadded KV (3236 % 1024 != 0)
+    with self.assertRaisesRegex(
+        ValueError, "kv_block_size=1024 should divide kv_seq_len=3236"
+    ):
+      splash_attention_mask_info._process_mask(
+          unpadded_mask,
+          block_shape=(block_sz, block_sz),
+          is_dkv=False,
+          q_seq_shards=1,
+          head_shards=1,
+      )
+
+    # 2. Padded KV length: padded to next multiple of block_sz = 4096
+    kv_pad = (block_sz - (unpadded_kv_len % block_sz)) % block_sz
+    padded_kv_len = unpadded_kv_len + kv_pad
+    self.assertEqual(padded_kv_len, 4096)
+    padded_mask = mask_lib.MultiHeadMask([
+        mask_lib.CausalMask((flash_q_len, padded_kv_len), offset=pfx_offset)
+        for _ in range(4)
+    ])
+    # TPU Pallas _process_mask MUST accept padded KV (4096 % 1024 == 0)
+    mask_info, _ = splash_attention_mask_info._process_mask(
+        padded_mask,
+        block_shape=(block_sz, block_sz),
+        is_dkv=False,
+        q_seq_shards=1,
+        head_shards=1,
+    )
+    self.assertIsNotNone(mask_info)
 
 
 if __name__ == "__main__":
