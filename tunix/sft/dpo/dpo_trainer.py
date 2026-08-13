@@ -26,17 +26,15 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+
 # TODO(abheesht): We should move TokenizerAdapter outside `generate`.
 from tunix.generate import tokenizer_adapter
 from tunix.rl import common
 from tunix.sft import peft_trainer
 from typing_extensions import override
 
-
 RawImageType = (
-    str
-    | np.ndarray
-    | list[str | np.ndarray | list[str | np.ndarray] | None]
+    str | np.ndarray | list[str | np.ndarray | list[str | np.ndarray] | None]
 )
 
 
@@ -195,9 +193,12 @@ class DPOTrainer(peft_trainer.PeftTrainer):
     """
     self.model = model
     self.ref_model = ref_model
-    self.dpo_config = training_config
-    self.algorithm = training_config.algorithm
-    super().__init__(model, optimizer, training_config)
+    super().__init__(
+        model=model,
+        optimizer=optimizer,
+        training_config=training_config,
+        loss_fn=dpo_loss_fn,
+    )
 
     self.tokenizer = (
         None
@@ -205,8 +206,6 @@ class DPOTrainer(peft_trainer.PeftTrainer):
         else tokenizer_adapter.TokenizerAdapter(tokenizer)
     )
     self.image_processor = image_processor
-
-    self.with_loss_fn(dpo_loss_fn, has_aux=True)
 
     if self.algorithm == "orpo":
       self.with_gen_model_input_fn(
@@ -318,11 +317,11 @@ class DPOTrainer(peft_trainer.PeftTrainer):
     # Duplicate images as well (for multimodal inputs only).
     images = training_input.images
     if images is not None:
-        images = jnp.concatenate([images, images], axis=0)
+      images = jnp.concatenate([images, images], axis=0)
 
     if hasattr(self.model, "get_attention_mask"):
       attention_mask = self.model.get_attention_mask(
-        input_ids, inputs_mask=mask
+          input_ids, inputs_mask=mask
       )
     else:
       attention_mask = common.make_causal_attn_mask(mask)
@@ -524,7 +523,7 @@ def _tokenize(input_string: str, tokenizer: Any) -> jax.Array:
   input_ids = tokenizer.encode(input_string)
   bos_tok = [tokenizer.bos_id()] if tokenizer.bos_id() else []
   input_ids = jnp.array(
-    tokenizer.dedup_bos_ids(bos_tok + input_ids), dtype=jnp.int32
+      tokenizer.dedup_bos_ids(bos_tok + input_ids), dtype=jnp.int32
   )
   return input_ids
 
@@ -550,11 +549,13 @@ def _preprocess_dict(
         for field in tokenized_input_fields
     })
   elif all(
-    field in training_input for field in data_input_fields if field != "images"
+      field in training_input
+      for field in data_input_fields
+      if field != "images"
   ):
-    return DataInput(
-        **{field: training_input.get(field, None) for field in data_input_fields}
-    )
+    return DataInput(**{
+        field: training_input.get(field, None) for field in data_input_fields
+    })
   else:
     raise ValueError(
         "Training input must contain either tokenized fields "
@@ -583,9 +584,9 @@ def process_dpo_record(
   Args:
       record: A dictionary, containing "prompts", "images", "chosen_responses",
         "rejected_responses" as keys. For text fields, the values can be a
-        single string, or a list of strings. For `"images"`, the fields can be
-        a path (str), a NumPy array, list of paths, list of arrays, list of
-        lists of paths/arrays, or just None.
+        single string, or a list of strings. For `"images"`, the fields can be a
+        path (str), a NumPy array, list of paths, list of arrays, list of lists
+        of paths/arrays, or just None.
       tokenizer: The tokenizer or processor to use for converting text into
         token IDs.
       max_prompt_length: The maximum length for the tokenized prompts. Any

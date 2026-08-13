@@ -32,7 +32,6 @@ from tunix.rl import function_registry
 from tunix.rl import rl_cluster as rl_cluster_lib
 from tunix.rl import rl_learner
 
-
 TrainingInputT = rl_learner.TrainingInputT
 RewardFn = rl_learner.RewardFn
 MetricFn = rl_learner.MetricFn
@@ -188,7 +187,8 @@ class PPOLearner(rl_learner.RLLearner[PPOConfig]):
     policy_loss_fn = registry.get(
         "policy_loss_fn", self.algo_config.policy_loss_fn
     )
-    self.rl_cluster.actor_trainer.with_loss_fn(policy_loss_fn, has_aux=True)
+    self.rl_cluster.actor_trainer.loss_fn = policy_loss_fn
+    self.rl_cluster.actor_trainer.eval_loss_fn = policy_loss_fn
     self.rl_cluster.actor_trainer.with_gen_model_input_fn(
         lambda x: {
             "train_example": x,
@@ -202,7 +202,8 @@ class PPOLearner(rl_learner.RLLearner[PPOConfig]):
     value_loss_fn = registry.get(
         "value_loss_fn", self.algo_config.value_loss_fn
     )
-    self.rl_cluster.critic_trainer.with_loss_fn(value_loss_fn, has_aux=True)
+    self.rl_cluster.critic_trainer.loss_fn = value_loss_fn
+    self.rl_cluster.critic_trainer.eval_loss_fn = value_loss_fn
     self.rl_cluster.critic_trainer.with_gen_model_input_fn(
         lambda x: {
             "train_example": x,

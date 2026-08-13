@@ -13,6 +13,7 @@
 # limitations under the License.
 
 """Distillation trainer."""
+
 import dataclasses
 from typing import Any, Callable
 
@@ -61,15 +62,15 @@ class DistillationTrainer(peft_trainer.PeftTrainer):
     student_model, teacher_model = strategy.pre_process_models(
         student_model, teacher_model
     )
-    super().__init__(student_model, optimizer, training_config)
+    super().__init__(
+        model=student_model,
+        optimizer=optimizer,
+        training_config=training_config,
+        loss_fn=self.get_train_loss,
+        eval_loss_fn=self.get_eval_loss,
+    )
     self.strategy = strategy
     self.teacher_model = teacher_model
-    self.loss_fn = self.get_train_loss
-    self.eval_loss_fn = self.get_eval_loss
-
-    # Since distillation strategies return (loss, metrics),
-    # we explicitly enable auxiliary metric handling.
-    self._has_aux = True
 
     self.gen_model_input_fn = lambda x: {
         "inputs": {"input_tokens": x.input_tokens, "input_mask": x.input_mask},
@@ -89,17 +90,6 @@ class DistillationTrainer(peft_trainer.PeftTrainer):
         ),
     }
     return self
-
-  @override
-  def with_loss_fn(
-      self,
-      loss_fn: Callable[..., ArrayLike | tuple[ArrayLike, Any]],
-      has_aux: bool = False,
-  ) -> "DistillationTrainer":
-    raise NotImplementedError(
-        "with_loss_fn is not supported for distillation. Use the strategy to"
-        " define the loss."
-    )
 
   @override
   def _prepare_inputs(self, input_data: TrainingInput) -> TrainingInput:
@@ -144,20 +134,20 @@ class DistillationTrainer(peft_trainer.PeftTrainer):
   def get_train_loss(
       self,
       model: nnx.Module,
-      teacher_output: Any,
-      inputs: dict[str, ArrayLike],
+      inputs: Any,
   ) -> tuple[ArrayLike, dict[str, Any]]:
-    output = self.strategy.get_train_loss(model, teacher_output, inputs)
+    input_dict = self.gen_model_input_fn(inputs)["inputs"]
+    teacher_output = getattr(inputs, "teacher_output", None)
+    output = self.strategy.get_train_loss(model, teacher_output, input_dict)
     return self._standardize_loss_output(output)
 
   def get_eval_loss(
       self,
       model: nnx.Module,
-      teacher_output: Any,
-      inputs: dict[str, ArrayLike],
+      inputs: Any,
   ) -> tuple[ArrayLike, dict[str, Any]]:
-    del teacher_output  # Not computed in eval.
-    output = self.strategy.get_eval_loss(model, inputs)
+    input_dict = self.gen_model_input_fn(inputs)["inputs"]
+    output = self.strategy.get_eval_loss(model, input_dict)
     return self._standardize_loss_output(output)
 
   def close(self):

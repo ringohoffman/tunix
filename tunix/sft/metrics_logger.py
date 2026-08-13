@@ -245,6 +245,8 @@ class MetricsLogger:
         internal storage keyed by ``(prefix, mode, metric_name)`` for progress
         bar compatibility.
     """
+    if isinstance(scalar_value, jax.Array):
+      scalar_value = np.asarray(scalar_value)
     self._metrics[metrics_prefix][mode][metric_name].append(scalar_value)
 
     if formatted_name is None:

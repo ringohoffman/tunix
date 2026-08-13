@@ -251,8 +251,7 @@ class PeftTrainer(Generic[ModuleT]):
 
   Lifecycle::
 
-      trainer = PeftTrainer(model, optimizer, config)
-      trainer = trainer.with_loss_fn(my_loss_fn, has_aux=True)
+      trainer = PeftTrainer(model, optimizer, config, loss_fn=my_loss_fn)
       trainer.compile()          # JIT-compile train/eval kernels
       trainer.train(train_ds)    # runs the loop (calls compile() if needed)
 
@@ -288,6 +287,8 @@ class PeftTrainer(Generic[ModuleT]):
       model: ModuleT,
       optimizer: optax.GradientTransformation,
       training_config: TrainingConfig,
+      loss_fn: Callable[..., Any] | None = None,
+      eval_loss_fn: Callable[..., Any] | None = None,
       metrics_logger: MetricsLogger | None = None,
       perf_tracer: perf_trace.Tracer | None = None,
       perf_tracer_v2: perf_tracer_lib.Tracer | None = None,
@@ -317,8 +318,10 @@ class PeftTrainer(Generic[ModuleT]):
 
     self.optimizer = nnx.Optimizer(self.model, gradient_transform, wrt=wrt)
 
-    self.loss_fn: Callable[..., Any] = _default_loss_fn
-    self.eval_loss_fn: Callable[..., Any] = _default_loss_fn
+    self.loss_fn: Callable[..., Any] | None = loss_fn
+    self.eval_loss_fn: Callable[..., Any] | None = (
+        eval_loss_fn if eval_loss_fn is not None else loss_fn
+    )
     self.checkpoint_manager = checkpoint_manager.CheckpointManager(
         root_directory=self.config.checkpoint_root_directory,
         options=self.config.checkpointing_options,
@@ -345,7 +348,6 @@ class PeftTrainer(Generic[ModuleT]):
         max_inflight=training_config.max_inflight_computations
     )
     self._mode: sft_metrics_logger.Mode = sft_metrics_logger.Mode.TRAIN
-    self._has_aux = False
     self._pbar = None
 
     self._train_steps, self._restored_custom_metadata = (
@@ -417,17 +419,6 @@ class PeftTrainer(Generic[ModuleT]):
         attr.reset()
     self._compiled = False
 
-  def with_loss_fn(
-      self,
-      loss_fn: Callable[..., Any],
-      has_aux: bool = False,
-  ) -> PeftTrainer[ModuleT]:
-    self.clear_jit_cache()
-    self.loss_fn = loss_fn
-    self.eval_loss_fn = loss_fn
-    self._has_aux = has_aux
-    return self
-
   def _train_step_impl(
       self, model: ModuleT, optimizer: nnx.Optimizer[Any], inputs: Any
   ) -> tuple[Loss, Aux, GradNorm]:
@@ -441,25 +432,37 @@ class PeftTrainer(Generic[ModuleT]):
     Returns:
       A tuple of (loss, aux_or_None, grad_norm).
     """
+    if (loss_fn := self.loss_fn) is None:
+      raise ValueError(
+          "loss_fn must be provided before training. Pass loss_fn to"
+          " PeftTrainer.__init__."
+      )
+
+    def _wrapped_loss_fn(m: ModuleT, inp: Any) -> tuple[Loss, Aux]:
+      out = loss_fn(m, inp)
+      if isinstance(out, tuple) and len(out) == 2:
+        return out[0], out[1]
+      return out, None
+
     grad_fn = nnx.value_and_grad(
-        self.loss_fn,
+        _wrapped_loss_fn,
         argnums=nnx.DiffState(0, nnx.LoRAParam) if self._lora_enabled else 0,
-        has_aux=self._has_aux,
+        has_aux=True,
     )
-    out, grads = grad_fn(model, inputs)
+    (loss, aux), grads = grad_fn(model, inputs)
     grad_norm = optax.global_norm(grads)
     optimizer.update(model, grads)
-    if self._has_aux:
-      loss, aux = out
-      return loss, aux, grad_norm
-    else:
-      return out, None, grad_norm
+    return loss, aux, grad_norm
 
   def _eval_step_impl(self, model: ModuleT, inputs: Any) -> tuple[Loss, Aux]:
-    out = self.eval_loss_fn(model, inputs)
-    if self._has_aux:
-      loss, aux = out
-      return loss, aux
+    if (eval_loss_fn := self.eval_loss_fn) is None:
+      raise ValueError(
+          "eval_loss_fn must be provided before evaluating. Pass eval_loss_fn"
+          " to PeftTrainer.__init__."
+      )
+    out = eval_loss_fn(model, inputs)
+    if isinstance(out, tuple) and len(out) == 2:
+      return out[0], out[1]
     return out, None
 
   def _shard_optimizer(self, mesh: jax.sharding.Mesh | None = None) -> None:
@@ -470,9 +473,9 @@ class PeftTrainer(Generic[ModuleT]):
     Args:
       mesh: The mesh used for sharding.
     """
-    if mesh is None or mesh.empty:
+    if mesh is None:
       mesh = jax.sharding.get_mesh()
-    if mesh.empty:
+    if mesh is None or mesh.empty:
       return
     optimizer_state = nnx.state(self.optimizer, nnx.optimizer.OptState)
 
@@ -783,12 +786,22 @@ class PeftTrainer(Generic[ModuleT]):
   ) -> None:
     """Runs evaluation loop."""
     logging.info("Running evaluation on train step %d.", self._train_steps)
-    eval_iterator = iter(eval_ds)
     with self._switch_mode(sft_metrics_logger.Mode.EVAL):
-      eval_loss: float | jax.Array = 0
-      eval_steps = 0
       for hook in self.training_hooks:
         hook.on_eval_start(self)
+
+      if self.eval_loss_fn is None:
+        logging.info(
+            "No eval_loss_fn configured on trainer; skipping loss evaluation on"
+            " eval_ds."
+        )
+        for hook in self.training_hooks:
+          hook.on_eval_end(self, jnp.asarray(0.0))
+        return
+
+      eval_iterator = iter(eval_ds)
+      eval_loss: float | jax.Array = 0
+      eval_steps = 0
       while True:
         if self.data_hooks:
           eval_example = self.data_hooks.load_next_eval_batch(self)
@@ -827,35 +840,3 @@ class PeftTrainer(Generic[ModuleT]):
       )
       for hook in self.training_hooks:
         hook.on_eval_end(self, jnp.asarray(eval_loss))
-
-
-def _default_loss_fn(
-    model: nnx.Module,
-    input_tokens: jax.Array,
-    input_mask: jax.Array,
-    positions: jax.Array,
-    attention_mask: jax.Array,
-    images: jax.Array | None = None,
-) -> jax.Array:
-  """Default loss function for PEFT training."""
-  # Weird kwargs workaround because not all models support `images` right now.
-  kwargs = {} if images is None else {"images": images}
-  logits, _ = model(input_tokens, positions, None, attention_mask, **kwargs)
-
-  # Exclude the last step as it does not appear in the targets.
-  logits = logits[:, :-1, :]
-  target_tokens = input_tokens[:, 1:]
-  target_mask = input_mask[:, 1:]
-
-  # Convert the target labels to one-hot encoded vectors.
-  one_hot = jax.nn.one_hot(target_tokens, logits.shape[-1])
-
-  # Don't update on unwanted tokens.
-  one_hot = one_hot * target_mask.astype(one_hot.dtype)[..., None]
-
-  # Define the normalization factor.
-  norm_factor = 1 / (jnp.sum(target_mask) + 1e-8)
-
-  # Return the negative log likelihood (NLL) loss.
-  # Equivalent to: optax.softmax_cross_entropy(logits, one_hot).mean()
-  return -jnp.sum(jax.nn.log_softmax(logits) * one_hot) * norm_factor

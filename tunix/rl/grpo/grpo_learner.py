@@ -184,10 +184,8 @@ class GRPOLearner(rl_learner.RLLearner[TGrpoConfig]):
         eos_id=self.rl_cluster.rollout.eos_id(),
     )
 
-    self.rl_cluster.actor_trainer.with_loss_fn(
-        loss_fn,
-        has_aux=True,
-    )
+    self.rl_cluster.actor_trainer.loss_fn = loss_fn
+    self.rl_cluster.actor_trainer.eval_loss_fn = loss_fn
     self.rl_cluster.actor_trainer.with_gen_model_input_fn(
         lambda x: {
             "train_example": x,

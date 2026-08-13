@@ -26,7 +26,6 @@ from tunix.distillation import distillation_trainer
 from tunix.distillation import strategies
 from tunix.tests import test_common as tc
 
-
 os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=4'
 _VOCAB_SIZE = 256
 
@@ -121,25 +120,6 @@ class DistillationTrainerTest(absltest.TestCase):
   def setUp(self):
     super().setUp()
     self.eval_ds = self.train_ds = dummy_datasets(batch_size=4)
-
-  def test_with_loss_fn_raises_exception(self):
-    student_rngs = nnx.Rngs(0)
-    teacher_rngs = nnx.Rngs(1)
-    student_model = tc.ToyTransformer(
-        config=tc.ModelConfig(vocab_size=_VOCAB_SIZE), rngs=student_rngs
-    )
-    teacher_model = tc.ToyTransformer(
-        config=tc.ModelConfig(vocab_size=_VOCAB_SIZE), rngs=teacher_rngs
-    )
-    strategy = get_toy_logit_strategy()
-    config = distillation_trainer.TrainingConfig(
-        eval_every_n_steps=2, max_steps=100
-    )
-
-    with self.assertRaises(NotImplementedError):
-      distillation_trainer.DistillationTrainer(
-          student_model, teacher_model, strategy, optax.sgd(1e-3), config
-      ).with_loss_fn(lambda a, b: 0.0)
 
   def test_basic_training(self):
     student_rngs = nnx.Rngs(0)
