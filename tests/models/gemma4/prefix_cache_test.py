@@ -89,7 +89,7 @@ class Gemma4PrefixCacheTest(parameterized.TestCase):
           prompt,
           max_new_tokens=max_new_tokens,
           pad_id=0,
-          eos_id=1,
+          eos_ids=1,
           cache_size=cache_size,
           temperature=0.0,
       )
@@ -120,7 +120,7 @@ class Gemma4PrefixCacheTest(parameterized.TestCase):
           prefix_cache=pfx_c,
           max_new_tokens=max_new_tokens,
           pad_id=0,
-          eos_id=1,
+          eos_ids=1,
           cache_size=cache_size,
           temperature=0.0,
       )
@@ -231,7 +231,7 @@ class Gemma4PrefixCacheTest(parameterized.TestCase):
           prompt,
           max_new_tokens=max_new_tokens,
           pad_id=0,
-          eos_id=1,
+          eos_ids=1,
           cache_size=cache_size,
           temperature=0.0,
       )
@@ -262,7 +262,7 @@ class Gemma4PrefixCacheTest(parameterized.TestCase):
           prefix_cache=pfx_c,
           max_new_tokens=max_new_tokens,
           pad_id=0,
-          eos_id=1,
+          eos_ids=1,
           cache_size=cache_size,
           temperature=0.0,
       )
@@ -314,7 +314,7 @@ class Gemma4PrefixCacheTest(parameterized.TestCase):
           prompt,
           max_new_tokens=max_new_tokens,
           pad_id=pad_id,
-          eos_id=1,
+          eos_ids=1,
           cache_size=cache_size,
           temperature=0.0,
       )
@@ -343,7 +343,7 @@ class Gemma4PrefixCacheTest(parameterized.TestCase):
           prefix_cache=pfx_c,
           max_new_tokens=max_new_tokens,
           pad_id=pad_id,
-          eos_id=1,
+          eos_ids=1,
           cache_size=cache_size,
           temperature=0.0,
       )
@@ -396,7 +396,7 @@ class Gemma4PrefixCacheTest(parameterized.TestCase):
           prompt,
           max_new_tokens=max_new_tokens,
           pad_id=0,
-          eos_id=1,
+          eos_ids=1,
           cache_size=cache_size,
           temperature=0.0,
           return_logits=True,
@@ -425,7 +425,7 @@ class Gemma4PrefixCacheTest(parameterized.TestCase):
           prefix_cache=pfx_c,
           max_new_tokens=max_new_tokens,
           pad_id=0,
-          eos_id=1,
+          eos_ids=1,
           cache_size=cache_size,
           temperature=0.0,
           return_logits=True,
@@ -487,7 +487,7 @@ class Gemma4PrefixCacheTest(parameterized.TestCase):
           prompt,
           max_new_tokens=max_new_tokens,
           pad_id=0,
-          eos_id=1,
+          eos_ids=1,
           cache_size=cache_size,
           temperature=0.0,
       )
@@ -516,7 +516,7 @@ class Gemma4PrefixCacheTest(parameterized.TestCase):
           prefix_cache=pfx_c,
           max_new_tokens=max_new_tokens,
           pad_id=0,
-          eos_id=1,
+          eos_ids=1,
           cache_size=cache_size,
           temperature=0.0,
       )
