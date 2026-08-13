@@ -11,8 +11,12 @@ import functools
 
 from absl.testing import absltest
 from absl.testing import parameterized
+from flax import nnx
 import jax
 import jax.numpy as jnp
+import numpy as np
+from tunix.generate import functional
+from tunix.models.gemma4 import model as gemma4_model
 
 
 def split_attention(
@@ -649,6 +653,161 @@ class GradientTest(absltest.TestCase):
 
     max_diff = float(jnp.max(jnp.abs(split_grad - mono_grad)))
     self.assertLess(max_diff, 1e-4, f"Gradient max diff: {max_diff:.8f}")
+
+
+class BridgeFlashAttentionTest(absltest.TestCase):
+  """Verify bridge+flash path matches dense attention for unaligned suffixes.
+
+  When a prefix cache is present and the suffix length is NOT a multiple
+  of flash_attention_block_size, the model should use the bridge+flash
+  path: dense attention for the first (suffix_len % block_size) tokens,
+  then Splash Attention for the aligned remainder.
+  """
+
+  def _make_model(self, *, use_flash: bool, sliding_window: int | None = None):
+    config = gemma4_model.ModelConfig.gemma4_e2b()
+    config.num_layers = 1
+    config.embed_dim = 128
+    config.hidden_dim = 256
+    config.num_heads = 4
+    config.head_dim = 32
+    config.num_kv_heads = 2
+    config.frac_shared_layers = 0.0
+    config.use_flash_attention = use_flash
+    config.flash_attention_block_size = 128
+    config.shd_config = gemma4_model.ShardingConfig.no_shard()
+    if sliding_window is not None:
+      config.sliding_window_size = sliding_window
+    rngs = nnx.Rngs(42)
+    mesh = jax.sharding.Mesh(
+        np.array(jax.devices()[:1]).reshape((1,)), ("batch",)
+    )
+    model = gemma4_model.Gemma4(config, rngs=rngs)
+    return model, config, mesh
+
+  def test_bridge_flash_matches_dense_global(self):
+    """Bridge+flash with global attention matches dense reference."""
+    model_flash, config, mesh = self._make_model(use_flash=True)
+    model_dense, _, _ = self._make_model(use_flash=False)
+
+    # Copy weights from flash model to dense model
+    flash_state = model_flash.__getstate__()
+    model_dense.__setstate__(flash_state)
+
+    # Prefix: 100 tokens (NOT aligned to block_size=128)
+    prefix_ids = jax.random.randint(
+        jax.random.key(1), (100,), 1, config.num_embed
+    )
+    cache_size = 512
+
+    with jax.set_mesh(mesh):
+      pfx_flash = functional.prefill_prefix(model_flash, prefix_ids, cache_size)
+      pfx_dense = functional.prefill_prefix(model_dense, prefix_ids, cache_size)
+
+      # Suffix: 180 tokens (total 100+180=280, suffix NOT aligned)
+      suffix = jax.random.randint(
+          jax.random.key(2), (2, 180), 1, config.num_embed
+      )
+
+      out_flash = functional.generate(
+          model_flash,
+          suffix,
+          max_new_tokens=1,
+          pad_id=0,
+          eos_ids=99999,
+          cache_size=cache_size,
+          prefix_cache=pfx_flash,
+      )
+      out_dense = functional.generate(
+          model_dense,
+          suffix,
+          max_new_tokens=1,
+          pad_id=0,
+          eos_ids=99999,
+          cache_size=cache_size,
+          prefix_cache=pfx_dense,
+      )
+
+    # Compare generated tokens (shape is [batch, max_new_tokens] = [2, 1])
+    self.assertEqual(out_flash.tokens.shape, (2, 1))
+    self.assertEqual(out_dense.tokens.shape, (2, 1))
+    np.testing.assert_array_equal(out_flash.tokens, out_dense.tokens)
+
+  def test_bridge_flash_matches_dense_local_sliding(self):
+    """Bridge+flash with sliding window attention matches dense reference."""
+    model_flash, config, mesh = self._make_model(
+        use_flash=True, sliding_window=64
+    )
+    model_dense, _, _ = self._make_model(use_flash=False, sliding_window=64)
+
+    # Copy weights from flash model to dense model
+    flash_state = model_flash.__getstate__()
+    model_dense.__setstate__(flash_state)
+
+    prefix_ids = jax.random.randint(
+        jax.random.key(1), (100,), 1, config.num_embed
+    )
+    cache_size = 512
+
+    with jax.set_mesh(mesh):
+      pfx_flash = functional.prefill_prefix(model_flash, prefix_ids, cache_size)
+      pfx_dense = functional.prefill_prefix(model_dense, prefix_ids, cache_size)
+
+      suffix = jax.random.randint(
+          jax.random.key(2), (2, 180), 1, config.num_embed
+      )
+
+      out_flash = functional.generate(
+          model_flash,
+          suffix,
+          max_new_tokens=1,
+          pad_id=0,
+          eos_ids=99999,
+          cache_size=cache_size,
+          prefix_cache=pfx_flash,
+      )
+      out_dense = functional.generate(
+          model_dense,
+          suffix,
+          max_new_tokens=1,
+          pad_id=0,
+          eos_ids=99999,
+          cache_size=cache_size,
+          prefix_cache=pfx_dense,
+      )
+
+    self.assertEqual(out_flash.tokens.shape, (2, 1))
+    self.assertEqual(out_dense.tokens.shape, (2, 1))
+    np.testing.assert_array_equal(out_flash.tokens, out_dense.tokens)
+
+  def test_bridge_flash_aligned_suffix_no_bridge(self):
+    """When suffix is already aligned, no bridge is needed — pure Flash."""
+    model, config, mesh = self._make_model(use_flash=True)
+
+    # Prefix: 128 tokens (aligned to block_size=128)
+    prefix_ids = jax.random.randint(
+        jax.random.key(1), (128,), 1, config.num_embed
+    )
+    cache_size = 512
+
+    with jax.set_mesh(mesh):
+      pfx = functional.prefill_prefix(model, prefix_ids, cache_size)
+
+      # Suffix: 128 tokens (aligned) — should use pure Flash, no bridge
+      suffix = jax.random.randint(
+          jax.random.key(2), (2, 128), 1, config.num_embed
+      )
+
+      out = functional.generate(
+          model,
+          suffix,
+          max_new_tokens=1,
+          pad_id=0,
+          eos_ids=99999,
+          cache_size=cache_size,
+          prefix_cache=pfx,
+      )
+    self.assertEqual(out.tokens.shape, (2, 1))
 
 
 if __name__ == "__main__":

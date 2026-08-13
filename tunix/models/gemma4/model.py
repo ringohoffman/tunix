@@ -1143,11 +1143,19 @@ class Attention(nnx.Module):
         # Only expand K/V to full cache for standard attention.  When flash
         # attention will handle this prefill, K/V must stay at the original
         # [B, seq_len, H, D] shape so Q and KV dimensions match for
-        # self-attention.
-        if not (
-            self.config.use_flash_attention
-            and seq_len % self.config.flash_attention_block_size == 0
-        ):
+        # self-attention.  Also skip expansion when a prefix cache is present
+        # and Flash attention is enabled — the bridge+flash path needs the
+        # original shape too.
+        _has_pfx_cache = "prefix_k" in cache and "prefix_v" in cache
+        _can_use_flash = self.config.use_flash_attention and (
+            seq_len % self.config.flash_attention_block_size == 0
+            or (
+                _has_pfx_cache
+                and (seq_len - seq_len % self.config.flash_attention_block_size)
+                > 0
+            )
+        )
+        if not _can_use_flash:
           value_proj = cache_v
           key_proj = cache_k
       else:  # decode (seq_len == 1)
@@ -1228,38 +1236,195 @@ class Attention(nnx.Module):
           new_cache["prefix_k"] = cache["prefix_k"]
           new_cache["prefix_v"] = cache["prefix_v"]
 
-    if (
-        self.config.use_flash_attention
+    # --- Detect prefix KV in cache ---
+    _pfx_cache = (
+        cache
+        if cache is not None
+        else (kv_override if kv_override is not None else kv_shared_cache)
+    )
+    _pfx_k = (
+        _pfx_cache.get("prefix_k") if isinstance(_pfx_cache, dict) else None
+    )
+    _pfx_v = (
+        _pfx_cache.get("prefix_v") if isinstance(_pfx_cache, dict) else None
+    )
+    _has_prefix = (
+        _pfx_k is not None and _pfx_v is not None and _pfx_k.shape[1] > 0
+    )
+    _block_sz = self.config.flash_attention_block_size
+
+    # Determine Flash eligibility.  With a prefix cache, the bridge+flash
+    # path can handle unaligned suffix lengths by processing the first
+    # (seq_len % block_size) tokens with dense attention and the aligned
+    # remainder with Splash Attention.
+    _sfx_aligned = seq_len > 1 and seq_len % _block_sz == 0
+    _bridge_len = (
+        seq_len % _block_sz
+        if _has_prefix and self.config.use_flash_attention and seq_len > 1
+        else 0
+    )
+    _remaining = seq_len - _bridge_len
+    _can_bridge_flash = (
+        _has_prefix
+        and self.config.use_flash_attention
         and seq_len > 1
-        and (seq_len % self.config.flash_attention_block_size == 0)
-    ):
+        and _bridge_len > 0
+        and _remaining > 0
+        and _remaining % _block_sz == 0
+    )
+    _can_flash = self.config.use_flash_attention and _sfx_aligned
+
+    if _can_flash or _can_bridge_flash:
       b, _, qh, _ = query_proj.shape
       _, _, kh, _ = key_proj.shape
-      query_proj = query_proj.transpose(0, 2, 1, 3)
-      key_proj = key_proj.transpose(0, 2, 1, 3)
-      value_proj = value_proj.transpose(0, 2, 1, 3)
+
+      # --- Bridge: dense attention for unaligned prefix tokens ---
+      bridge_encoded: jaxtyping.Array | None = None
+      if _can_bridge_flash:
+        assert _pfx_k is not None and _pfx_v is not None
+        pfx_len_raw = _pfx_k.shape[1]
+
+        # Bridge queries/keys/values (first _bridge_len tokens)
+        q_br = query_proj[:, :_bridge_len, :, :]
+        k_br = key_proj[:, :_bridge_len, :, :]
+        v_br = value_proj[:, :_bridge_len, :, :]
+
+        # Bridge logits: Q_bridge × [prefix_k ; bridge_k]
+        if self.use_gqa:
+          n_groups = qh // kh
+          q_br_r = q_br.reshape((b, _bridge_len, kh, n_groups, self.head_dim))
+          pfx_logits_br = jnp.einsum("BTKGH,BSKH->BTKGS", q_br_r, _pfx_k)
+          self_logits_br = jnp.einsum("BTKGH,BSKH->BTKGS", q_br_r, k_br)
+        else:
+          pfx_logits_br = jnp.einsum("BTNH,BSNH->BTNS", q_br, _pfx_k)
+          self_logits_br = jnp.einsum("BTNH,BSNH->BTNS", q_br, k_br)
+
+        # Causal mask for bridge self-attention
+        br_causal = jnp.tril(
+            jnp.ones((_bridge_len, _bridge_len), dtype=jnp.bool_)
+        )
+        if self.attn_type == AttentionType.LOCAL_SLIDING:
+          assert self.config.sliding_window_size is not None
+          sw = self.config.sliding_window_size
+          br_causal = br_causal & jnp.triu(
+              jnp.ones((_bridge_len, _bridge_len), dtype=jnp.bool_),
+              -(sw - 1),
+          )
+          # Sliding window mask for prefix cross-attention
+          br_pos = jnp.arange(_bridge_len) + pfx_len_raw
+          pfx_pos = jnp.arange(pfx_len_raw)
+          pfx_mask_br = (br_pos[:, None] - pfx_pos[None, :]) < sw
+          pfx_mask_br = pfx_mask_br & (br_pos[:, None] >= pfx_pos[None, :])
+        else:
+          pfx_mask_br = jnp.ones((_bridge_len, pfx_len_raw), dtype=jnp.bool_)
+
+        K_MASK_VAL = jnp.finfo(jnp.float32).min
+        if self.use_gqa:
+          self_masked = jnp.where(
+              br_causal[None, :, None, None, :], self_logits_br, K_MASK_VAL
+          )
+          pfx_masked = jnp.where(
+              pfx_mask_br[None, :, None, None, :], pfx_logits_br, K_MASK_VAL
+          )
+        else:
+          self_masked = jnp.where(
+              br_causal[None, :, None, :], self_logits_br, K_MASK_VAL
+          )
+          pfx_masked = jnp.where(
+              pfx_mask_br[None, :, None, :], pfx_logits_br, K_MASK_VAL
+          )
+
+        # 2-chunk online softmax
+        m_self = jnp.max(
+            self_masked.astype(jnp.float32), axis=-1, keepdims=True
+        )
+        m_pfx = jnp.max(pfx_masked.astype(jnp.float32), axis=-1, keepdims=True)
+        m = jnp.maximum(m_self, m_pfx)
+        e_self = jnp.exp(self_masked.astype(jnp.float32) - m)
+        e_pfx = jnp.exp(pfx_masked.astype(jnp.float32) - m)
+        l_total = jnp.sum(e_self, axis=-1, keepdims=True) + jnp.sum(
+            e_pfx, axis=-1, keepdims=True
+        )
+        self_attn = (e_self / l_total).astype(key_proj.dtype)
+        pfx_attn = (e_pfx / l_total).astype(key_proj.dtype)
+
+        if self.use_gqa:
+          bridge_encoded = jnp.einsum(
+              "BTKGS,BSKH->BTKGH", pfx_attn, _pfx_v
+          ) + jnp.einsum("BTKGS,BSKH->BTKGH", self_attn, v_br)
+          _b, _t, _k, _g, _h = bridge_encoded.shape
+          bridge_encoded = bridge_encoded.reshape((_b, _t, _k * _g, _h))
+        else:
+          bridge_encoded = jnp.einsum(
+              "BTNS,BSNH->BTNH", pfx_attn, _pfx_v
+          ) + jnp.einsum("BTNS,BSNH->BTNH", self_attn, v_br)
+
+        # Prepare remaining suffix for Flash (skip bridge tokens)
+        query_proj_flash = query_proj[:, _bridge_len:, :, :]
+        key_proj_flash = key_proj[:, _bridge_len:, :, :]
+        value_proj_flash = value_proj[:, _bridge_len:, :, :]
+        flash_q_len = _remaining
+      else:
+        query_proj_flash = query_proj
+        key_proj_flash = key_proj
+        value_proj_flash = value_proj
+        flash_q_len = seq_len
+
+      # --- Transpose to [B, H, S, D] for Splash ---
+      query_proj = query_proj_flash.transpose(0, 2, 1, 3)
+      key_proj_t = key_proj_flash.transpose(0, 2, 1, 3)
+      value_proj_t = value_proj_flash.transpose(0, 2, 1, 3)
+
+      # --- Concatenate prefix KV for Flash ---
+      pfx_offset = 0
+      if _has_prefix:
+        assert _pfx_k is not None and _pfx_v is not None
+        pfx_k_t = _pfx_k.transpose(0, 2, 1, 3)  # [1, KH, pfx_len, D]
+        pfx_v_t = _pfx_v.transpose(0, 2, 1, 3)
+        pfx_len_for_flash = pfx_k_t.shape[2]
+        if _can_bridge_flash:
+          # Extend prefix with bridge KV for the Flash portion
+          br_k_t = key_proj[:, :_bridge_len, :, :].transpose(0, 2, 1, 3)
+          br_v_t = value_proj[:, :_bridge_len, :, :].transpose(0, 2, 1, 3)
+          pfx_k_t = jnp.concatenate(
+              [jnp.broadcast_to(pfx_k_t, (b,) + pfx_k_t.shape[1:]), br_k_t],
+              axis=2,
+          )
+          pfx_v_t = jnp.concatenate(
+              [jnp.broadcast_to(pfx_v_t, (b,) + pfx_v_t.shape[1:]), br_v_t],
+              axis=2,
+          )
+          pfx_len_for_flash = pfx_k_t.shape[2]
+        else:
+          pfx_k_t = jnp.broadcast_to(pfx_k_t, (b,) + pfx_k_t.shape[1:])
+          pfx_v_t = jnp.broadcast_to(pfx_v_t, (b,) + pfx_v_t.shape[1:])
+        key_proj_t = jnp.concatenate([pfx_k_t, key_proj_t], axis=2)
+        value_proj_t = jnp.concatenate([pfx_v_t, value_proj_t], axis=2)
+        pfx_offset = pfx_len_for_flash
+
+      kv_len = key_proj_t.shape[2]
 
       mesh = shd.get_abstract_mesh()
       if self.attn_type == AttentionType.LOCAL_SLIDING:
         assert self.config.sliding_window_size is not None
         mask = mask_lib.LocalMask(
-            (seq_len, seq_len),
+            (flash_q_len, kv_len),
             window_size=(self.config.sliding_window_size - 1, 0),
-            offset=0,
+            offset=pfx_offset,
         )
       else:
-        mask = mask_lib.CausalMask((seq_len, seq_len))
+        mask = mask_lib.CausalMask((flash_q_len, kv_len), offset=pfx_offset)
 
       multi_head_mask = mask_lib.MultiHeadMask([mask for _ in range(qh)])
 
       block_sizes = splash.BlockSizes(
-          block_q=self.config.flash_attention_block_size,
-          block_kv=self.config.flash_attention_block_size,
-          block_q_dkv=self.config.flash_attention_block_size,
-          block_kv_dkv=self.config.flash_attention_block_size,
-          block_kv_dkv_compute=self.config.flash_attention_block_size,
-          block_q_dq=self.config.flash_attention_block_size,
-          block_kv_dq=self.config.flash_attention_block_size,
+          block_q=_block_sz,
+          block_kv=_block_sz,
+          block_q_dkv=_block_sz,
+          block_kv_dkv=_block_sz,
+          block_kv_dkv_compute=_block_sz,
+          block_q_dq=_block_sz,
+          block_kv_dq=_block_sz,
       )
 
       shd_b, shd_t, shd_n, shd_h = self.config.shd_config.act_btnh
@@ -1367,11 +1532,17 @@ class Attention(nnx.Module):
           kv_seg = segment_ids
           _prefix_segment_id = None
 
+        # Trim segment_ids to flash Q length (skip bridge tokens)
+        if _can_bridge_flash:
+          q_seg = q_seg[:, _bridge_len:]
+          if not isinstance(kv_seg, splash.SegmentIds):
+            kv_seg = kv_seg[:, _bridge_len:]
+
         qkv = sharded_splash_attn_with_seg(
             splash_attn_kernel,
             query_proj,
-            key_proj,
-            value_proj,
+            key_proj_t,
+            value_proj_t,
             q_seg,
             kv_seg,
         )
@@ -1402,13 +1573,24 @@ class Attention(nnx.Module):
         qkv = sharded_splash_attn(
             splash_attn_kernel,
             query_proj,
-            key_proj,
-            value_proj,
+            key_proj_t,
+            value_proj_t,
         )
-      encoded = qkv.transpose(0, 2, 1, 3)
-      query_proj = query_proj.transpose(0, 2, 1, 3)
-      key_proj = key_proj.transpose(0, 2, 1, 3)
-      value_proj = value_proj.transpose(0, 2, 1, 3)
+
+      # Transpose Flash output back to [B, T, H, D]
+      flash_encoded = qkv.transpose(0, 2, 1, 3)
+
+      # Concatenate bridge + flash outputs
+      if bridge_encoded is not None:
+        encoded = jnp.concatenate([bridge_encoded, flash_encoded], axis=1)
+      else:
+        encoded = flash_encoded
+
+      # Restore original key_proj / value_proj references for the return
+      # value (the caller uses the returned KV pair for shared-layer caching).
+      # key_proj / value_proj were NOT reassigned during Flash setup (only
+      # key_proj_t / value_proj_t were created), so they still hold the
+      # original [B, seq_len, KH, D] tensors.
 
     else:
       # --- Prefix KV extraction (read-only, B=1 or empty) ---
