@@ -2552,6 +2552,24 @@ class ScanLayerGroup(nnx.Module):
     return x
 
 
+def _reshape_per_layer_inputs(
+    pli: jaxtyping.Array | None,
+    num_groups: int,
+    pattern_len: int,
+    shd_config: ShardingConfig,
+) -> jaxtyping.Array | None:
+  """Reshapes and shards per_layer_inputs for nnx.scan: (B,T,N,D) -> (groups,B,T,pat,D)."""
+  if pli is None:
+    return None
+  b, t, _, d = pli.shape
+  reshaped = pli.reshape((b, t, num_groups, pattern_len, d))
+  shd_b, shd_t, _, _ = shd_config.act_btnh
+  return sharding_utils.shard(
+      jnp.transpose(reshaped, (2, 0, 1, 3, 4)),
+      (None, shd_b, shd_t, None, None),
+  )
+
+
 class Gemma4(BackendMappingMixin, nnx.Module):
   """Gemma4 model."""
 
@@ -2953,17 +2971,12 @@ class Gemma4(BackendMappingMixin, nnx.Module):
       seq_len = x.shape[1]
 
       # Reshape per_layer_inputs for scan: (B,T,N,D) -> (groups,B,T,pat,D)
-      scan_per_layer_inputs = None
-      if per_layer_inputs is not None:
-        b, t, _, d = per_layer_inputs.shape
-        reshaped = per_layer_inputs.reshape(
-            (b, t, num_scan_groups, pattern_len, d)
-        )
-        shd_b, shd_t, _, _ = self.config.shd_config.act_btnh
-        scan_per_layer_inputs = sharding_utils.shard(
-            jnp.transpose(reshaped, (2, 0, 1, 3, 4)),
-            (None, shd_b, shd_t, None, None),
-        )
+      scan_per_layer_inputs = _reshape_per_layer_inputs(
+          per_layer_inputs,
+          num_scan_groups,
+          pattern_len,
+          self.config.shd_config,
+      )
 
       is_stacked_cache = isinstance(cache, (tuple, list))
       if is_stacked_cache:
@@ -3362,17 +3375,12 @@ class Gemma4(BackendMappingMixin, nnx.Module):
       # Single scan path for unshared models
       num_scan_groups = self.config.num_layers // pattern_len
 
-      scan_per_layer_inputs = None
-      if per_layer_inputs is not None:
-        b, t, _, d = per_layer_inputs.shape
-        reshaped = per_layer_inputs.reshape(
-            (b, t, num_scan_groups, pattern_len, d)
-        )
-        shd_b, shd_t, _, _ = self.config.shd_config.act_btnh
-        scan_per_layer_inputs = sharding_utils.shard(
-            jnp.transpose(reshaped, (2, 0, 1, 3, 4)),
-            (None, shd_b, shd_t, None, None),
-        )
+      scan_per_layer_inputs = _reshape_per_layer_inputs(
+          per_layer_inputs,
+          num_scan_groups,
+          pattern_len,
+          self.config.shd_config,
+      )
 
       @nnx.scan(
           in_axes=(
@@ -3422,29 +3430,28 @@ class Gemma4(BackendMappingMixin, nnx.Module):
       num_unshared_groups = num_unshared_layers // pattern_len
       num_shared_groups = num_shared_layers // pattern_len
 
-      scan_unshared_pli = None
-      scan_shared_pli = None
-      if per_layer_inputs is not None:
-        b, t, _, d = per_layer_inputs.shape
-        unshared_pli = per_layer_inputs[:, :, :num_unshared_layers, :]
-        shared_pli = per_layer_inputs[:, :, num_unshared_layers:, :]
-
-        reshaped_u = unshared_pli.reshape(
-            (b, t, num_unshared_groups, pattern_len, d)
-        )
-        shd_b, shd_t, _, _ = self.config.shd_config.act_btnh
-        scan_unshared_pli = sharding_utils.shard(
-            jnp.transpose(reshaped_u, (2, 0, 1, 3, 4)),
-            (None, shd_b, shd_t, None, None),
-        )
-
-        reshaped_s = shared_pli.reshape(
-            (b, t, num_shared_groups, pattern_len, d)
-        )
-        scan_shared_pli = sharding_utils.shard(
-            jnp.transpose(reshaped_s, (2, 0, 1, 3, 4)),
-            (None, shd_b, shd_t, None, None),
-        )
+      unshared_pli = (
+          per_layer_inputs[:, :, :num_unshared_layers, :]
+          if per_layer_inputs is not None
+          else None
+      )
+      shared_pli = (
+          per_layer_inputs[:, :, num_unshared_layers:, :]
+          if per_layer_inputs is not None
+          else None
+      )
+      scan_unshared_pli = _reshape_per_layer_inputs(
+          unshared_pli,
+          num_unshared_groups,
+          pattern_len,
+          self.config.shd_config,
+      )
+      scan_shared_pli = _reshape_per_layer_inputs(
+          shared_pli,
+          num_shared_groups,
+          pattern_len,
+          self.config.shd_config,
+      )
 
       global_sub_idx = (num_unshared_layers - 1) % pattern_len
       local_sub_idx = (num_unshared_layers - 2) % pattern_len
