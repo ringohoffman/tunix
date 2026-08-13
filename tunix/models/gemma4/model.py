@@ -58,6 +58,9 @@ _REMAT_SUPPORTS_GRAPH_UPDATES = (
 
 
 _F = TypeVar("_F", bound=Callable[..., object])
+_CacheT = TypeVar(
+    "_CacheT", LayerKV, LayerCache, None, LayerKV | LayerCache | None
+)
 
 
 def _compat_remat(
@@ -1023,71 +1026,11 @@ class Attention(nnx.Module):
         param_dtype=config.param_dtype,
     )
 
-  @overload
   def block(
       self,
       x: jaxtyping.Array,
       segment_pos: jaxtyping.Array,
-      cache: LayerCache,
-      attn_mask: jaxtyping.Array | None,
-      kv_shared_cache: LayerKV | LayerCache | None = None,
-      kv_override: LayerKV | LayerCache | None = None,
-      use_kv_override: jaxtyping.Array | bool | None = None,
-      skip_kv_projection: bool = False,
-      segment_ids: jaxtyping.Array | splash.SegmentIds | None = None,
-  ) -> tuple[LayerCache, jaxtyping.Array, LayerKVPair]:
-    ...
-
-  @overload
-  def block(
-      self,
-      x: jaxtyping.Array,
-      segment_pos: jaxtyping.Array,
-      cache: LayerKV,
-      attn_mask: jaxtyping.Array | None,
-      kv_shared_cache: LayerKV | LayerCache | None = None,
-      kv_override: LayerKV | LayerCache | None = None,
-      use_kv_override: jaxtyping.Array | bool | None = None,
-      skip_kv_projection: bool = False,
-      segment_ids: jaxtyping.Array | splash.SegmentIds | None = None,
-  ) -> tuple[LayerKV, jaxtyping.Array, LayerKVPair]:
-    ...
-
-  @overload
-  def block(
-      self,
-      x: jaxtyping.Array,
-      segment_pos: jaxtyping.Array,
-      cache: None,
-      attn_mask: jaxtyping.Array | None,
-      kv_shared_cache: LayerKV | LayerCache | None = None,
-      kv_override: LayerKV | LayerCache | None = None,
-      use_kv_override: jaxtyping.Array | bool | None = None,
-      skip_kv_projection: bool = False,
-      segment_ids: jaxtyping.Array | splash.SegmentIds | None = None,
-  ) -> tuple[None, jaxtyping.Array, LayerKVPair]:
-    ...
-
-  @overload
-  def block(
-      self,
-      x: jaxtyping.Array,
-      segment_pos: jaxtyping.Array,
-      cache: LayerKV | LayerCache | None,
-      attn_mask: jaxtyping.Array | None,
-      kv_shared_cache: LayerKV | LayerCache | None = None,
-      kv_override: LayerKV | LayerCache | None = None,
-      use_kv_override: jaxtyping.Array | bool | None = None,
-      skip_kv_projection: bool = False,
-      segment_ids: jaxtyping.Array | splash.SegmentIds | None = None,
-  ) -> tuple[LayerKV | LayerCache | None, jaxtyping.Array, LayerKVPair]:
-    ...
-
-  def block(
-      self,
-      x: jaxtyping.Array,
-      segment_pos: jaxtyping.Array,
-      cache: LayerKV | LayerCache | None,
+      cache: _CacheT,
       attn_mask: jaxtyping.Array | None,
       kv_shared_cache: LayerKV | LayerCache | None = None,
       kv_override: LayerKV | LayerCache | None = None,
@@ -1095,7 +1038,7 @@ class Attention(nnx.Module):
       skip_kv_projection: bool = False,
       segment_ids: jaxtyping.Array | splash.SegmentIds | None = None,
   ) -> tuple[
-      LayerKV | LayerCache | None,
+      _CacheT,
       jaxtyping.Array,
       LayerKVPair,
   ]:
@@ -1672,71 +1615,11 @@ class Attention(nnx.Module):
   def use_gqa(self) -> bool:
     return self.num_kv_heads != self.config.num_heads and self.num_kv_heads > 1
 
-  @overload
   def __call__(
       self,
       x: jaxtyping.Array,
       segment_pos: jaxtyping.Array,
-      cache: LayerCache,
-      attn_mask: jaxtyping.Array | None,
-      kv_shared_cache: LayerKV | LayerCache | None = None,
-      kv_override: LayerKV | LayerCache | None = None,
-      use_kv_override: jaxtyping.Array | bool | None = None,
-      skip_kv_projection: bool = False,
-      segment_ids: jaxtyping.Array | splash.SegmentIds | None = None,
-  ) -> tuple[LayerCache, jaxtyping.Array, LayerKVPair]:
-    ...
-
-  @overload
-  def __call__(
-      self,
-      x: jaxtyping.Array,
-      segment_pos: jaxtyping.Array,
-      cache: LayerKV,
-      attn_mask: jaxtyping.Array | None,
-      kv_shared_cache: LayerKV | LayerCache | None = None,
-      kv_override: LayerKV | LayerCache | None = None,
-      use_kv_override: jaxtyping.Array | bool | None = None,
-      skip_kv_projection: bool = False,
-      segment_ids: jaxtyping.Array | splash.SegmentIds | None = None,
-  ) -> tuple[LayerKV, jaxtyping.Array, LayerKVPair]:
-    ...
-
-  @overload
-  def __call__(
-      self,
-      x: jaxtyping.Array,
-      segment_pos: jaxtyping.Array,
-      cache: None,
-      attn_mask: jaxtyping.Array | None,
-      kv_shared_cache: LayerKV | LayerCache | None = None,
-      kv_override: LayerKV | LayerCache | None = None,
-      use_kv_override: jaxtyping.Array | bool | None = None,
-      skip_kv_projection: bool = False,
-      segment_ids: jaxtyping.Array | splash.SegmentIds | None = None,
-  ) -> tuple[None, jaxtyping.Array, LayerKVPair]:
-    ...
-
-  @overload
-  def __call__(
-      self,
-      x: jaxtyping.Array,
-      segment_pos: jaxtyping.Array,
-      cache: LayerKV | LayerCache | None,
-      attn_mask: jaxtyping.Array | None,
-      kv_shared_cache: LayerKV | LayerCache | None = None,
-      kv_override: LayerKV | LayerCache | None = None,
-      use_kv_override: jaxtyping.Array | bool | None = None,
-      skip_kv_projection: bool = False,
-      segment_ids: jaxtyping.Array | splash.SegmentIds | None = None,
-  ) -> tuple[LayerKV | LayerCache | None, jaxtyping.Array, LayerKVPair]:
-    ...
-
-  def __call__(
-      self,
-      x: jaxtyping.Array,
-      segment_pos: jaxtyping.Array,
-      cache: LayerKV | LayerCache | None,
+      cache: _CacheT,
       attn_mask: jaxtyping.Array | None,
       kv_shared_cache: LayerKV | LayerCache | None = None,
       kv_override: LayerKV | LayerCache | None = None,
@@ -1744,7 +1627,7 @@ class Attention(nnx.Module):
       skip_kv_projection: bool = False,
       segment_ids: jaxtyping.Array | splash.SegmentIds | None = None,
   ) -> tuple[
-      LayerKV | LayerCache | None,
+      _CacheT,
       jaxtyping.Array,
       LayerKVPair,
   ]:
@@ -1989,75 +1872,11 @@ class DecoderLayer(nnx.Module):
 
     self.skip_scale = nnx.Param(jnp.ones((1,), dtype=config.param_dtype))
 
-  @overload
   def block(
       self,
       x: jaxtyping.Array,
       segment_pos: jaxtyping.Array,
-      cache: LayerCache,
-      attn_mask: jaxtyping.Array | None,
-      per_layer_input: jaxtyping.Array | None = None,
-      kv_shared_cache: LayerKV | LayerCache | None = None,
-      kv_override: LayerKV | LayerCache | None = None,
-      use_kv_override: jaxtyping.Array | bool | None = None,
-      skip_kv_projection: bool = False,
-      segment_ids: jaxtyping.Array | splash.SegmentIds | None = None,
-  ) -> tuple[LayerCache, jaxtyping.Array, LayerKVPair]:
-    ...
-
-  @overload
-  def block(
-      self,
-      x: jaxtyping.Array,
-      segment_pos: jaxtyping.Array,
-      cache: LayerKV,
-      attn_mask: jaxtyping.Array | None,
-      per_layer_input: jaxtyping.Array | None = None,
-      kv_shared_cache: LayerKV | LayerCache | None = None,
-      kv_override: LayerKV | LayerCache | None = None,
-      use_kv_override: jaxtyping.Array | bool | None = None,
-      skip_kv_projection: bool = False,
-      segment_ids: jaxtyping.Array | splash.SegmentIds | None = None,
-  ) -> tuple[LayerKV, jaxtyping.Array, LayerKVPair]:
-    ...
-
-  @overload
-  def block(
-      self,
-      x: jaxtyping.Array,
-      segment_pos: jaxtyping.Array,
-      cache: None,
-      attn_mask: jaxtyping.Array | None,
-      per_layer_input: jaxtyping.Array | None = None,
-      kv_shared_cache: LayerKV | LayerCache | None = None,
-      kv_override: LayerKV | LayerCache | None = None,
-      use_kv_override: jaxtyping.Array | bool | None = None,
-      skip_kv_projection: bool = False,
-      segment_ids: jaxtyping.Array | splash.SegmentIds | None = None,
-  ) -> tuple[None, jaxtyping.Array, LayerKVPair]:
-    ...
-
-  @overload
-  def block(
-      self,
-      x: jaxtyping.Array,
-      segment_pos: jaxtyping.Array,
-      cache: LayerKV | LayerCache | None,
-      attn_mask: jaxtyping.Array | None,
-      per_layer_input: jaxtyping.Array | None = None,
-      kv_shared_cache: LayerKV | LayerCache | None = None,
-      kv_override: LayerKV | LayerCache | None = None,
-      use_kv_override: jaxtyping.Array | bool | None = None,
-      skip_kv_projection: bool = False,
-      segment_ids: jaxtyping.Array | splash.SegmentIds | None = None,
-  ) -> tuple[LayerKV | LayerCache | None, jaxtyping.Array, LayerKVPair]:
-    ...
-
-  def block(
-      self,
-      x: jaxtyping.Array,
-      segment_pos: jaxtyping.Array,
-      cache: LayerKV | LayerCache | None,
+      cache: _CacheT,
       attn_mask: jaxtyping.Array | None,
       per_layer_input: jaxtyping.Array | None = None,
       kv_shared_cache: LayerKV | LayerCache | None = None,
@@ -2066,7 +1885,7 @@ class DecoderLayer(nnx.Module):
       skip_kv_projection: bool = False,
       segment_ids: jaxtyping.Array | splash.SegmentIds | None = None,
   ) -> tuple[
-      LayerKV | LayerCache | None,
+      _CacheT,
       jaxtyping.Array,
       LayerKVPair,
   ]:
@@ -2109,75 +1928,11 @@ class DecoderLayer(nnx.Module):
     ffw = ffw * self.skip_scale[...]
     return cache, ffw, kv
 
-  @overload
   def __call__(
       self,
       x: jaxtyping.Array,
       segment_pos: jaxtyping.Array,
-      cache: LayerCache,
-      attn_mask: jaxtyping.Array | None,
-      per_layer_input: jaxtyping.Array | None = None,
-      kv_shared_cache: LayerKV | LayerCache | None = None,
-      kv_override: LayerKV | LayerCache | None = None,
-      use_kv_override: jaxtyping.Array | bool | None = None,
-      skip_kv_projection: bool = False,
-      segment_ids: jaxtyping.Array | splash.SegmentIds | None = None,
-  ) -> tuple[LayerCache, jaxtyping.Array, LayerKVPair]:
-    ...
-
-  @overload
-  def __call__(
-      self,
-      x: jaxtyping.Array,
-      segment_pos: jaxtyping.Array,
-      cache: LayerKV,
-      attn_mask: jaxtyping.Array | None,
-      per_layer_input: jaxtyping.Array | None = None,
-      kv_shared_cache: LayerKV | LayerCache | None = None,
-      kv_override: LayerKV | LayerCache | None = None,
-      use_kv_override: jaxtyping.Array | bool | None = None,
-      skip_kv_projection: bool = False,
-      segment_ids: jaxtyping.Array | splash.SegmentIds | None = None,
-  ) -> tuple[LayerKV, jaxtyping.Array, LayerKVPair]:
-    ...
-
-  @overload
-  def __call__(
-      self,
-      x: jaxtyping.Array,
-      segment_pos: jaxtyping.Array,
-      cache: None,
-      attn_mask: jaxtyping.Array | None,
-      per_layer_input: jaxtyping.Array | None = None,
-      kv_shared_cache: LayerKV | LayerCache | None = None,
-      kv_override: LayerKV | LayerCache | None = None,
-      use_kv_override: jaxtyping.Array | bool | None = None,
-      skip_kv_projection: bool = False,
-      segment_ids: jaxtyping.Array | splash.SegmentIds | None = None,
-  ) -> tuple[None, jaxtyping.Array, LayerKVPair]:
-    ...
-
-  @overload
-  def __call__(
-      self,
-      x: jaxtyping.Array,
-      segment_pos: jaxtyping.Array,
-      cache: LayerKV | LayerCache | None,
-      attn_mask: jaxtyping.Array | None,
-      per_layer_input: jaxtyping.Array | None = None,
-      kv_shared_cache: LayerKV | LayerCache | None = None,
-      kv_override: LayerKV | LayerCache | None = None,
-      use_kv_override: jaxtyping.Array | bool | None = None,
-      skip_kv_projection: bool = False,
-      segment_ids: jaxtyping.Array | splash.SegmentIds | None = None,
-  ) -> tuple[LayerKV | LayerCache | None, jaxtyping.Array, LayerKVPair]:
-    ...
-
-  def __call__(
-      self,
-      x: jaxtyping.Array,
-      segment_pos: jaxtyping.Array,
-      cache: LayerKV | LayerCache | None,
+      cache: _CacheT,
       attn_mask: jaxtyping.Array | None,
       per_layer_input: jaxtyping.Array | None = None,
       kv_shared_cache: LayerKV | LayerCache | None = None,
@@ -2186,7 +1941,7 @@ class DecoderLayer(nnx.Module):
       skip_kv_projection: bool = False,
       segment_ids: jaxtyping.Array | splash.SegmentIds | None = None,
   ) -> tuple[
-      LayerKV | LayerCache | None,
+      _CacheT,
       jaxtyping.Array,
       LayerKVPair,
   ]:
