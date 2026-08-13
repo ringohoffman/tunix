@@ -662,7 +662,8 @@ class ScanForwardEquivalenceTest(absltest.TestCase):
       )
       if m.final_norm is not None:
         x = m.final_norm(x)
-      return x
+      logits = m.embedder.decode(x)
+      return logits
 
     def loss_head(m, tok, pos, mask):
       out = forward_scan_head_stacked(m, tok, pos, mask)
@@ -700,13 +701,13 @@ class ScanForwardEquivalenceTest(absltest.TestCase):
         ),
     )
 
-    # 2. Verify Carry produces a smaller HLO text graph by avoiding stacked tensor tracking
+    # 2. Verify Carry produces significantly less temporary HLO memory
     self.assertLess(
-        len(hlo_carry),
-        len(hlo_head),
+        mem_carry.temp_size_in_bytes,
+        mem_head.temp_size_in_bytes,
         msg=(
-            f"Carry HLO size ({len(hlo_carry)} chars) should be smaller "
-            f"than HEAD ({len(hlo_head)} chars)"
+            f"Carry temp bytes ({mem_carry.temp_size_in_bytes}) should be less "
+            f"than HEAD ({mem_head.temp_size_in_bytes})"
         ),
     )
 
@@ -1477,4 +1478,3 @@ class CacheConversionTest(absltest.TestCase):
 
 if __name__ == "__main__":
   absltest.main()
-
