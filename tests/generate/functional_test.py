@@ -601,6 +601,52 @@ class FunctionalGenerateTest(parameterized.TestCase):
         out_std.logits, out_suffix.logits, atol=1e-5, rtol=1e-5
     )
 
+  def test_multiple_eos_tokens_array(self):
+    prompt = jnp.array([[3, 4, 5]], dtype=jnp.int32)
+    # Generate 10 tokens with standard single eos_id
+    out_single = functional.generate(
+        self.model,
+        prompt,
+        max_new_tokens=10,
+        pad_id=self.pad_id,
+        eos_id=self.eos_id,
+        cache_size=32,
+        temperature=0.0,
+    )
+    tokens_single = np.asarray(out_single.tokens[0]).tolist()
+    # Find the first index i >= 1 where token was not in earlier tokens
+    stop_idx = None
+    extra_eos = None
+    for i in range(1, len(tokens_single)):
+      if (
+          tokens_single[i] not in tokens_single[:i]
+          and tokens_single[i] != self.pad_id
+      ):
+        stop_idx = i
+        extra_eos = tokens_single[i]
+        break
+
+    self.assertIsNotNone(stop_idx)
+    assert extra_eos is not None
+    eos_array = jnp.array([self.eos_id, extra_eos], dtype=jnp.int32)
+
+    out_multi = functional.generate(
+        self.model,
+        prompt,
+        max_new_tokens=10,
+        pad_id=self.pad_id,
+        eos_id=eos_array,
+        cache_size=32,
+        temperature=0.0,
+    )
+    tokens_multi = np.asarray(out_multi.tokens[0]).tolist()
+    # Up to stop_idx, tokens should match out_single
+    self.assertEqual(
+        tokens_multi[: stop_idx + 1], tokens_single[: stop_idx + 1]
+    )
+    # After stop_idx, tokens should all be pad_id
+    self.assertTrue(all(t == self.pad_id for t in tokens_multi[stop_idx + 1 :]))
+
 
 if __name__ == "__main__":
   absltest.main()

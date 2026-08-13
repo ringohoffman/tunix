@@ -22,6 +22,7 @@ convenience ``Sampler`` wrapper.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 import dataclasses
 import inspect
 from typing import TypeAlias
@@ -351,7 +352,7 @@ def generate(
     *,
     max_new_tokens: int,
     pad_id: int,
-    eos_id: int,
+    eos_ids: int | Sequence[int] | jax.Array,
     cache_size: int,
     temperature: float = 1.0,
     top_p: float = 1.0,
@@ -378,7 +379,8 @@ def generate(
       suffix-only ``[B, S]`` when ``prefix_cache`` is provided).
     max_new_tokens: Maximum number of new tokens to generate.
     pad_id: Padding token ID.
-    eos_id: End-of-sequence token ID.
+    eos_ids: End-of-sequence token ID, as a scalar int or 1D array of EOS token
+      IDs.
     cache_size: KV cache length (must be ``>= prompt_len + max_new_tokens``).
     temperature: Sampling temperature.  ``0.0`` → greedy.
     top_p: Nucleus sampling threshold (``1.0`` = disabled).
@@ -407,6 +409,11 @@ def generate(
   """
   batch_size = input_ids.shape[0]
   in_len = input_ids.shape[1]
+
+  eos_ids = jnp.atleast_1d(jnp.asarray(eos_ids, dtype=jnp.int32))
+
+  def _is_eos(tokens: jax.Array) -> jax.Array:
+    return jnp.any(tokens[:, None] == eos_ids[None, :], axis=-1)
 
   prefix_length = 0
   prefix_tokens_arr = None
@@ -747,7 +754,7 @@ def generate(
   first_decode_pos = last_prompt_pos + 1
   positions = positions.at[:, prompt_len].set(first_decode_pos)
 
-  done = done_expanded | (first_token == eos_id)
+  done = done_expanded | _is_eos(first_token)
 
   init_state = _DecodeState(
       step=jnp.int32(1),
@@ -878,7 +885,7 @@ def generate(
     next_position = step_position[:, 0] + 1
     write_pos_idx = prompt_len + state.step
     new_positions = state.positions.at[:, write_pos_idx].set(next_position)
-    new_done = new_done | (next_token == eos_id)
+    new_done = new_done | _is_eos(next_token)
 
     return loop_model, _DecodeState(
         step=state.step + 1,
