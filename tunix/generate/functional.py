@@ -25,7 +25,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 import dataclasses
 import inspect
-from typing import TypeAlias
+from typing import Any, Protocol, TypeAlias, runtime_checkable
 
 import flax
 from flax import nnx
@@ -76,6 +76,20 @@ class GenerateOutput:
   - ``jax.device_put(output.cache, cpu)``  — offload to host RAM
   - Pass to downstream kernels that accept a warm cache
   """
+
+
+@runtime_checkable
+class GenerateFn(Protocol):
+  """Callback protocol for autoregressive token generation callables."""
+
+  def __call__(
+      self,
+      prompt_ids: jax.Array,
+      prefix_cache: PrefixCache | None = None,
+      *,
+      key: jax.Array | None = None,
+  ) -> GenerateOutput:
+    ...
 
 
 @flax.struct.dataclass
